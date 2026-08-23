@@ -1471,6 +1471,30 @@ describe('background tab isolation', () => {
     expect(isoWindow).not.toBe(4);
   });
 
+  it('never relocates another window\'s tabs when a call names its own window', async () => {
+    const { chrome, tabs, groups } = createChromeMock();
+    // Two OpenCLI groups in two windows: the isolated container (win 8) and one
+    // in the person's window (win 4). This is the state that killed sessions —
+    // convergence merged them and emptied win 8, so Chrome closed it.
+    tabs.length = 0;
+    tabs.push({ id: 40, windowId: 4, url: 'https://user.example', title: 'user', active: true, status: 'complete', groupId: -1 });
+    tabs.push({ id: 41, windowId: 4, url: 'https://prev.example', title: 'prev', active: false, status: 'complete', groupId: 700 });
+    tabs.push({ id: 80, windowId: 8, url: 'https://iso.example', title: 'iso', active: false, status: 'complete', groupId: 800 });
+    groups.push({ id: 700, windowId: 4, title: 'OpenCLI: prev', color: 'orange', collapsed: false });
+    groups.push({ id: 800, windowId: 8, title: 'OpenCLI: iso', color: 'orange', collapsed: false });
+    chrome.windows.getAll = vi.fn(async () => [{ id: 4, focused: true, incognito: false, type: 'normal' }]);
+    chrome.windows.getLastFocused = vi.fn(async () => ({ id: 4, focused: true, incognito: false, type: 'normal' }));
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./background');
+    // A call that names window 4 must confine itself to window 4.
+    await mod.__test__.ensureOwnedContainerGroup('interactive', 4, [40]);
+
+    // The isolated window's tab has to stay put. Moving it empties window 8.
+    expect(tabs.find((tab) => tab.id === 80)?.windowId).toBe(8);
+    expect(chrome.tabs.move).not.toHaveBeenCalled();
+  });
+
   it('carries every window mode through to the session override', async () => {
     const { chrome } = createChromeMock();
     vi.stubGlobal('chrome', chrome);

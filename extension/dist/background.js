@@ -1392,7 +1392,12 @@ async function ensureOwnedContainerGroup(role, fallbackWindowId, tabIds, pinWind
   const ids = [...new Set(tabIds.filter((id) => id !== void 0))];
   const container = ownedContainers[role];
   const previousGroupPromise = container.groupPromise ?? Promise.resolve(null);
-  const nextGroupPromise = previousGroupPromise.catch(() => null).then(() => ensureOwnedContainerGroupUnlocked(role, fallbackWindowId, ids, pinWindowId));
+  const nextGroupPromise = previousGroupPromise.catch(() => null).then(() => ensureOwnedContainerGroupUnlocked(
+    role,
+    fallbackWindowId,
+    ids,
+    pinWindowId ?? (fallbackWindowId ?? void 0)
+  ));
   const trackedGroupPromise = nextGroupPromise.finally(() => {
     if (container.groupPromise === trackedGroupPromise) container.groupPromise = null;
   });

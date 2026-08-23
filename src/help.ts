@@ -59,7 +59,7 @@ const BROWSER_COMMON_OPTIONS = [
     flags: '--window <mode>',
     name: 'window',
     help: 'Window mode: background (default, reuses your current window, never steals focus), foreground (raise + select), isolated (background in its own window)',
-    choices: ['foreground', 'background'],
+    choices: ['foreground', 'background', 'isolated'],
   },
   {
     flags: '--site-session <mode>',

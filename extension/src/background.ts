@@ -920,11 +920,17 @@ async function ensureOwnedContainerGroup(
   role: OwnedWindowRole,
   fallbackWindowId: number | null,
   tabIds: Array<number | undefined>,
-  // When set, the group must live in THIS window. Group convergence otherwise
-  // adopts the canonical group wherever it happens to be and moves the tabs to
-  // it — which silently undid `--window isolated`: the dedicated window was
-  // created correctly and its tab was then dragged back into the group sitting
-  // in the person's window.
+  // The group must live in THIS window. Defaults to `fallbackWindowId`, and that
+  // default is the point: convergence walks to the canonical group wherever it
+  // happens to be and MOVES tabs there, so every call that knew its window but
+  // forgot to say so was a door for relocating tabs across windows. Emptying a
+  // window that way makes Chrome close it, which killed every session inside.
+  // Four separate bugs came through four different unpinned calls before this
+  // stopped being a per-call-site decision.
+  //
+  // Cross-window adoption is now only possible where it is meaningful: the
+  // discovery call that passes `fallbackWindowId: null` because it does not yet
+  // know which window it wants.
   pinWindowId?: number,
 ): Promise<OwnedContainerGroup | null> {
   // Adapter automation runs in an owned background window but no longer creates
@@ -938,7 +944,12 @@ async function ensureOwnedContainerGroup(
   const previousGroupPromise = container.groupPromise ?? Promise.resolve(null);
   const nextGroupPromise = previousGroupPromise
     .catch(() => null)
-    .then(() => ensureOwnedContainerGroupUnlocked(role, fallbackWindowId, ids, pinWindowId));
+    .then(() => ensureOwnedContainerGroupUnlocked(
+      role,
+      fallbackWindowId,
+      ids,
+      pinWindowId ?? (fallbackWindowId ?? undefined),
+    ));
   const trackedGroupPromise = nextGroupPromise.finally(() => {
     if (container.groupPromise === trackedGroupPromise) container.groupPromise = null;
   });
@@ -1148,7 +1159,6 @@ async function ensureOwnedContainerWindowUnlocked(
   const hostWindowId = (role === 'interactive' && !wantsDedicated)
     ? await findHostWindowForContainer()
     : undefined;
-
   const existingGroup = wantsDedicated
     ? null
     : await ensureOwnedContainerGroup(role, null, [], hostWindowId);
