@@ -92,6 +92,12 @@ export async function checkConnectivity(opts?: { timeout?: number }): Promise<Co
       surface: 'browser',
     });
     try {
+      // Establish the session first. `evaluate` carries no URL, and the extension
+      // refuses to auto-create a tab for URL-less commands (that guard is what keeps
+      // eval/click/state from spawning orphan blank tabs on a mistyped session name).
+      // `tabs op:new` creates the lease directly, so it is the one call that can open
+      // a probe tab without navigating anywhere.
+      await page.newTab?.();
       // Try a simple eval to verify end-to-end connectivity.
       await page.evaluate('1 + 1');
       await page.closeWindow?.();
