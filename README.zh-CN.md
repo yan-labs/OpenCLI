@@ -1,3 +1,41 @@
+# OpenCLI —— `yan-labs` fork
+
+> ### 🍴 这个 fork 改了什么
+>
+> fork 自 [`jackwener/opencli`](https://github.com/jackwener/opencli)（Apache-2.0）。
+> 它存在的理由只有一件事：**自动化不该抢走你正在用的那个浏览器。**
+>
+> | | 上游 / Chrome 应用商店版 | 这个 fork |
+> |---|---|---|
+> | 默认窗口模式 | 前台 | **后台** |
+> | `browser` 的标签页开在哪 | 新开一个 1280×900 的窗口 | **你当前正在用的那个窗口** |
+> | 你正在看的标签页 | 被切走 | **不动** |
+> | `--window isolated` | 没有 | 后台 + **独立窗口** |
+> | `browser sessions` | —— | 报 **windowId**，谁占着哪个标签页一目了然 |
+> | `browser batch` / `sessions` / `cleanup` | —— | 有 |
+>
+> **从 [Releases](https://github.com/yan-labs/OpenCLI/releases/latest) 装，浏览器扩展也要从那里拿——
+> 不要装 Chrome 应用商店那个。** 上表里的行为**全都住在扩展里**：装了商店版，
+> 每条命令照样成功，行为却回到上游，而且不会报任何错。`opencli doctor` 会替你指出这个错配。
+>
+> ### 还需要装配套的 Skill
+>
+> CLI 只是接口。**让 AI Agent 用好它**所需要的操作规范——不抢你的标签页、不泄漏会话、
+> 不把抓来的文件丢进下载目录——在 `opencli` Skill 里：
+>
+> ```bash
+> npx skills add yan-labs/yan-skills --skill opencli -g -y
+> ```
+>
+> 它覆盖会话命名与标签页租约纪律（「我的标签页被别人抢了」那一整套实测数据）、
+> 取数阶梯与落盘 SOP、adapter 的编写与自修复、桥接排障。
+> 仓库：[`yan-labs/yan-skills`](https://github.com/yan-labs/yan-skills)。
+> 那个仓库里的 `rankup` 与 `backlink` 两个 Skill，浏览器动作全部经由它。
+>
+> 以下是上游的 README，未改动。
+
+---
+
 # OpenCLI
 
 > **把任意网站变成 CLI & 在你的登录态浏览器上跑 Browser Use。**

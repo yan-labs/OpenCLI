@@ -1,3 +1,43 @@
+# OpenCLI — `yan-labs` fork
+
+> ### 🍴 What is different here
+>
+> Forked from [`jackwener/opencli`](https://github.com/jackwener/opencli) (Apache-2.0).
+> It exists for one reason: **automation should not take over the browser you are using.**
+>
+> | | upstream / Chrome Web Store build | this fork |
+> |---|---|---|
+> | default window mode | foreground | **background** |
+> | where a `browser` tab opens | a new 1280×900 window | **the window you are already in** |
+> | your active tab | gets switched away | **untouched** |
+> | `--window isolated` | not available | background **in its own window** |
+> | `browser sessions` | — | reports **windowId**, so you can tell who owns which tab |
+> | `browser batch` / `sessions` / `cleanup` | — | available |
+>
+> **Install from [Releases](https://github.com/yan-labs/OpenCLI/releases/latest), and take
+> the browser extension from there too — not from the Chrome Web Store.** The behaviours
+> above live in the extension; with the store build every command still succeeds while
+> behaving like upstream, and nothing errors. `opencli doctor` flags that mismatch for you.
+>
+> ### You also want the Skill
+>
+> The CLI is the surface. The **operating rules** an AI agent needs to drive it without
+> stealing your tabs, leaking sessions, or dumping scraped files into your Downloads folder
+> live in the `opencli` Skill:
+>
+> ```bash
+> npx skills add yan-labs/yan-skills --skill opencli -g -y
+> ```
+>
+> It covers session naming and tab-lease discipline (the measured "something stole my tab"
+> failure modes), the extraction ladder and landing SOP, adapter authoring and self-repair,
+> and bridge troubleshooting. Repo: [`yan-labs/yan-skills`](https://github.com/yan-labs/yan-skills).
+> The `rankup` and `backlink` Skills in that repo route all of their browser work through it.
+>
+> Everything below is upstream's README, unchanged.
+
+---
+
 # OpenCLI
 
 > **Convert any website into a CLI & run Browser Use on your logged-in Chrome.**
