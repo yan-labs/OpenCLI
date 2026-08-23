@@ -16,6 +16,9 @@ import { formatDaemonVersion, isDaemonStale, staleDaemonIssue } from './browser/
 import { findShadowedUserAdapters, formatAdapterShadowIssue, type AdapterShadow } from './adapter-shadow.js';
 
 const DOCTOR_LIVE_TIMEOUT_SECONDS = 8;
+/** Oldest extension build that carries this fork's window/focus behaviour. */
+const MIN_YAN_EXTENSION_VERSION = '1.0.27';
+const YAN_RELEASES_URL = 'https://github.com/yan-labs/OpenCLI/releases/latest';
 const DOCTOR_SESSION = '__doctor__';
 
 /** Parse a semver string into [major, minor, patch]. Returns null on invalid input. */
@@ -159,7 +162,25 @@ export async function runBrowserDoctor(opts: DoctorOptions = {}): Promise<Doctor
     issues.push(
       'Extension is connected but did not report a version.\n' +
       '  This usually means an outdated Browser Bridge extension.\n' +
-      '  Reload or reinstall the extension from: https://github.com/jackwener/opencli/releases',
+      `  Reload or reinstall the extension from: ${YAN_RELEASES_URL}`,
+    );
+  }
+  // The behaviours this fork exists for — background by default, tabs opening in the
+  // window the person is already using, no active-tab stealing, `--window isolated`,
+  // windowId in `sessions` — all live in the EXTENSION. Install the Chrome Web Store
+  // build instead and every command still "works" while behaving like upstream, so
+  // the mismatch surfaces as confusing behaviour rather than an error. Say it plainly
+  // here, because `doctor` is the one thing everybody runs before blaming their code.
+  if (extensionConnected && extensionVersion && !satisfiesRange(extensionVersion, `>=${MIN_YAN_EXTENSION_VERSION}`)) {
+    issues.push(
+      `Extension is v${extensionVersion}, which is older than the yan-labs build (v${MIN_YAN_EXTENSION_VERSION}+).\n` +
+      '  You are most likely running the Chrome Web Store extension. It is not broken, but it\n' +
+      '  behaves like upstream: foreground by default, automation opens its own window and\n' +
+      '  steals your active tab, `--window isolated` is ignored, and `sessions` reports no\n' +
+      '  windowId. Commands will succeed while doing the wrong thing.\n' +
+      `  Fix: download opencli-extension-v*.zip from ${YAN_RELEASES_URL}, unzip it, then\n` +
+      '  chrome://extensions/ → Developer Mode → Load unpacked → pick that folder, and\n' +
+      '  remove or disable the Web Store copy (two extensions both connect and fight).',
     );
   }
   if (!connectivity.ok) {
