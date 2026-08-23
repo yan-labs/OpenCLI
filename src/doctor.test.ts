@@ -323,7 +323,7 @@ describe('doctor report rendering', () => {
       state: 'ready' as const,
       status: {
         extensionConnected: true,
-        extensionVersion: '1.0.29',
+        extensionVersion: '1.0.30',
       },
     };
     mockGetDaemonHealth.mockResolvedValue(status);

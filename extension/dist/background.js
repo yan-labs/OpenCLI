@@ -1462,8 +1462,8 @@ async function ensureOwnedContainerWindowUnlocked(role, initialUrl, mode = "back
     container.groupId = null;
     container.borrowed = false;
   }
-  if (!wantsDedicated && role === "interactive" && container.borrowed && container.windowId !== null) {
-    const current = await findHostWindowForContainer(container.windowId);
+  if (!wantsDedicated && role === "interactive" && container.windowId !== null) {
+    const current = await findHostWindowForContainer(container.borrowed ? container.windowId : void 0);
     if (current !== void 0 && current !== container.windowId) {
       container.windowId = null;
       container.groupId = null;
@@ -1510,7 +1510,8 @@ async function ensureOwnedContainerWindowUnlocked(role, initialUrl, mode = "back
       container.groupId = null;
     }
   }
-  const existingGroup = wantsDedicated ? null : await ensureOwnedContainerGroup(role, null, []);
+  const hostWindowId = role === "interactive" && !wantsDedicated ? await findHostWindowForContainer() : void 0;
+  const existingGroup = wantsDedicated ? null : await ensureOwnedContainerGroup(role, null, [], hostWindowId);
   if (existingGroup) {
     await focusOwnedWindowIfRequested(existingGroup.windowId, mode);
     const initialTabId2 = await findReusableOwnedContainerTab(existingGroup.windowId, existingGroup.id);
@@ -1521,7 +1522,6 @@ async function ensureOwnedContainerWindowUnlocked(role, initialUrl, mode = "back
     };
   }
   const startUrl = initialUrl && isSafeNavigationUrl(initialUrl) ? initialUrl : BLANK_PAGE;
-  const hostWindowId = role === "interactive" && mode !== "isolated" ? await findHostWindowForContainer() : void 0;
   let initialTabId;
   if (hostWindowId !== void 0) {
     const hostTab = await chrome.tabs.create({
@@ -1573,7 +1573,7 @@ async function ensureOwnedContainerWindowUnlocked(role, initialUrl, mode = "back
     role,
     container.windowId,
     [initialTabId],
-    wantsDedicated ? container.windowId ?? void 0 : void 0
+    container.windowId ?? void 0
   );
   await persistRuntimeState();
   return { windowId: group?.windowId ?? container.windowId, initialTabId };

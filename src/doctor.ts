@@ -17,7 +17,7 @@ import { findShadowedUserAdapters, formatAdapterShadowIssue, type AdapterShadow 
 
 const DOCTOR_LIVE_TIMEOUT_SECONDS = 8;
 /** Oldest extension build that carries this fork's window/focus behaviour. */
-const MIN_YAN_EXTENSION_VERSION = '1.0.29';
+const MIN_YAN_EXTENSION_VERSION = '1.0.30';
 const YAN_RELEASES_URL = 'https://github.com/yan-labs/OpenCLI/releases/latest';
 const DOCTOR_SESSION = '__doctor__';
 

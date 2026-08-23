@@ -1443,6 +1443,34 @@ describe('background tab isolation', () => {
     expect(mod.__test__.getSession(browserKey('isoB'))).toBeTruthy();
   });
 
+  it('does not let an isolated window capture later default-mode sessions', async () => {
+    const { chrome, tabs } = createChromeMock();
+    tabs.length = 0;
+    tabs.push({ id: 40, windowId: 4, url: 'https://user.example', title: 'user', active: true, status: 'complete', groupId: -1 });
+    chrome.windows.getAll = vi.fn(async () => [{ id: 4, focused: true, incognito: false, type: 'normal' }]);
+    chrome.windows.getLastFocused = vi.fn(async () => ({ id: 4, focused: true, incognito: false, type: 'normal' }));
+    let nextWindowId = 60;
+    let nextTabId = 600;
+    chrome.windows.create = vi.fn(async ({ url, focused, width, height, type }: any) => {
+      const windowId = nextWindowId++;
+      tabs.push({ id: nextTabId++, windowId, url, title: url ?? 'blank', active: false, status: 'complete', groupId: -1 });
+      return { id: windowId, url, focused, width, height, type };
+    });
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./background');
+    mod.__test__.sessionOverrides.set(browserKey('iso'), { windowMode: 'isolated' });
+    const isoTab = await mod.__test__.resolveTabId(undefined, browserKey('iso'), 'https://iso.example');
+    const isoWindow = tabs.find((tab) => tab.id === isoTab)?.windowId;
+
+    // Default mode after that must still land where the person is. The role has
+    // one container slot, so without re-asking, the isolated window it now holds
+    // would silently swallow work the person explicitly asked to watch.
+    const defTab = await mod.__test__.resolveTabId(undefined, browserKey('later'), 'https://later.example');
+    expect(tabs.find((tab) => tab.id === defTab)?.windowId).toBe(4);
+    expect(isoWindow).not.toBe(4);
+  });
+
   it('carries every window mode through to the session override', async () => {
     const { chrome } = createChromeMock();
     vi.stubGlobal('chrome', chrome);

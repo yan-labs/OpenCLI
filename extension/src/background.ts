@@ -1065,12 +1065,26 @@ async function ensureOwnedContainerWindowUnlocked(
     container.groupId = null;
     container.borrowed = false;
   }
-  // Borrowing is not owning. A window we borrowed once is not ours to keep coming
-  // back to — the person moves on, and piling every later session into the window
-  // they were in an hour ago is the same complaint as opening a new one, just
-  // quieter. So whenever the container is borrowed, re-ask where they are now.
-  if (!wantsDedicated && role === 'interactive' && container.borrowed && container.windowId !== null) {
-    const current = await findHostWindowForContainer(container.windowId);
+  // Where is the person right now? Ask on every non-isolated session, and move
+  // the container if the answer changed. Two different ways this goes wrong
+  // without it, and the role only has one container slot to express both:
+  //
+  //  - a window we borrowed once is not ours to keep coming back to. The person
+  //    moves on, and piling every later session into the window they were in an
+  //    hour ago is the same complaint as opening a new one, just quieter.
+  //  - a dedicated window created for `--window isolated` would otherwise
+  //    capture every later default-mode session too, silently sending work the
+  //    person asked to see into the window they cannot see.
+  //
+  // `findHostWindowForContainer` skips our own container windows, so this only
+  // ever moves toward a real window of theirs. No such window (every window is
+  // ours) leaves the container alone rather than spawning another one.
+  if (!wantsDedicated && role === 'interactive' && container.windowId !== null) {
+    // A borrowed container is one of the person's own windows, so it stays a
+    // legitimate candidate — otherwise we would move away from it every time.
+    // A dedicated one must not be: keeping it eligible is exactly how default
+    // sessions got captured by the isolated window.
+    const current = await findHostWindowForContainer(container.borrowed ? container.windowId : undefined);
     if (current !== undefined && current !== container.windowId) {
       container.windowId = null;
       container.groupId = null;
@@ -1126,7 +1140,18 @@ async function ensureOwnedContainerWindowUnlocked(
 
   // Adopting a stray group would land us right back in whatever window it lives in,
   // which is the thing `isolated` exists to avoid.
-  const existingGroup = wantsDedicated ? null : await ensureOwnedContainerGroup(role, null, []);
+  // Decide the destination BEFORE adopting a group. Group convergence walks to
+  // the canonical group wherever it lives, so adopting first quietly overrides
+  // everything decided above — that is how the third variant of this bug worked:
+  // the container was correctly moved off the isolated window, and then the
+  // group sitting in that window pulled it straight back.
+  const hostWindowId = (role === 'interactive' && !wantsDedicated)
+    ? await findHostWindowForContainer()
+    : undefined;
+
+  const existingGroup = wantsDedicated
+    ? null
+    : await ensureOwnedContainerGroup(role, null, [], hostWindowId);
   if (existingGroup) {
     await focusOwnedWindowIfRequested(existingGroup.windowId, mode);
     const initialTabId = await findReusableOwnedContainerTab(existingGroup.windowId, existingGroup.id);
@@ -1139,12 +1164,7 @@ async function ensureOwnedContainerWindowUnlocked(
 
   const startUrl = (initialUrl && isSafeNavigationUrl(initialUrl)) ? initialUrl : BLANK_PAGE;
 
-  // Prefer opening a tab in the window the person is already using. `isolated`
-  // opts back into a dedicated window, and the adapter role always gets one.
-  const hostWindowId = (role === 'interactive' && mode !== 'isolated')
-    ? await findHostWindowForContainer()
-    : undefined;
-
+  // hostWindowId was resolved above, before group adoption could override it.
   let initialTabId: number | undefined;
 
   if (hostWindowId !== undefined) {
@@ -1203,13 +1223,16 @@ async function ensureOwnedContainerWindowUnlocked(
       }
     });
   }
-  // Pin the group to this window when a dedicated one was requested, otherwise
-  // convergence adopts the group in the person's window and moves the tab there.
+  // Always pin: by this point the window is decided — created, or borrowed from
+  // the person — and convergence must not relocate the tab we just put there.
+  // Pinning only for `isolated` was not enough: a default-mode session created
+  // its tab in the right window and then got dragged into whichever window held
+  // the canonical group, which after any isolated run was the dedicated one.
   const group = await ensureOwnedContainerGroup(
     role,
     container.windowId,
     [initialTabId],
-    wantsDedicated ? container.windowId ?? undefined : undefined,
+    container.windowId ?? undefined,
   );
   await persistRuntimeState();
   return { windowId: group?.windowId ?? container.windowId, initialTabId };
