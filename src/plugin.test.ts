@@ -234,24 +234,33 @@ describe('validatePluginStructure', () => {
 });
 
 describe('lock file', () => {
-  const backupPath = `${getLockFilePath()}.test-backup`;
-  let hadOriginal = false;
+  // These tests used to read and write the real ~/.opencli/plugins.lock.json and
+  // put it back afterwards. Backup-and-restore only covers the file it knows
+  // about: the atomic writer also drops a `.plugins.lock.json.tmp-<pid>-...`
+  // beside it, and the failure test deliberately injects a no-op `rmSync`, so
+  // that temp file was never cleaned up and accumulated in the developer's home
+  // directory — 37 of them before anyone noticed. Point HOME at a temp dir
+  // instead: `getHomeDir()` reads it at call time, so everything these tests
+  // write lands somewhere that gets deleted wholesale.
+  let homeDir: string;
+  let originalHome: string | undefined;
+  let originalUserProfile: string | undefined;
 
   beforeEach(() => {
-    hadOriginal = fs.existsSync(getLockFilePath());
-    if (hadOriginal) {
-      fs.mkdirSync(path.dirname(backupPath), { recursive: true });
-      fs.copyFileSync(getLockFilePath(), backupPath);
-    }
+    originalHome = process.env.HOME;
+    originalUserProfile = process.env.USERPROFILE;
+    homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'opencli-lock-test-'));
+    process.env.HOME = homeDir;
+    process.env.USERPROFILE = homeDir;
+    fs.mkdirSync(path.join(homeDir, '.opencli'), { recursive: true });
   });
 
   afterEach(() => {
-    if (hadOriginal) {
-      fs.copyFileSync(backupPath, getLockFilePath());
-      fs.unlinkSync(backupPath);
-      return;
-    }
-    try { fs.unlinkSync(getLockFilePath()); } catch {}
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+    if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = originalUserProfile;
+    fs.rmSync(homeDir, { recursive: true, force: true });
   });
 
   it('reads empty lock when file does not exist', () => {
