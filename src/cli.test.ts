@@ -72,7 +72,7 @@ describe('createProgram root help descriptions', () => {
     expect(descriptionFor(program, 'plugin')).toBe('create, install, list, uninstall, update');
     expect(descriptionFor(program, 'adapter')).toBe('eject, reset, status');
     expect(descriptionFor(program, 'profile')).toBe('list, rename, use');
-    expect(descriptionFor(program, 'daemon')).toBe('restart, status, stop');
+    expect(descriptionFor(program, 'daemon')).toBe('logs, restart, status, stop');
     expect(descriptionFor(program, 'external')).toBe('install, list, register');
   });
 
@@ -667,11 +667,11 @@ describe('createProgram root help descriptions', () => {
         command: 'opencli daemon',
         usage: 'opencli daemon <command> [args] [options]',
         description: 'Manage the opencli daemon',
-        command_count: 3,
+        command_count: 4,
         namespace_options: [],
         structured_help: { usage: 'opencli daemon --help -f yaml' },
       });
-      expect(data.commands.map((cmd: any) => cmd.name)).toEqual(['restart', 'status', 'stop']);
+      expect(data.commands.map((cmd: any) => cmd.name)).toEqual(['logs', 'restart', 'status', 'stop']);
       expect(data.global_options.map((option: any) => option.name)).toEqual(expect.arrayContaining(['version', 'profile']));
     } finally {
       process.argv = argv;

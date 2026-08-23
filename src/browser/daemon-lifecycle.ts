@@ -37,6 +37,9 @@ export function resolveDaemonLaunchSpec(): DaemonLaunchSpec {
 
 export function spawnDaemonProcess(): ChildProcess {
   const launch = resolveDaemonLaunchSpec();
+  // stdio stays ignored on purpose: the daemon writes its own logs, split by
+  // kind, via installDaemonLogSink() — see src/daemon-logs.ts. Piping the raw
+  // stream here as well would only produce a second, unclassified copy.
   const proc = spawn(launch.binary, launch.args, {
     detached: true,
     stdio: 'ignore',

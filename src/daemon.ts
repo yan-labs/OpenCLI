@@ -42,6 +42,11 @@ import {
   getSessionLeaseKey,
   isSessionLeaseCommand,
 } from './session-lease.js';
+import { installDaemonLogSink } from './daemon-logs.js';
+
+// Before anything else can log: the daemon is detached with no terminal, so
+// without this every record it writes is lost at the moment it is produced.
+installDaemonLogSink();
 
 const PORT = DEFAULT_DAEMON_PORT;
 if (!isIgnorableDaemonPortEnv(process.env.OPENCLI_DAEMON_PORT)) {

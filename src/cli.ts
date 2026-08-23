@@ -3757,6 +3757,49 @@ cli({
     .command('restart')
     .description('Restart the daemon')
     .action(async () => { await daemonRestart(); });
+  daemonCmd
+    .command('logs')
+    .description('Show the daemon logs, split by kind (errors | commands | extension | daemon)')
+    .argument('[stream]', 'Which log to read: daemon, commands, extension, or errors', 'errors')
+    .option('-n, --lines <n>', 'How many trailing lines to print', '100')
+    .option('-g, --grep <pattern>', 'Only lines matching this (case-insensitive)')
+    .option('--all', 'Print the whole file instead of the tail')
+    .option('--path', 'Print the log directory and exit')
+    .action(async function daemonLogsAction(this: Command, stream: string) {
+      const { DAEMON_LOG_STREAMS, daemonLogDir, daemonLogPath } = await import('./daemon-logs.js');
+      const fsp = await import('node:fs/promises');
+      const opts = this.opts();
+      if (opts.path) { console.log(daemonLogDir()); return; }
+      if (!(DAEMON_LOG_STREAMS as string[]).includes(stream)) {
+        // Name the choices rather than just rejecting: the whole point of
+        // splitting the logs is that the reader picks the right one up front.
+        log.error(`Unknown log "${stream}". Choose one of: ${DAEMON_LOG_STREAMS.join(', ')}`);
+        log.error('  errors    — every warning and failure, whatever produced it. Start here.');
+        log.error('  commands  — commands that went wrong: timeouts, dispatch failures, results lost to a disconnect');
+        log.error('  extension — messages relayed from the browser extension');
+        log.error('  daemon    — lifecycle: startup, shutdown, extension connect/disconnect');
+        process.exit(EXIT_CODES.USAGE_ERROR);
+      }
+      const file = daemonLogPath(stream as never);
+      let text: string;
+      try {
+        text = await fsp.readFile(file, 'utf8');
+      } catch {
+        // Saying where it would be is what makes "nothing here" actionable.
+        console.log(`No ${stream} log yet at ${file}.`);
+        console.log('Logs are written from the next daemon start onward: opencli daemon restart');
+        return;
+      }
+      let lines = text.split('\n').filter(Boolean);
+      if (opts.grep) {
+        const needle = String(opts.grep).toLowerCase();
+        lines = lines.filter(line => line.toLowerCase().includes(needle));
+      }
+      const n = Number.parseInt(String(opts.lines), 10);
+      const tail = opts.all || !Number.isFinite(n) || n <= 0 ? lines : lines.slice(-n);
+      if (tail.length === 0) { console.log(`(no matching lines in ${stream})`); return; }
+      console.log(tail.join('\n'));
+    });
 
   // ── External CLIs ─────────────────────────────────────────────────────────
 

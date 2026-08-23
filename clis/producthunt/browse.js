@@ -54,15 +54,27 @@ cli({
           const href = cardLink.getAttribute('href');
           if (!href || seen.has(href)) continue;
 
-          // Child 0: div with name (strip "Launched this month/week/year" noise)
-          const nameDiv = cardLink.querySelector('div');
-          const rawName = nameDiv?.textContent?.trim() || '';
+          // Name: two card shapes coexist on the same page.
+          //   big card:   <a><div><span class="...text-primary">Name</span></div>...
+          //   small card: <a><span class="...text-primary">Name</span>...   (no <div>)
+          // Both keep the name inside this <a>, so read the primary span first and
+          // only fall back to the wrapper <div>. Reading the <div> alone yielded
+          // an empty name for every small card, and the "if (!name) continue"
+          // guard below then dropped them silently (3 of 18 cards on
+          // /categories/ai-agents, verified 2026-08-24).
+          // NOTE: this whole block lives inside a template literal — no backticks.
+          const nameEl = cardLink.querySelector('span[class*="text-primary"]')
+            || cardLink.querySelector('div');
+          const rawName = nameEl?.textContent?.trim() || '';
           const name = rawName
             .replace(/\\s*Launched\\s+this\\s+(month|week|year|day)\\s*/gi, '')
             .replace(/\\s*Featured\\s*/gi, '')
             .trim();
 
-          // Child 1: span.text-secondary — tagline
+          // Tagline: span.text-secondary, queried on the card <a> itself.
+          // querySelector only walks this anchor's own subtree, and each card holds
+          // exactly one such span and zero nested <a> (checked across all 18 cards of
+          // /categories/ai-agents, 2026-08-24), so it cannot bleed into a neighbour.
           const taglineEl = cardLink.querySelector('span.text-secondary, span[class*="text-secondary"]');
           const tagline = taglineEl?.textContent?.trim() || '';
 
