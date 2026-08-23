@@ -302,6 +302,40 @@ describe('doctor report rendering', () => {
     ]));
   });
 
+  it('flags the Chrome Web Store extension, which works while behaving like upstream', async () => {
+    const status = {
+      state: 'ready' as const,
+      status: {
+        extensionConnected: true,
+        extensionVersion: '1.0.22',
+      },
+    };
+    mockGetDaemonHealth.mockResolvedValue(status);
+
+    const report = await runBrowserDoctor();
+
+    // The failure mode this catches is silent: every command succeeds, and only the
+    // behaviour is wrong (foreground default, its own window, stolen active tab).
+    expect(report.issues).toEqual(expect.arrayContaining([
+      expect.stringContaining('Chrome Web Store extension'),
+    ]));
+  });
+
+  it('says nothing about the store build once the extension is new enough', async () => {
+    const status = {
+      state: 'ready' as const,
+      status: {
+        extensionConnected: true,
+        extensionVersion: '1.0.27',
+      },
+    };
+    mockGetDaemonHealth.mockResolvedValue(status);
+
+    const report = await runBrowserDoctor();
+
+    expect(report.issues.join('\n')).not.toContain('Chrome Web Store extension');
+  });
+
   it('reports an issue when daemon version differs from CLI version', async () => {
     const status = {
       state: 'ready' as const,
