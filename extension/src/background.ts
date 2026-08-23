@@ -1080,7 +1080,18 @@ async function ensureOwnedContainerWindowUnlocked(
   if (container.windowId !== null) {
     try {
       await chrome.windows.get(container.windowId);
-      const group = await ensureOwnedContainerGroup(role, container.windowId, []);
+      // Pin here too, not just on the create path. Without it, a second
+      // `--window isolated` session takes the reuse branch, convergence adopts
+      // the canonical group wherever it lives — usually the person's window —
+      // and the flag is silently ignored while the first isolated session loses
+      // its container. Reuse is exactly where a dedicated window is easiest to
+      // lose, because nothing is being created to pin.
+      const group = await ensureOwnedContainerGroup(
+        role,
+        container.windowId,
+        [],
+        wantsDedicated ? container.windowId : undefined,
+      );
       if (group) {
         await focusOwnedWindowIfRequested(group.windowId, mode);
         const initialTabId = await findReusableOwnedContainerTab(group.windowId, group.id);
@@ -1091,7 +1102,12 @@ async function ensureOwnedContainerWindowUnlocked(
       }
       await focusOwnedWindowIfRequested(container.windowId, mode);
       const initialTabId = await findReusableOwnedContainerTab(container.windowId, null);
-      const createdGroup = await ensureOwnedContainerGroup(role, container.windowId, [initialTabId]);
+      const createdGroup = await ensureOwnedContainerGroup(
+        role,
+        container.windowId,
+        [initialTabId],
+        wantsDedicated ? container.windowId : undefined,
+      );
       if (createdGroup) {
         return {
           windowId: createdGroup.windowId,

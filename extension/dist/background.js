@@ -1473,7 +1473,12 @@ async function ensureOwnedContainerWindowUnlocked(role, initialUrl, mode = "back
   if (container.windowId !== null) {
     try {
       await chrome.windows.get(container.windowId);
-      const group2 = await ensureOwnedContainerGroup(role, container.windowId, []);
+      const group2 = await ensureOwnedContainerGroup(
+        role,
+        container.windowId,
+        [],
+        wantsDedicated ? container.windowId : void 0
+      );
       if (group2) {
         await focusOwnedWindowIfRequested(group2.windowId, mode);
         const initialTabId3 = await findReusableOwnedContainerTab(group2.windowId, group2.id);
@@ -1484,7 +1489,12 @@ async function ensureOwnedContainerWindowUnlocked(role, initialUrl, mode = "back
       }
       await focusOwnedWindowIfRequested(container.windowId, mode);
       const initialTabId2 = await findReusableOwnedContainerTab(container.windowId, null);
-      const createdGroup = await ensureOwnedContainerGroup(role, container.windowId, [initialTabId2]);
+      const createdGroup = await ensureOwnedContainerGroup(
+        role,
+        container.windowId,
+        [initialTabId2],
+        wantsDedicated ? container.windowId : void 0
+      );
       if (createdGroup) {
         return {
           windowId: createdGroup.windowId,

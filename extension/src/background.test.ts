@@ -1406,6 +1406,43 @@ describe('background tab isolation', () => {
     expect(tabs.find((tab) => tab.id === tabId)?.windowId).toBe(9);
   });
 
+  it('keeps a second isolated session in the dedicated window instead of killing the first', async () => {
+    const { chrome, tabs, groups } = createChromeMock();
+    // The person's window already carries an OpenCLI group from earlier work —
+    // the convergence target that used to swallow the second isolated session.
+    tabs.length = 0;
+    tabs.push({ id: 40, windowId: 4, url: 'https://user.example', title: 'user', active: true, status: 'complete', groupId: -1 });
+    tabs.push({ id: 41, windowId: 4, url: 'https://earlier.example', title: 'earlier', active: false, status: 'complete', groupId: 900 });
+    groups.push({ id: 900, windowId: 4, title: 'OpenCLI: earlier', color: 'orange', collapsed: false });
+    chrome.windows.getAll = vi.fn(async () => [{ id: 4, focused: true, incognito: false, type: 'normal' }]);
+    chrome.windows.getLastFocused = vi.fn(async () => ({ id: 4, focused: true, incognito: false, type: 'normal' }));
+    let nextWindowId = 60;
+    let nextTabId = 600;
+    chrome.windows.create = vi.fn(async ({ url, focused, width, height, type }: any) => {
+      const windowId = nextWindowId++;
+      tabs.push({ id: nextTabId++, windowId, url, title: url ?? 'blank', active: false, status: 'complete', groupId: -1 });
+      return { id: windowId, url, focused, width, height, type };
+    });
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./background');
+    mod.__test__.sessionOverrides.set(browserKey('isoA'), { windowMode: 'isolated' });
+    mod.__test__.sessionOverrides.set(browserKey('isoB'), { windowMode: 'isolated' });
+
+    const tabA = await mod.__test__.resolveTabId(undefined, browserKey('isoA'), 'https://a.example');
+    const windowA = tabs.find((tab) => tab.id === tabA)?.windowId;
+    const tabB = await mod.__test__.resolveTabId(undefined, browserKey('isoB'), 'https://b.example');
+    const windowB = tabs.find((tab) => tab.id === tabB)?.windowId;
+
+    // Neither may fall back into window 4, and the first session must survive the
+    // second: previously B took the reuse branch, convergence pulled it into the
+    // person's window, and A silently lost its container.
+    expect(windowA).not.toBe(4);
+    expect(windowB).not.toBe(4);
+    expect(mod.__test__.getSession(browserKey('isoA'))).toBeTruthy();
+    expect(mod.__test__.getSession(browserKey('isoB'))).toBeTruthy();
+  });
+
   it('carries every window mode through to the session override', async () => {
     const { chrome } = createChromeMock();
     vi.stubGlobal('chrome', chrome);
