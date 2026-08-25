@@ -11,7 +11,6 @@ import {
   setDaemonCommandTimeoutSeconds,
   setDaemonRunContext,
 } from './daemon-client.js';
-import { SessionBusyError } from '../errors.js';
 import * as daemonLifecycle from './daemon-lifecycle.js';
 
 describe('daemon-client', () => {
@@ -291,23 +290,27 @@ describe('daemon-client', () => {
     expect(body.access).toBeUndefined();
   });
 
-  it('throws a terminal SessionBusyError on a session_busy response without retrying', async () => {
-    vi.mocked(fetch).mockResolvedValue({
-      status: 409,
-      json: () => Promise.resolve({
-        id: 'server',
-        ok: false,
-        errorCode: 'session_busy',
-        error: 'Session "site:chatgpt" is busy: chatgpt ask (pid 111) has been driving it for 42s.',
-        errorHint: 'Wait for it to finish, or stop it with `kill 111` if it is stuck. Read-only commands are not blocked.',
-      }),
-    } as Response);
+  it('waits locally on session_busy and then runs without surfacing a retryable error', async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce({
+        status: 409,
+        json: () => Promise.resolve({
+          id: 'server',
+          ok: false,
+          errorCode: 'session_busy',
+          error: 'Session "site:chatgpt" is busy: chatgpt ask (pid 111) has been driving it for 42s.',
+          retryAfterMs: 10,
+        }),
+      } as Response)
+      .mockResolvedValueOnce({
+        status: 200,
+        json: () => Promise.resolve({ id: 'server', ok: true, data: 'ok' }),
+      } as Response);
 
     await expect(
       sendCommand('exec', { code: '1 + 1', surface: 'adapter', session: 'site:chatgpt', siteSession: 'persistent' }),
-    ).rejects.toBeInstanceOf(SessionBusyError);
-    // Terminal: no ensure-bridge / re-dispatch — exactly one request went out.
-    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1);
+    ).resolves.toBe('ok');
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
   });
 
   it('sendCommand forwards OPENCLI_PROFILE as a hard contextId requirement', async () => {

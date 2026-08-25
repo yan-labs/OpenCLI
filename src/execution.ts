@@ -26,7 +26,7 @@ import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import { executePipeline } from './pipeline/index.js';
-import { adapterLoadError, ArgumentError, CommandExecutionError, SessionBusyError, attachTraceReceipt, getErrorMessage } from './errors.js';
+import { adapterLoadError, ArgumentError, CommandExecutionError, SessionBusyError, SessionQueueTimeoutError, attachTraceReceipt, getErrorMessage } from './errors.js';
 import { shouldUseBrowserSession } from './capabilityRouting.js';
 import { getBrowserFactory, browserSession, runWithTimeout, DEFAULT_BROWSER_COMMAND_TIMEOUT, type BrowserWindowMode } from './runtime.js';
 import { profileRouteParams, resolveProfileSelection } from './browser/profile.js';
@@ -328,9 +328,10 @@ export async function executeCommand(
               data: { url: preNavUrl },
             });
           } catch (err) {
-            // A busy-session rejection is the whole point of the arbitration —
-            // surface it verbatim instead of burying it in a pre-nav wrapper.
-            if (err instanceof SessionBusyError) throw err;
+            // Older daemons may still return a terminal busy response; surface
+            // it verbatim instead of burying it in a pre-nav wrapper. Current
+            // daemons are waited out inside daemon-client before this point.
+            if (err instanceof SessionBusyError || err instanceof SessionQueueTimeoutError) throw err;
             observation?.record({
               stream: 'action',
               name: 'pre_navigate',

@@ -16,6 +16,9 @@ const {
   mockBrowserClose,
   mockBindTab,
   mockSendCommand,
+  mockSetDaemonRunContext,
+  mockClearDaemonRunContext,
+  mockReleaseSessionLease,
   mockExecFileSync,
   browserState,
 } = vi.hoisted(() => ({
@@ -23,6 +26,9 @@ const {
   mockBrowserClose: vi.fn(),
   mockBindTab: vi.fn(),
   mockSendCommand: vi.fn(),
+  mockSetDaemonRunContext: vi.fn(),
+  mockClearDaemonRunContext: vi.fn(),
+  mockReleaseSessionLease: vi.fn(),
   mockExecFileSync: vi.fn(),
   browserState: { page: null as IPage | null },
 }));
@@ -43,6 +49,9 @@ vi.mock('./browser/daemon-client.js', async () => {
     ...actual,
     bindTab: mockBindTab,
     sendCommand: mockSendCommand,
+    setDaemonRunContext: mockSetDaemonRunContext,
+    clearDaemonRunContext: mockClearDaemonRunContext,
+    releaseSiteSessionLease: mockReleaseSessionLease,
   };
 });
 
@@ -1179,6 +1188,9 @@ describe('browser tab targeting commands', () => {
       title: 'Inbox',
     });
     mockSendCommand.mockReset().mockResolvedValue({ closed: true });
+    mockSetDaemonRunContext.mockClear();
+    mockClearDaemonRunContext.mockClear();
+    mockReleaseSessionLease.mockReset().mockResolvedValue(undefined);
 
     browserState.page = {
       goto: vi.fn().mockResolvedValue(undefined),
@@ -1258,6 +1270,12 @@ describe('browser tab targeting commands', () => {
     // active tab unless someone asked for foreground explicitly.
     expect(mockBrowserConnect).toHaveBeenCalledWith({ timeout: 45, session: 'test', surface: 'browser', windowMode: 'background' });
     expect(browserState.page?.snapshot).toHaveBeenCalled();
+    expect(mockSetDaemonRunContext).toHaveBeenCalledWith(expect.objectContaining({
+      runId: expect.stringMatching(/^run_/), command: 'browser state', access: 'read',
+    }));
+    const runId = mockSetDaemonRunContext.mock.calls.at(-1)?.[0].runId;
+    expect(mockClearDaemonRunContext).toHaveBeenCalledWith(runId);
+    expect(mockReleaseSessionLease).toHaveBeenCalledWith({ runId, session: 'test', surface: 'browser' });
   });
 
   it('passes browser --window through Commander options without relying on env pre-processing', async () => {
@@ -1358,6 +1376,35 @@ describe('browser tab targeting commands', () => {
     await program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'back']);
 
     expect(browserState.page?.evaluate).toHaveBeenCalledWith('history.back()');
+    expect(mockSetDaemonRunContext).toHaveBeenCalledWith(expect.objectContaining({
+      command: 'browser back', access: 'write',
+    }));
+  });
+
+  it('treats a batch as write when any nested command writes', async () => {
+    const program = createProgram('', '');
+
+    await program.parseAsync([
+      'node', 'opencli', 'browser', '--session', 'test', 'batch', '--commands',
+      JSON.stringify([{ cmd: 'state' }, { cmd: 'click', args: { target: '#save' } }]),
+    ]);
+
+    expect(mockSetDaemonRunContext).toHaveBeenCalledWith(expect.objectContaining({
+      command: 'browser batch', access: 'write',
+    }));
+  });
+
+  it('keeps an all-read batch parallel-safe', async () => {
+    const program = createProgram('', '');
+
+    await program.parseAsync([
+      'node', 'opencli', 'browser', '--session', 'test', 'batch', '--commands',
+      JSON.stringify([{ cmd: 'state' }, { cmd: 'wait', args: { seconds: 0 } }]),
+    ]);
+
+    expect(mockSetDaemonRunContext).toHaveBeenCalledWith(expect.objectContaining({
+      command: 'browser batch', access: 'read',
+    }));
   });
 
   it('unbinds a session through the daemon close-window command', async () => {

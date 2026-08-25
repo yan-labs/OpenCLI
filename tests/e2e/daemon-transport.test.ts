@@ -195,6 +195,60 @@ describe('daemon transport contracts (real daemon)', () => {
     }
   });
 
+  it('rejects concurrent browser writes on one session while allowing reads', async () => {
+    if (guard()) return;
+    const ext = new FakeExtension();
+    let heldId = '';
+    ext.onCommand = (cmd) => {
+      if (!heldId) {
+        heldId = String(cmd.id);
+        return null;
+      }
+      return { id: String(cmd.id), ok: true, data: { echo: cmd.action } };
+    };
+    await ext.connect('ctx-browser-lease');
+    try {
+      const firstId = cmdId();
+      const first = postCommand({
+        id: firstId, action: 'navigate', url: 'https://example.com', session: 'shared',
+        surface: 'browser', contextId: 'ctx-browser-lease', access: 'write', runId: 'run_111_1_a', command: 'browser open',
+      });
+      await waitFor(() => ext.dispatchCountFor(firstId) === 1, 5_000, 'first write was not dispatched');
+
+      const rivalId = cmdId();
+      const rival = await postCommand({
+        id: rivalId, action: 'exec', code: 'document.body.click()', session: 'shared',
+        surface: 'browser', contextId: 'ctx-browser-lease', access: 'write', runId: 'run_222_2_b', command: 'browser click',
+      });
+      expect(rival.status).toBe(409);
+      expect(rival.result.errorCode).toBe('session_busy');
+      expect(rival.result.retryAfterMs).toBe(2_000);
+      expect(ext.dispatchCountFor(rivalId)).toBe(0);
+
+      const readId = cmdId();
+      const read = await postCommand({
+        id: readId, action: 'exec', code: 'document.title', session: 'shared',
+        surface: 'browser', contextId: 'ctx-browser-lease', access: 'read', runId: 'run_333_3_c', command: 'browser state',
+      });
+      expect(read.result.ok).toBe(true);
+      expect(ext.dispatchCountFor(readId)).toBe(1);
+
+      ext.send({ id: firstId, ok: true, data: 'opened' });
+      expect((await first).result.ok).toBe(true);
+      await postCommand({ id: cmdId(), action: 'lease-release', runId: 'run_111_1_a' });
+
+      const retryId = cmdId();
+      const retry = await postCommand({
+        id: retryId, action: 'exec', code: 'document.body.click()', session: 'shared',
+        surface: 'browser', contextId: 'ctx-browser-lease', access: 'write', runId: 'run_222_2_b', command: 'browser click',
+      });
+      expect(retry.result.ok).toBe(true);
+      expect(ext.dispatchCountFor(retryId)).toBe(1);
+    } finally {
+      ext.close();
+    }
+  });
+
   it('attaches a duplicate command id to the pending command instead of re-dispatching', async () => {
     if (guard()) return;
     const ext = new FakeExtension();

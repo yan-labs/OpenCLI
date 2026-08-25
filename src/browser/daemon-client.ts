@@ -5,7 +5,8 @@
  */
 
 import { sleep } from '../utils.js';
-import { BrowserConnectError, SessionBusyError } from '../errors.js';
+import { BrowserConnectError, SessionBusyError, SessionQueueTimeoutError } from '../errors.js';
+import { log } from '../logger.js';
 import { COMMAND_RESULT_UNKNOWN_CODE, COMMAND_RESULT_UNKNOWN_HINT } from '../daemon-utils.js';
 import { classifyBrowserError } from './errors.js';
 import { profileRouteParams, resolveProfileSelection } from './profile.js';
@@ -65,14 +66,14 @@ export function clearDaemonRunContext(runId: string): void {
 }
 
 /**
- * Best-effort release of a persistent site-session lease on command completion.
+ * Best-effort release of a session lease on command completion.
  * A direct one-shot POST (no bridge ensure / retry): if it never lands, the
  * daemon's TTL reclaims the lease anyway, so this must never block the caller.
  */
 export async function releaseSiteSessionLease(params: {
   runId: string;
   session: string;
-  surface: 'adapter';
+  surface: 'adapter' | 'browser';
 }): Promise<void> {
   try {
     await requestDaemon('/command', {
@@ -152,7 +153,8 @@ const UNKNOWN_OUTCOME_CODES = new Set(['command_result_unknown', 'command_lost',
  * command may still be running even though the client gave up. Callers use this
  * to decide whether it is safe to release a persistent site-session lease: it is
  * not, because the still-running command keeps mutating the tab. Walks the cause
- * chain so a wrapped `BrowserCommandError` is still recognized.
+ * chain so a wrapped `BrowserCommandError` is still recognized. Browser CLI
+ * calls currently follow their explicit finally-release contract.
  */
 export function isUnknownOutcomeError(err: unknown): boolean {
   const seen = new Set<unknown>();
@@ -168,6 +170,8 @@ export function isUnknownOutcomeError(err: unknown): boolean {
 
 /** Max transport attempts for one logical command (same id throughout). */
 const TRANSPORT_MAX_ATTEMPTS = 4;
+const SESSION_QUEUE_RETRY_MS = 2_000;
+const SESSION_QUEUE_MAX_WAIT_MS = 10 * 60_000;
 
 /**
  * undici surfaces network failures as `TypeError: fetch failed` with the real
@@ -280,6 +284,8 @@ export interface DaemonResult {
   error?: string;
   errorCode?: string;
   errorHint?: string;
+  /** Local-daemon queue poll delay. No browser/site request was dispatched. */
+  retryAfterMs?: number;
   /** Page identity (targetId) — present on page-scoped command responses */
   page?: string;
 }
@@ -327,7 +333,7 @@ async function sendCommandRaw(
   params: Omit<DaemonCommand, 'id' | 'action'>,
 ): Promise<DaemonResult> {
   const timeoutSeconds = effectiveCommandTimeoutSeconds(params);
-  const deadlineAt = Date.now() + timeoutSeconds * 1000;
+  let deadlineAt = Date.now() + timeoutSeconds * 1000;
   const rawWindowMode = process.env.OPENCLI_WINDOW;
   const envWindowMode = rawWindowMode === 'foreground' || rawWindowMode === 'background'
     ? rawWindowMode
@@ -345,6 +351,8 @@ async function sendCommandRaw(
   let ensureUsed = false;
   let semanticRetryUsed = false;
   let executorJournaled: boolean | null = null;
+  let queuedAt: number | null = null;
+  let queueNoticeShown = false;
 
   const ensureBridge = async (): Promise<void> => {
     // Bound the connect wait by the command's remaining budget so repeated
@@ -381,9 +389,9 @@ async function sendCommandRaw(
       ...(contextId && { contextId }),
       ...(preferredContextId && { preferredContextId }),
       ...(windowMode && { windowMode }),
-      // Carry the run identity so the daemon can acquire/refresh the write
-      // lease on the persistent site session. The same runId across every exec
-      // of one command is the heartbeat that keeps a long-running holder alive.
+      // Carry the run identity so the daemon can acquire/refresh a write lease.
+      // The same runId across every daemon command in one CLI invocation is the
+      // heartbeat that keeps a long-running holder alive.
       ...(_runContext && {
         runId: _runContext.runId,
         command: _runContext.command,
@@ -402,11 +410,33 @@ async function sendCommandRaw(
 
       if (result.ok) return result;
 
-      // A second concurrent write on the same persistent site session is
-      // rejected before the daemon dispatches anything — terminal, never
-      // retried, and surfaced as a CliError so the busy message is the output.
+      // A second concurrent write has not reached Chrome or the target site.
+      // Keep this CLI invocation alive and retry only the local daemon until
+      // the holder releases the lease, instead of making the outer agent guess
+      // whether it should retry (and usually creating a retry storm).
       if (result.errorCode === 'session_busy') {
-        throw new SessionBusyError(result.error ?? 'The site session is busy.', result.errorHint);
+        const now = Date.now();
+        queuedAt ??= now;
+        const waitedMs = now - queuedAt;
+        if (waitedMs >= SESSION_QUEUE_MAX_WAIT_MS) {
+          throw new SessionQueueTimeoutError(
+            `${result.error ?? 'The previous command still holds the session.'} Waited ${Math.round(waitedMs / 1000)}s in the local queue. This command was not sent to Chrome or the target site.`,
+            'Do not retry immediately. Use a unique session name, or inspect and stop the previous holder if it is stuck.',
+          );
+        }
+        const suggestedMs = typeof result.retryAfterMs === 'number' && Number.isFinite(result.retryAfterMs)
+          ? result.retryAfterMs
+          : SESSION_QUEUE_RETRY_MS;
+        const retryMs = Math.min(Math.max(250, suggestedMs), SESSION_QUEUE_MAX_WAIT_MS - waitedMs);
+        if (!queueNoticeShown) {
+          log.status(`${result.error ?? 'The session is in use.'} Queued locally; checking again in ${Math.ceil(retryMs / 1000)}s. No request has been sent to the target site.`);
+          queueNoticeShown = true;
+        }
+        const sleepStartedAt = Date.now();
+        await sleep(retryMs);
+        deadlineAt += Date.now() - sleepStartedAt;
+        attempt--;
+        continue;
       }
 
       if (result.errorCode && UNKNOWN_OUTCOME_CODES.has(result.errorCode)) {
@@ -444,7 +474,7 @@ async function sendCommandRaw(
 
       throw new BrowserCommandError(result.error ?? 'Daemon command failed', result.errorCode, result.errorHint);
     } catch (err) {
-      if (err instanceof BrowserCommandError || err instanceof BrowserConnectError || err instanceof SessionBusyError) throw err;
+      if (err instanceof BrowserCommandError || err instanceof BrowserConnectError || err instanceof SessionBusyError || err instanceof SessionQueueTimeoutError) throw err;
 
       if (err instanceof Error && err.name === 'AbortError') {
         throw new BrowserCommandError(

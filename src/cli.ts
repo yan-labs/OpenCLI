@@ -35,7 +35,15 @@ import { analyzeSite, type PageSignals } from './browser/analyze.js';
 import { registerAuthCommands } from './commands/auth.js';
 import { daemonRestart, daemonStatus, daemonStop } from './commands/daemon.js';
 import { log } from './logger.js';
-import { bindTab, BrowserCommandError, sendCommand } from './browser/daemon-client.js';
+import {
+  bindTab,
+  BrowserCommandError,
+  clearDaemonRunContext,
+  generateRunId,
+  releaseSiteSessionLease,
+  sendCommand,
+  setDaemonRunContext,
+} from './browser/daemon-client.js';
 import { fetchDaemonStatus } from './browser/daemon-transport.js';
 import { aliasForContextId, loadProfileConfig, profileRouteParams, renameProfile, resolveProfileSelection, setDefaultProfile, type ProfileSelection } from './browser/profile.js';
 import { formatDaemonVersion, isDaemonStale } from './browser/daemon-version.js';
@@ -1079,16 +1087,57 @@ Examples:
     if (err.hint) log.error(`Hint: ${err.hint}`);
   }
 
-  /** Wrap browser actions with error handling and optional --json output */
+  const browserReadCommands = new Set([
+    'state', 'frames', 'screenshot', 'console', 'find', 'wait', 'extract',
+  ]);
+
+  function browserCommandAccess(command: Command | undefined, args: unknown[]): 'read' | 'write' {
+    if (!command) return 'write';
+    const name = command.name();
+    const parent = command.parent?.name();
+    if (parent === 'tab') return name === 'list' ? 'read' : 'write';
+    if (parent === 'get') return 'read';
+    if (name !== 'batch') return browserReadCommands.has(name) ? 'read' : 'write';
+
+    const raw = (args[0] as { commands?: unknown } | undefined)?.commands;
+    if (typeof raw !== 'string') return 'write';
+    try {
+      const entries = JSON.parse(raw) as Array<{ cmd?: unknown }>;
+      return Array.isArray(entries) && entries.every((entry) =>
+        typeof entry?.cmd === 'string' && browserReadCommands.has(entry.cmd)
+      ) ? 'read' : 'write';
+    } catch {
+      return 'write';
+    }
+  }
+
+  function browserCommandLabel(command: Command | undefined): string {
+    if (!command) return 'browser command';
+    const names: string[] = [];
+    for (let current: Command | null = command; current && current.name() !== 'opencli'; current = current.parent) {
+      names.unshift(current.name());
+    }
+    return names.join(' ');
+  }
+
+  /** Wrap browser actions with error handling, write arbitration, and optional --json output. */
   function browserAction<Args extends unknown[]>(fn: (page: Awaited<ReturnType<typeof getBrowserPage>>, ...args: Args) => Promise<unknown>) {
     return async (...args: Args) => {
       let page: Awaited<ReturnType<typeof getBrowserPage>> | null = null;
+      let runId: string | null = null;
+      let session: string | null = null;
       try {
         const command = args.at(-1) instanceof Command ? args.at(-1) as Command : undefined;
         const targetPage = getBrowserTargetId(command);
-        const session = getBrowserSession(command);
+        session = getBrowserSession(command);
         const profileSelection = getBrowserProfileSelection(command);
         const windowMode = getBrowserWindowMode(command, 'background');
+        runId = generateRunId();
+        setDaemonRunContext({
+          runId,
+          command: browserCommandLabel(command),
+          access: browserCommandAccess(command, args),
+        });
         page = await getBrowserPage(session, targetPage, profileSelection, { windowMode });
         await fn(page, ...args);
       } catch (err) {
@@ -1119,6 +1168,11 @@ Examples:
           }
         }
         process.exitCode = EXIT_CODES.GENERIC_ERROR;
+      } finally {
+        if (runId) {
+          clearDaemonRunContext(runId);
+          if (session) await releaseSiteSessionLease({ runId, session, surface: 'browser' });
+        }
       }
     };
   }
@@ -1134,6 +1188,8 @@ Examples:
       const session = getBrowserSession(command);
       const profileSelection = getBrowserProfileSelection(command);
       const contextId = profileSelection?.contextId;
+      const runId = generateRunId();
+      setDaemonRunContext({ runId, command: browserCommandLabel(command), access: 'write' });
       try {
         const { BrowserBridge } = await import('./browser/index.js');
         const bridge = new BrowserBridge();
@@ -1147,6 +1203,9 @@ Examples:
           log.error(err instanceof Error ? err.message : String(err));
         }
         process.exitCode = EXIT_CODES.GENERIC_ERROR;
+      } finally {
+        clearDaemonRunContext(runId);
+        await releaseSiteSessionLease({ runId, session, surface: 'browser' });
       }
     };
   }

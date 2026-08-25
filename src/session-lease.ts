@@ -8,10 +8,14 @@
  * arbitration at the exec level because two interleaved asks rarely have an
  * exec in flight at the same instant.
  *
+ * Browser CLI writes use the same arbitration so two processes cannot mutate
+ * one named browser session at the same time.
+ *
  * This registry grants ONE logical write lease per (contextId, surface,
  * session) that spans the whole CLI command run. A second concurrent write
- * fails fast, and a lease whose holder died (kill -9, crash) self-expires
- * after TTL of inactivity so a retry succeeds within a bounded time. Each exec
+ * is told to wait locally, and a lease whose holder died (kill -9, crash)
+ * self-expires after TTL of inactivity so the queued command proceeds within
+ * a bounded time. Each exec
  * that flows through refreshes the lease, and a holder whose single exec
  * outlives the TTL (e.g. a slow navigate) is still protected while that exec
  * is in flight (see `hasPendingWork`), so a live long-running holder keeps the
@@ -25,7 +29,7 @@
 /** Inactivity window after which a lease is considered abandoned. */
 export const SESSION_LEASE_TTL_MS = 45_000;
 
-/** Machine-readable error code for the fast-fail busy response. */
+/** Machine-readable code telling the local client to keep waiting. */
 export const SESSION_BUSY_CODE = 'session_busy';
 
 export interface SessionLeaseHolder {
@@ -71,17 +75,17 @@ export type SessionLeaseCommand = {
 };
 
 /**
- * A command is subject to lease arbitration only when it is an adapter write
- * against a persistent site session and carries the identity needed to own a
- * lease. Read commands, ephemeral sessions, and non-adapter surfaces are never
- * arbitrated — a user mid-ask must still be able to check state.
+ * A command is subject to lease arbitration when it is either an adapter write
+ * against a persistent site session or a browser-surface write. Both must carry
+ * the identity needed to own a lease. Reads and ephemeral adapter sessions are
+ * never arbitrated — a user mid-write must still be able to inspect state.
  */
 export function isSessionLeaseCommand<T extends SessionLeaseCommand>(
   command: T,
-): command is T & { surface: 'adapter'; siteSession: 'persistent'; access: 'write'; session: string; runId: string } {
+): command is T & { surface: 'adapter' | 'browser'; access: 'write'; session: string; runId: string } {
   return (
-    command.surface === 'adapter' &&
-    command.siteSession === 'persistent' &&
+    (command.surface === 'browser' ||
+      (command.surface === 'adapter' && command.siteSession === 'persistent')) &&
     command.access === 'write' &&
     typeof command.session === 'string' && command.session.length > 0 &&
     typeof command.runId === 'string' && command.runId.length > 0
@@ -195,7 +199,7 @@ export interface SessionBusyFailure {
   status: number;
 }
 
-/** Build the fast-fail response naming the holder, its pid, and hold time. */
+/** Build the local-queue response naming the holder, its pid, and hold time. */
 export function buildSessionBusyFailure(
   session: string,
   holder: SessionLeaseHolder,

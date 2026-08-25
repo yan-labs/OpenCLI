@@ -91,10 +91,9 @@ type PendingEntry = {
 };
 const pending = new Map<string, PendingEntry>();
 
-// One logical write lease per (contextId, surface, persistent site session).
-// Serializes concurrent adapter write commands so a retry can't drive the same
-// Chrome tab as a still-running command. Stale leases self-expire (see
-// session-lease.ts).
+// One logical write lease per (contextId, surface, session). Serializes
+// concurrent adapter and browser-surface writes so two processes cannot drive
+// the same Chrome tab. Stale leases self-expire (see session-lease.ts).
 const sessionLeases = new SessionLeaseRegistry();
 
 /** A TTL-stale lease holder with a command still in flight is alive, not dead. */
@@ -389,9 +388,11 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       // Runs AFTER profile routing (the resolved contextId is part of the
       // lease key — the same site session in two Chrome profiles drives two
       // different browsers) but BEFORE any dispatch to the extension. The
-      // first write acquires, same-runId execs refresh (heartbeat), and a
-      // concurrent different-runId write fails fast. Read and ephemeral
-      // commands are never arbitrated.
+      // first write acquires, same-runId commands refresh (heartbeat), and a
+      // concurrent different-runId write gets a local retry hint. The client
+      // waits and asks the daemon again; nothing reaches Chrome or the site
+      // until this lease is granted. Reads and ephemeral adapter commands are
+      // never arbitrated.
       let leaseKey: string | undefined;
       let leaseRunId: string | undefined;
       if (isSessionLeaseCommand(body)) {
@@ -417,6 +418,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
             errorCode: failure.errorCode,
             error: failure.message,
             errorHint: failure.errorHint,
+            retryAfterMs: 2_000,
           });
           return;
         }

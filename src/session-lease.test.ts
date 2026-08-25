@@ -51,9 +51,10 @@ describe('isSessionLeaseCommand', () => {
   it('excludes read commands (a user mid-ask can still check state)', () => {
     expect(isSessionLeaseCommand(writeCommand({ access: 'read' }))).toBe(false);
   });
-  it('excludes ephemeral sessions and non-adapter surfaces', () => {
+  it('excludes ephemeral adapter sessions and includes browser writes', () => {
     expect(isSessionLeaseCommand(writeCommand({ siteSession: 'ephemeral' }))).toBe(false);
-    expect(isSessionLeaseCommand(writeCommand({ surface: 'browser' }))).toBe(false);
+    expect(isSessionLeaseCommand(writeCommand({ surface: 'browser', siteSession: undefined }))).toBe(true);
+    expect(isSessionLeaseCommand(writeCommand({ surface: 'browser', siteSession: undefined, access: 'read' }))).toBe(false);
   });
   it('excludes commands without identity or session', () => {
     expect(isSessionLeaseCommand(writeCommand({ runId: undefined }))).toBe(false);

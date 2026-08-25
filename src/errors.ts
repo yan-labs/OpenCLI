@@ -142,6 +142,13 @@ export class SessionBusyError extends CliError {
   }
 }
 
+/** The built-in local queue waited long enough; an outer retry would just loop. */
+export class SessionQueueTimeoutError extends CliError {
+  constructor(message: string, hint?: string) {
+    super('SESSION_QUEUE_TIMEOUT', message, hint, EXIT_CODES.GENERIC_ERROR);
+  }
+}
+
 export class EmptyResultError extends CliError {
   constructor(command: string, hint?: string) {
     super(
