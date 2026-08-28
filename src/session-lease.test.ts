@@ -255,4 +255,41 @@ describe('buildSessionBusyFailure', () => {
     expect(failure.message).not.toContain('pid');
     expect(failure.errorHint).not.toContain('kill');
   });
+
+  it('releases a lease whose client died mid-exec, so dialog accept can get through', () => {
+    // The deadlock this guards against, measured 2026-08-28: a native alert()
+    // blocks the renderer, so the exec never settles and `hasPendingWork` stays
+    // true forever. Without a liveness probe the lease outlives the CLI process
+    // that took it, and `dialog accept` — the only command that clears the
+    // alert — queues behind it indefinitely.
+    const leases = new SessionLeaseRegistry();
+    const held = leases.touch('k', { runId: 'run_49191_1_a', command: 'browser eval', now: 0 });
+    expect(held.granted).toBe(true);
+
+    const wayPastTtl = SESSION_LEASE_TTL_MS * 3;
+    const stillPending = () => true;
+
+    // Client alive: pending work protects it, exactly as before.
+    expect(leases.touch('k', {
+      runId: 'run_222_2_b', command: 'browser dialog', now: wayPastTtl,
+      hasPendingWork: stillPending, isClientAlive: () => true,
+    }).granted).toBe(false);
+
+    // Client dead: pending work no longer protects it.
+    expect(leases.touch('k', {
+      runId: 'run_222_2_b', command: 'browser dialog', now: wayPastTtl,
+      hasPendingWork: stillPending, isClientAlive: () => false,
+    }).granted).toBe(true);
+  });
+
+  it('a dead client still keeps its lease inside the TTL', () => {
+    // Only the pending-work protection is bypassed. Inside the TTL the lease
+    // stands regardless, so this fix cannot shorten normal arbitration.
+    const leases = new SessionLeaseRegistry();
+    leases.touch('k', { runId: 'run_49191_1_a', command: 'browser eval', now: 0 });
+    expect(leases.touch('k', {
+      runId: 'run_222_2_b', command: 'browser dialog', now: SESSION_LEASE_TTL_MS - 1,
+      hasPendingWork: () => true, isClientAlive: () => false,
+    }).granted).toBe(false);
+  });
 });

@@ -97,6 +97,16 @@ const pending = new Map<string, PendingEntry>();
 const sessionLeases = new SessionLeaseRegistry();
 
 /** A TTL-stale lease holder with a command still in flight is alive, not dead. */
+/** Signal 0 probes existence without delivering anything; EPERM still means alive. */
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException)?.code === 'EPERM';
+  }
+}
+
 function runHasPendingWork(runId: string): boolean {
   for (const entry of pending.values()) {
     if (entry.runId === runId) return true;
@@ -405,6 +415,11 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
           // A holder past the TTL whose exec is still in flight is alive — a
           // single slow command produces no heartbeat until it settles.
           hasPendingWork: runHasPendingWork,
+          // ...unless its CLI process is gone. A native alert() blocks the
+          // renderer so the reply never arrives, and without this probe the
+          // lease outlives the client forever — taking `dialog accept`, the
+          // only way out, down with it.
+          isClientAlive: isProcessAlive,
         });
         if (!outcome.granted) {
           const failure = buildSessionBusyFailure(body.session, outcome.holder, now);

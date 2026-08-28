@@ -21,6 +21,16 @@
  * is in flight (see `hasPendingWork`), so a live long-running holder keeps the
  * lease indefinitely.
  *
+ * "In flight" is not the same as "alive", and conflating the two deadlocks the
+ * session. A native `alert()` blocks the renderer's JS thread, so the exec's
+ * reply never arrives: `hasPendingWork` stays true forever, the TTL never
+ * bites, and the lease is held by a CLI process that has long since been
+ * killed. `dialog accept` — the one command that would clear the alert — then
+ * queues behind that lease and never runs. Measured 2026-08-28: the daemon
+ * reported "browser eval (pid 49191) has been driving it for 110s" while that
+ * pid no longer existed. So pending work only protects a holder whose client
+ * process is still alive; a dead client can never consume the reply anyway.
+ *
  * The daemon is the arbiter because it is the single local process that sees
  * every CLI client; keeping the logic here (pure, no I/O) makes it testable
  * without Chrome.
@@ -118,11 +128,27 @@ export class SessionLeaseRegistry {
    */
   touch(
     key: string,
-    input: { runId: string; command: string; now: number; hasPendingWork?: (runId: string) => boolean },
+    input: {
+      runId: string;
+      command: string;
+      now: number;
+      hasPendingWork?: (runId: string) => boolean;
+      /**
+       * Liveness probe for the holder's CLI process, injected so this registry
+       * stays pure. Omitted or returning `true` keeps the previous behaviour.
+       */
+      isClientAlive?: (pid: number) => boolean;
+    },
   ): LeaseTouchResult {
     const current = this.leases.get(key);
+    // A holder whose client process is gone cannot be protected by pending
+    // work: nothing will ever read that reply, so the lease must fall back to
+    // the TTL and let the queued command through.
+    const clientGone = current !== undefined && current.pid !== null
+      && input.isClientAlive?.(current.pid) === false;
     const alive = current !== undefined && (
-      input.now - current.lastSeenAt <= this.ttlMs || input.hasPendingWork?.(current.runId) === true
+      input.now - current.lastSeenAt <= this.ttlMs
+      || (!clientGone && input.hasPendingWork?.(current.runId) === true)
     );
     if (current !== undefined && alive && current.runId !== input.runId) {
       return { granted: false, holder: current };
