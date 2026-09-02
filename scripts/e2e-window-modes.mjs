@@ -11,7 +11,8 @@
  *   node scripts/e2e-window-modes.mjs
  *
  * Needs a live browser: `opencli doctor` green, and the yan-labs extension
- * loaded. It only opens example.com/.org/.net and closes what it opened.
+ * loaded. It opens example.com/.org/.net plus one `brave search` (public, no
+ * login) and closes what it opened; the adapter tab releases itself on idle.
  *
  * Exit code 0 = all checks passed, 1 = a check failed, 2 = could not run.
  */
@@ -28,13 +29,17 @@ async function opencli(args) {
   return stdout;
 }
 
-/** Session name → windowId, straight from the extension's own view. */
-async function sessionWindows() {
+/** Every session lease, straight from the extension's own view. */
+async function sessionEntries() {
   const out = await opencli(['browser', 'sessions', '-f', 'json']);
   const start = out.indexOf('[');
-  if (start < 0) return new Map();
-  const entries = JSON.parse(out.slice(start));
-  return new Map(entries.map(e => [e.session, e.windowId]));
+  if (start < 0) return [];
+  return JSON.parse(out.slice(start));
+}
+
+/** Session name → windowId. */
+async function sessionWindows() {
+  return new Map((await sessionEntries()).map(e => [e.session, e.windowId]));
 }
 
 function check(name, passed, detail) {
@@ -92,6 +97,29 @@ async function main() {
     check('every session survives the others',
       [def, isoA, isoB].every(v => v !== undefined),
       `alive=[${[...win.keys()].filter(k => k.startsWith(RUN)).join(', ')}]`);
+
+    // One group per session, named after it — never the pooled group of before.
+    const entries = await sessionEntries();
+    const groupOf = name => entries.find(e => e.session === name)?.groupTitle;
+    check('each browser session sits in its own group named after it',
+      groupOf(sessions.def) === `OpenCLI: ${sessions.def}` && groupOf(sessions.isoA) === `OpenCLI: ${sessions.isoA}`,
+      `def="${groupOf(sessions.def)}" isoA="${groupOf(sessions.isoA)}"`);
+    check('default mode did not have to open a window of its own',
+      entries.find(e => e.session === sessions.def)?.windowFallbackReason == null,
+      `reason=${entries.find(e => e.session === sessions.def)?.windowFallbackReason ?? 'none'}`);
+
+    // Adapter surface: the same rule. `opencli <site> …` used to spawn a window of
+    // its own by design; it now borrows yours and groups under the site name.
+    // `--keep-tab true` keeps the one-shot lease alive long enough to read it back
+    // (the 30s adapter idle timeout releases it on its own afterwards).
+    await opencli(['brave', 'search', 'example', '--limit', '1', '--keep-tab', 'true']).catch(() => {});
+    const adapter = (await sessionEntries()).find(e => e.surface === 'adapter' && String(e.session).startsWith('site:brave'));
+    check('adapter command opens in the window you are already using',
+      adapter !== undefined && adapter.windowId === userWindow,
+      adapter ? `adapter=win${adapter.windowId} you=win${userWindow}` : 'no adapter lease found (did `opencli brave search` run?)');
+    check('adapter tabs are grouped under the site name',
+      adapter?.groupTitle === 'OpenCLI: brave',
+      `group="${adapter?.groupTitle}"`);
   } finally {
     for (const name of Object.values(sessions)) {
       await opencli(['browser', name, 'close']).catch(() => {});

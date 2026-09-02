@@ -1078,7 +1078,7 @@ describe('background tab isolation', () => {
     expect(mod.__test__.getSession(adapterKey('twitter'))).toBeNull();
   });
 
-  it('reconciles an owned adapter container with no stored leases without closing it or grouping new tabs', async () => {
+  it('reconciles an owned adapter container with no stored leases without closing it or touching its tabs', async () => {
     const { chrome, tabs, groups } = createChromeMock();
     vi.stubGlobal('chrome', chrome);
     await chrome.storage.session.set({
@@ -1099,13 +1099,16 @@ describe('background tab isolation', () => {
 
     const tabId = await mod.__test__.resolveTabId(undefined, adapterKey('twitter'), 'https://after.example');
 
+    // The http tab already in the window carries no ownership signal, so it is
+    // the person's: untouched and left outside any group. The new lease gets a
+    // fresh tab in its own session-named group.
     expect(tabId).not.toBe(1);
     expect(chrome.windows.create).not.toHaveBeenCalled();
     expect(tabs.find((tab) => tab.id === 1)?.url).toBe('https://automation.example');
     expect(tabs.find((tab) => tab.id === 1)?.groupId).toBe(-1);
     expect(tabs.find((tab) => tab.id === tabId)?.url).toBe('https://after.example');
-    expect(tabs.find((tab) => tab.id === tabId)?.groupId).toBe(-1);
-    expect(groups).toEqual([]);
+    expect(tabs.find((tab) => tab.id === tabId)?.groupId).not.toBe(-1);
+    expect(groups).toEqual([expect.objectContaining({ windowId: 1, title: 'OpenCLI: twitter' })]);
   });
 
   it('restores owned and borrowed leases from the registry', async () => {
@@ -1271,18 +1274,81 @@ describe('background tab isolation', () => {
     expect(chrome.windows.create).toHaveBeenCalledTimes(1);
   });
 
-  it('does not create a visible tab group for adapter automation windows', async () => {
+  it('groups adapter automation tabs under the site name', async () => {
     const { chrome, tabs, groups } = createChromeMock();
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
     const tabId = await mod.__test__.resolveTabId(undefined, adapterKey('twitter'));
 
+    // Adapter tabs used to sit ungrouped in a window of their own. Now they live
+    // in the person's window like everything else, so the label is what tells
+    // them apart from the person's own tabs.
     expect(tabId).toBe(1);
-    expect(tabs[0].groupId).toBe(-1);
-    expect(groups).toEqual([]);
-    expect(chrome.tabs.group).not.toHaveBeenCalled();
-    expect(chrome.tabGroups.update).not.toHaveBeenCalled();
+    expect(tabs[0].groupId).not.toBe(-1);
+    expect(groups).toEqual([expect.objectContaining({ id: tabs[0].groupId, title: 'OpenCLI: twitter', color: 'orange' })]);
+  });
+
+  it('gives every session its own group titled after it, on both surfaces', async () => {
+    const { chrome, tabs, groups } = createChromeMock();
+    chrome.windows.getAll = vi.fn(async () => [{ id: 7, focused: true, incognito: false, type: 'normal' }]);
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./background');
+    const a = await mod.__test__.resolveTabId(undefined, browserKey('recon'), 'https://a.example');
+    const b = await mod.__test__.resolveTabId(undefined, browserKey('checkout'), 'https://b.example');
+    const c = await mod.__test__.resolveTabId(undefined, adapterKey('reddit'), 'https://c.example');
+
+    const groupOf = (id: number) => tabs.find((tab) => tab.id === id)?.groupId;
+    // Three sessions, three groups, one window — never the pooled
+    // "OpenCLI: recon, checkout" group of before.
+    expect(new Set([groupOf(a), groupOf(b), groupOf(c)]).size).toBe(3);
+    expect(tabs.filter((tab) => [a, b, c].includes(tab.id)).every((tab) => tab.windowId === 7)).toBe(true);
+    expect(groups.map((group) => group.title).sort()).toEqual(['OpenCLI: checkout', 'OpenCLI: recon', 'OpenCLI: reddit']);
+    expect(chrome.windows.create).not.toHaveBeenCalled();
+
+    // A second tab opened on a session joins that session's group, not a new one.
+    await mod.__test__.handleTabs(
+      { id: 'more', action: 'tabs', op: 'new', url: 'https://a2.example', session: browserKey('recon') } as never,
+      browserKey('recon'),
+    );
+    expect(tabs.at(-1)?.groupId).toBe(groupOf(a));
+    expect(groups).toHaveLength(3);
+  });
+
+  it('titles adapter groups after the site, not the runtime session name', async () => {
+    const { chrome, tabs, groups } = createChromeMock();
+    chrome.windows.getAll = vi.fn(async () => [{ id: 7, focused: true, incognito: false, type: 'normal' }]);
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./background');
+    // What the CLI actually sends: `site:<site>` for a persistent site session,
+    // `site:<site>:<uuid>` for a one-shot run.
+    const persistent = await mod.__test__.resolveTabId(undefined, adapterKey('site:reddit'), 'https://reddit.example/p');
+    const oneShot = await mod.__test__.resolveTabId(undefined, adapterKey('site:reddit:0b08261e-d0f4-420c-9baa-3029d7e51a7d'), 'https://reddit.example/o');
+
+    expect(groups.map((group) => group.title)).toEqual(['OpenCLI: reddit', 'OpenCLI: reddit']);
+    // Same title, still two sessions, still two groups.
+    expect(tabs.find((tab) => tab.id === persistent)?.groupId).not.toBe(tabs.find((tab) => tab.id === oneShot)?.groupId);
+  });
+
+  it('keeps a browser session and an adapter session apart even when they share a name', async () => {
+    const { chrome, tabs, groups } = createChromeMock();
+    chrome.windows.getAll = vi.fn(async () => [{ id: 7, focused: true, incognito: false, type: 'normal' }]);
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./background');
+    const viaBrowser = await mod.__test__.resolveTabId(undefined, browserKey('reddit'), 'https://reddit.example/a');
+    const viaAdapter = await mod.__test__.resolveTabId(undefined, adapterKey('reddit'), 'https://reddit.example/b');
+
+    // Same title, different lease keys: the title layer alone would have merged
+    // them, and then releasing one session would have taken the other's tab.
+    const browserGroup = tabs.find((tab) => tab.id === viaBrowser)?.groupId;
+    const adapterGroup = tabs.find((tab) => tab.id === viaAdapter)?.groupId;
+    expect(browserGroup).not.toBe(-1);
+    expect(adapterGroup).not.toBe(-1);
+    expect(browserGroup).not.toBe(adapterGroup);
+    expect(groups.map((group) => group.title)).toEqual(['OpenCLI: reddit', 'OpenCLI: reddit']);
   });
 
   it('opens interactive automation in the window the person is already using', async () => {
@@ -1302,7 +1368,7 @@ describe('background tab isolation', () => {
     expect(chrome.tabs.create).toHaveBeenCalledWith(expect.objectContaining({ windowId: 7, active: false }));
   });
 
-  it('gives adapter automation its own window even when a user window exists', async () => {
+  it('opens adapter automation in the window the person is already using too', async () => {
     const { chrome, tabs } = createChromeMock();
     chrome.windows.getAll = vi.fn(async () => [{ id: 7, focused: true, incognito: false, type: 'normal' }]);
     vi.stubGlobal('chrome', chrome);
@@ -1310,9 +1376,108 @@ describe('background tab isolation', () => {
     const mod = await import('./background');
     const tabId = await mod.__test__.resolveTabId(undefined, adapterKey('twitter'));
 
-    // Adapter runs are background chores nobody watches; they stay out of the way.
+    // Adapter runs used to get a window of their own "because nobody watches
+    // them" — but the window itself is what the person sees. Same rule as the
+    // browser surface: borrow, stay inactive, group under the session name.
+    expect(chrome.windows.create).not.toHaveBeenCalled();
+    expect(tabs.find((tab) => tab.id === tabId)?.windowId).toBe(7);
+    expect(chrome.tabs.create).toHaveBeenCalledWith(expect.objectContaining({ windowId: 7, active: false }));
+
+    const listed = await mod.__test__.handleSessions({ id: 'ls', action: 'sessions', op: 'list' } as never);
+    expect(listed.data).toEqual([expect.objectContaining({
+      session: 'twitter',
+      surface: 'adapter',
+      windowId: 7,
+      groupTitle: 'OpenCLI: twitter',
+      windowFallbackReason: null,
+    })]);
+  });
+
+  it('records why a window had to be created when none of the person\'s can be borrowed', async () => {
+    const cases: Array<{ name: string; setup: (chrome: any) => void; reason: string }> = [
+      {
+        name: 'no window at all',
+        setup: (chrome) => { chrome.windows.getAll = vi.fn(async () => []); },
+        reason: 'no-normal-window',
+      },
+      {
+        name: 'only incognito windows',
+        setup: (chrome) => { chrome.windows.getAll = vi.fn(async () => [{ id: 7, focused: true, incognito: true, type: 'normal' }]); },
+        reason: 'all-incognito',
+      },
+      {
+        name: 'the query itself fails',
+        setup: (chrome) => {
+          chrome.windows.getLastFocused = vi.fn(async () => { throw new Error('no window manager'); });
+          chrome.windows.getAll = vi.fn(async () => { throw new Error('no window manager'); });
+        },
+        reason: 'query-failed',
+      },
+    ];
+    for (const { name, setup, reason } of cases) {
+      vi.resetModules();
+      const { chrome } = createChromeMock();
+      setup(chrome);
+      vi.stubGlobal('chrome', chrome);
+
+      const mod = await import('./background');
+      await mod.__test__.resolveTabId(undefined, adapterKey('twitter'), 'https://x.example');
+
+      expect(chrome.windows.create, name).toHaveBeenCalled();
+      const listed = await mod.__test__.handleSessions({ id: 'ls', action: 'sessions', op: 'list' } as never);
+      expect(listed.data, name).toEqual([expect.objectContaining({ session: 'twitter', windowFallbackReason: reason })]);
+    }
+  });
+
+  it('shares one stand-in window between both roles instead of opening two', async () => {
+    const { chrome, tabs } = createChromeMock();
+    let nextWindowId = 20;
+    let nextTabId = 200;
+    const created: number[] = [];
+    chrome.windows.create = vi.fn(async ({ url, focused, width, height, type }: any) => {
+      const windowId = nextWindowId++;
+      created.push(windowId);
+      tabs.push({ id: nextTabId++, windowId, url, title: url ?? 'blank', active: true, status: 'complete', groupId: -1 });
+      return { id: windowId, url, focused, width, height, type };
+    });
+    // Once created, the stand-in is a normal window Chrome reports back.
+    chrome.windows.getAll = vi.fn(async () => created.map((id) => ({ id, focused: false, incognito: false, type: 'normal' })));
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./background');
+    const browserTab = await mod.__test__.resolveTabId(undefined, browserKey('recon'), 'https://a.example');
+    const adapterTab = await mod.__test__.resolveTabId(undefined, adapterKey('twitter'), 'https://b.example');
+
+    // No window of the person's existed, so one was created for the first
+    // session; the second session of the other role must join it, not add a
+    // second empty window to the pile.
+    expect(chrome.windows.create).toHaveBeenCalledTimes(1);
+    expect(tabs.find((tab) => tab.id === browserTab)?.windowId).toBe(20);
+    expect(tabs.find((tab) => tab.id === adapterTab)?.windowId).toBe(20);
+    const listed = await mod.__test__.handleSessions({ id: 'ls', action: 'sessions', op: 'list' } as never);
+    expect(listed.data).toEqual(expect.arrayContaining([
+      expect.objectContaining({ session: 'recon', windowFallbackReason: 'no-normal-window' }),
+      expect.objectContaining({ session: 'twitter', windowFallbackReason: 'no-normal-window' }),
+    ]));
+  });
+
+  it('reports no fallback reason for a window the person asked for with --window isolated', async () => {
+    const { chrome, tabs } = createChromeMock();
+    chrome.windows.getAll = vi.fn(async () => [{ id: 7, focused: true, incognito: false, type: 'normal' }]);
+    chrome.windows.getLastFocused = vi.fn(async () => ({ id: 7, focused: true, incognito: false, type: 'normal' }));
+    chrome.windows.create = vi.fn(async ({ url, focused, width, height, type }: any) => {
+      tabs.push({ id: 600, windowId: 60, url, title: url ?? 'blank', active: false, status: 'complete', groupId: -1 });
+      return { id: 60, url, focused, width, height, type };
+    });
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./background');
+    mod.__test__.sessionOverrides.set(browserKey('iso'), { windowMode: 'isolated' });
+    await mod.__test__.resolveTabId(undefined, browserKey('iso'), 'https://iso.example');
+
     expect(chrome.windows.create).toHaveBeenCalled();
-    expect(tabs.find((tab) => tab.id === tabId)?.windowId).not.toBe(7);
+    const listed = await mod.__test__.handleSessions({ id: 'ls', action: 'sessions', op: 'list' } as never);
+    expect(listed.data).toEqual([expect.objectContaining({ session: 'iso', windowId: 60, windowFallbackReason: null })]);
   });
 
   it('escapes to its own window even when the borrowed flag was never recorded', async () => {
@@ -1488,11 +1653,35 @@ describe('background tab isolation', () => {
 
     const mod = await import('./background');
     // A call that names window 4 must confine itself to window 4.
-    await mod.__test__.ensureOwnedContainerGroup('interactive', 4, [40]);
+    await mod.__test__.ensureOwnedContainerGroup('interactive', browserKey('prev'), 4, [40]);
 
     // The isolated window's tab has to stay put. Moving it empties window 8.
     expect(tabs.find((tab) => tab.id === 80)?.windowId).toBe(8);
+    expect(tabs.find((tab) => tab.id === 80)?.groupId).toBe(800);
     expect(chrome.tabs.move).not.toHaveBeenCalled();
+  });
+
+  it('never folds another session\'s group into its own, even on an unpinned discovery call', async () => {
+    const { chrome, tabs, groups } = createChromeMock();
+    // Two sessions, two groups, two windows. The discovery call (no window
+    // named) may walk across windows — but only ever to ITS OWN group.
+    tabs.length = 0;
+    tabs.push({ id: 40, windowId: 4, url: 'https://user.example', title: 'user', active: true, status: 'complete', groupId: -1 });
+    tabs.push({ id: 41, windowId: 4, url: 'https://prev.example', title: 'prev', active: false, status: 'complete', groupId: 700 });
+    tabs.push({ id: 80, windowId: 8, url: 'https://iso.example', title: 'iso', active: false, status: 'complete', groupId: 800 });
+    groups.push({ id: 700, windowId: 4, title: 'OpenCLI: prev', color: 'orange', collapsed: false });
+    groups.push({ id: 800, windowId: 8, title: 'OpenCLI: iso', color: 'orange', collapsed: false });
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./background');
+    mod.__test__.setSession(browserKey('iso'), { windowId: 8, owned: true, preferredTabId: 80 });
+    const found = await mod.__test__.ensureOwnedContainerGroup('interactive', browserKey('prev'), null, []);
+
+    expect(found).toEqual(expect.objectContaining({ id: 700, windowId: 4 }));
+    expect(tabs.find((tab) => tab.id === 80)?.windowId).toBe(8);
+    expect(tabs.find((tab) => tab.id === 80)?.groupId).toBe(800);
+    expect(chrome.tabs.move).not.toHaveBeenCalled();
+    expect(groups).toHaveLength(2);
   });
 
   it('carries every window mode through to the session override', async () => {
@@ -1559,7 +1748,7 @@ describe('background tab isolation', () => {
     expect(tabs.length).toBeLessThan(before + 1);
   });
 
-  it('keeps browser groups while adapter sessions stay ungrouped in separate owned windows', async () => {
+  it('puts browser and adapter sessions in one window, each in its own labelled group', async () => {
     const { chrome, tabs, groups } = createChromeMock();
     let nextWindowId = 20;
     let nextTabId = 200;
@@ -1591,18 +1780,19 @@ describe('background tab isolation', () => {
     const browserTabId = tabs.at(-1)!.id!;
     const adapterTabId = await mod.__test__.resolveTabId(undefined, adapterKey('twitter'));
 
+    // No window of the person's exists in this fixture, so ONE stand-in window
+    // is created and both roles use it. Neither role focuses it — background is
+    // the default for both, and foreground is opt-in via `--window foreground`.
+    expect(chrome.windows.create).toHaveBeenCalledTimes(1);
+    expect(chrome.windows.create).toHaveBeenCalledWith(expect.objectContaining({ focused: false }));
     expect(tabs.find((tab) => tab.id === browserTabId)?.windowId).toBe(20);
-    expect(tabs.find((tab) => tab.id === adapterTabId)?.windowId).toBe(21);
-    // Neither role focuses its window any more — background is the default for both,
-    // and foreground is opt-in via `--window foreground`.
-    expect(chrome.windows.create).toHaveBeenNthCalledWith(1, expect.objectContaining({ focused: false }));
-    expect(chrome.windows.create).toHaveBeenNthCalledWith(2, expect.objectContaining({ focused: false }));
+    expect(tabs.find((tab) => tab.id === adapterTabId)?.windowId).toBe(20);
     expect(groups).toEqual([
-      // Group titles are session-derived now (dynamic tab group titles), so the
-      // browser container is titled after the sessions living in it.
       expect.objectContaining({ windowId: 20, title: 'OpenCLI: default' }),
+      expect.objectContaining({ windowId: 20, title: 'OpenCLI: twitter' }),
     ]);
-    expect(tabs.find((tab) => tab.id === adapterTabId)?.groupId).toBe(-1);
+    expect(tabs.find((tab) => tab.id === browserTabId)?.groupId).toBe(groups[0].id);
+    expect(tabs.find((tab) => tab.id === adapterTabId)?.groupId).toBe(groups[1].id);
   });
 
   it('lets adapters explicitly request a foreground automation window', async () => {
@@ -1639,22 +1829,22 @@ describe('background tab isolation', () => {
     expect(chrome.windows.create).toHaveBeenCalledWith(expect.objectContaining({ focused: true }));
   });
 
-  it('creates additional adapter lease tabs in the owned window without grouping them', async () => {
+  it('creates additional adapter lease tabs in the same window, each in its own group', async () => {
     const { chrome, tabs, groups } = createChromeMock();
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    await mod.__test__.resolveTabId(undefined, adapterKey('first'));
+    const firstTabId = await mod.__test__.resolveTabId(undefined, adapterKey('first'));
     const secondTabId = await mod.__test__.resolveTabId(undefined, adapterKey('second'));
 
     expect(secondTabId).toBe(10);
     expect(tabs.find((tab) => tab.id === 10)?.windowId).toBe(1);
-    expect(tabs.find((tab) => tab.id === 10)?.groupId).toBe(-1);
-    expect(groups).toEqual([]);
-    expect(chrome.tabs.group).not.toHaveBeenCalled();
+    expect(groups.map((group) => group.title)).toEqual(['OpenCLI: first', 'OpenCLI: second']);
+    expect(tabs.find((tab) => tab.id === firstTabId)?.groupId).toBe(groups[0].id);
+    expect(tabs.find((tab) => tab.id === secondTabId)?.groupId).toBe(groups[1].id);
   });
 
-  it('reuses a persisted adapter window after worker restart without recreating an adapter group', async () => {
+  it('reuses a persisted adapter window after worker restart, reading the pre-per-session registry shape', async () => {
     const { chrome, tabs, groups } = createChromeMock();
     vi.stubGlobal('chrome', chrome);
     await chrome.storage.session.set({
@@ -1662,6 +1852,7 @@ describe('background tab isolation', () => {
         version: 2,
         contextId: 'user-default',
         ownedContainers: {
+          // The shape an older build wrote: a singular groupId, no groups map.
           interactive: { windowId: null, groupId: null },
           automation: { windowId: 1, groupId: null },
         },
@@ -1677,11 +1868,11 @@ describe('background tab isolation', () => {
 
     expect(chrome.windows.create).not.toHaveBeenCalled();
     expect(tabs.find((tab) => tab.id === tabId)?.windowId).toBe(1);
-    expect(tabs.find((tab) => tab.id === tabId)?.groupId).toBe(-1);
-    expect(groups).toEqual([]);
+    expect(tabs.find((tab) => tab.id === tabId)?.groupId).not.toBe(-1);
+    expect(groups).toEqual([expect.objectContaining({ windowId: 1, title: 'OpenCLI: twitter' })]);
   });
 
-  it('reuses a restored adapter preferred tab when no adapter group exists after worker restart', async () => {
+  it('reuses a restored adapter preferred tab after worker restart and re-groups it', async () => {
     const { chrome, tabs, groups } = createChromeMock();
     const deadline = Date.now() + 30_000;
     vi.stubGlobal('chrome', chrome);
@@ -1712,15 +1903,15 @@ describe('background tab isolation', () => {
 
     const tabId = await mod.__test__.resolveTabId(undefined, adapterKey('twitter'));
 
+    // The lease's own tab is the ownership signal, so it is reused — and since
+    // the group did not survive the restart, it is rebuilt around that tab.
     expect(tabId).toBe(1);
     expect(chrome.windows.create).not.toHaveBeenCalled();
-    expect(tabs[0].groupId).toBe(-1);
-    expect(groups).toEqual([]);
-    expect(chrome.tabs.group).not.toHaveBeenCalled();
-    expect(chrome.tabGroups.update).not.toHaveBeenCalled();
+    expect(tabs[0].groupId).not.toBe(-1);
+    expect(groups).toEqual([expect.objectContaining({ id: tabs[0].groupId, windowId: 1, title: 'OpenCLI: twitter' })]);
   });
 
-  it('ignores legacy OpenCLI Adapter groups when choosing an adapter container', async () => {
+  it('leaves legacy OpenCLI Adapter groups alone when choosing an adapter container', async () => {
     const { chrome, tabs, groups } = createChromeMock();
     tabs.push({
       id: 77,
@@ -1743,12 +1934,14 @@ describe('background tab isolation', () => {
     const mod = await import('./background');
     const tabId = await mod.__test__.resolveTabId(undefined, adapterKey('twitter'));
 
+    // A group titled by an older build is not ours to adopt: no lease, no
+    // ledger entry, no per-session title. It keeps its tab and its title.
     expect(tabId).not.toBe(77);
     expect(mod.__test__.getAutomationWindowId(adapterKey('twitter'))).not.toBe(7);
     expect(tabs.find((tab) => tab.id === 77)?.groupId).toBe(99);
-    expect(groups).toHaveLength(1);
-    expect(chrome.tabs.group).not.toHaveBeenCalled();
-    expect(chrome.tabGroups.update).not.toHaveBeenCalled();
+    expect(groups.find((group) => group.id === 99)?.title).toBe('OpenCLI Adapter');
+    expect(chrome.tabGroups.update).not.toHaveBeenCalledWith(99, expect.anything());
+    expect(groups.filter((group) => group.title === 'OpenCLI: twitter')).toHaveLength(1);
   });
 
   it('does not reuse a user http tab from an adapter-owned window without an owned lease signal', async () => {
@@ -1772,8 +1965,9 @@ describe('background tab isolation', () => {
     expect(tabId).not.toBe(1);
     expect(chrome.windows.create).not.toHaveBeenCalled();
     expect(tabs.find((tab) => tab.id === 1)?.url).toBe('https://automation.example');
+    expect(tabs.find((tab) => tab.id === 1)?.groupId).toBe(-1);
     expect(tabs.find((tab) => tab.id === tabId)?.url).toBe('https://after.example');
-    expect(tabs.find((tab) => tab.id === tabId)?.groupId).toBe(-1);
+    expect(tabs.find((tab) => tab.id === tabId)?.groupId).not.toBe(-1);
   });
 
   it('does not group borrowed user tabs for bound sessions', async () => {
@@ -1856,7 +2050,7 @@ describe('background tab isolation', () => {
     expect(tabs.find((tab) => tab.id === 1)?.url).toBe('https://automation.example');
     expect(tabs.find((tab) => tab.id === 1)?.groupId).toBe(-1);
     expect(tabs.find((tab) => tab.id === tabId)?.url).toBe('about:blank');
-    expect(tabs.find((tab) => tab.id === tabId)?.groupId).toBe(-1);
+    expect(tabs.find((tab) => tab.id === tabId)?.groupId).not.toBe(-1);
   });
 
   it('idle timeout releases the automation lease for adapter:notebooklm', async () => {
@@ -2257,17 +2451,18 @@ describe('background tab isolation', () => {
   }
 
   it('does not wipe the persisted registry when a lease idle alarm fires before recovery', async () => {
-    const { chrome, groups } = createChromeMock();
+    const { chrome, tabs, groups } = createChromeMock();
     const deadline = Date.now() + 30_000;
-    groups.push({ id: 200, windowId: 5, title: 'OpenCLI Browser', color: 'orange', collapsed: false });
+    tabs.push({ id: 50, windowId: 5, url: 'about:blank', title: 'blank', active: true, status: 'complete', groupId: 200 });
+    groups.push({ id: 200, windowId: 5, title: '', color: 'orange', collapsed: false });
     vi.stubGlobal('chrome', chrome);
     await chrome.storage.session.set({
       [REGISTRY_KEY]: {
         version: 2,
         contextId: 'user-default',
         ownedContainers: {
-          interactive: { windowId: null, groupId: 200 },
-          automation: { windowId: 1, groupId: null },
+          interactive: { windowId: null, groups: { '200': browserKey('recon') } },
+          automation: { windowId: 1 },
         },
         leases: {
           [adapterKey('twitter')]: {
@@ -2297,17 +2492,17 @@ describe('background tab isolation', () => {
     // worker must leave storage untouched.
     await new Promise((resolve) => setTimeout(resolve, 0));
     const midFlight = await readDirect(REGISTRY_KEY);
-    expect(midFlight.ownedContainers.interactive.groupId).toBe(200);
+    expect(midFlight.ownedContainers.interactive.groups).toEqual({ '200': browserKey('recon') });
     expect(midFlight.leases[adapterKey('twitter')]).toBeDefined();
 
     gate.resolve();
     await alarmDone;
 
     const finalRegistry = await readDirect(REGISTRY_KEY);
-    // Group ids never re-enter the durable registry (browser-session scoped);
-    // the canonical group is re-found in memory via the title layer instead.
-    expect(finalRegistry.ownedContainers.interactive.groupId).toBeUndefined();
-    expect(mod.__test__.getInteractiveContainer().groupId).toBe(200);
+    // The session ledger survived recovery and the orphan it named got its title.
+    expect(finalRegistry.ownedContainers.interactive.groups).toEqual({ '200': browserKey('recon') });
+    expect(mod.__test__.getInteractiveContainer().groups).toEqual({ [browserKey('recon')]: 200 });
+    expect(groups.find((group) => group.id === 200)?.title).toBe('OpenCLI: recon');
     // The lease was released down the proper owned-placeholder path, not wiped.
     // Releasing a lease resets the tab but must never select it: this fires on idle
     // timeout and cleanup, long after the person stopped watching.
@@ -2316,17 +2511,18 @@ describe('background tab isolation', () => {
   });
 
   it('does not wipe the persisted registry when tabs.onRemoved fires before recovery', async () => {
-    const { chrome, groups } = createChromeMock();
+    const { chrome, tabs, groups } = createChromeMock();
     const deadline = Date.now() + 30_000;
-    groups.push({ id: 200, windowId: 5, title: 'OpenCLI Browser', color: 'orange', collapsed: false });
+    tabs.push({ id: 50, windowId: 5, url: 'about:blank', title: 'blank', active: true, status: 'complete', groupId: 200 });
+    groups.push({ id: 200, windowId: 5, title: '', color: 'orange', collapsed: false });
     vi.stubGlobal('chrome', chrome);
     await chrome.storage.session.set({
       [REGISTRY_KEY]: {
         version: 2,
         contextId: 'user-default',
         ownedContainers: {
-          interactive: { windowId: null, groupId: 200 },
-          automation: { windowId: 1, groupId: null },
+          interactive: { windowId: null, groups: { '200': browserKey('recon') } },
+          automation: { windowId: 1 },
         },
         leases: {
           [adapterKey('twitter')]: {
@@ -2353,16 +2549,15 @@ describe('background tab isolation', () => {
 
     await new Promise((resolve) => setTimeout(resolve, 0));
     const midFlight = await readDirect(REGISTRY_KEY);
-    expect(midFlight.ownedContainers.interactive.groupId).toBe(200);
+    expect(midFlight.ownedContainers.interactive.groups).toEqual({ '200': browserKey('recon') });
     expect(midFlight.leases[adapterKey('twitter')]).toBeDefined();
 
     gate.resolve();
     await removedDone;
 
     const finalRegistry = await readDirect(REGISTRY_KEY);
-    // Group ids never re-enter the durable registry (browser-session scoped).
-    expect(finalRegistry.ownedContainers.interactive.groupId).toBeUndefined();
-    expect(mod.__test__.getInteractiveContainer().groupId).toBe(200);
+    expect(finalRegistry.ownedContainers.interactive.groups).toEqual({ '200': browserKey('recon') });
+    expect(mod.__test__.getInteractiveContainer().groups).toEqual({ [browserKey('recon')]: 200 });
     // The unrelated lease survived the unrelated tab-close.
     expect(finalRegistry.leases[adapterKey('twitter')]).toBeDefined();
   });
@@ -2377,6 +2572,62 @@ describe('background tab isolation', () => {
         version: 2,
         contextId: 'user-default',
         ownedContainers: {
+          interactive: { windowId: null, groups: { '200': browserKey('recon') } },
+          automation: { windowId: null },
+        },
+        leases: {},
+      },
+    });
+
+    const mod = await import('./background');
+    await mod.__test__.reconcileTargetLeaseRegistry();
+
+    // The orphan was adopted and titled for its session — no second group spawned.
+    expect(groups).toHaveLength(1);
+    expect(groups[0].title).toBe('OpenCLI: recon');
+    const createGroupCalls = chrome.tabs.group.mock.calls.filter((call: any[]) => call[0]?.createProperties);
+    expect(createGroupCalls).toHaveLength(0);
+    const container = mod.__test__.getInteractiveContainer();
+    expect(container.groups).toEqual({ [browserKey('recon')]: 200 });
+    expect(container.groupIds).toContain(200);
+  });
+
+  it('adopts an orphan adapter group the same way', async () => {
+    const { chrome, tabs, groups } = createChromeMock();
+    tabs.push({ id: 50, windowId: 5, url: 'about:blank', title: 'blank', active: true, status: 'complete', groupId: 200 });
+    groups.push({ id: 200, windowId: 5, title: '', collapsed: false });
+    vi.stubGlobal('chrome', chrome);
+    await chrome.storage.session.set({
+      [REGISTRY_KEY]: {
+        version: 2,
+        contextId: 'user-default',
+        ownedContainers: {
+          interactive: { windowId: null },
+          automation: { windowId: null, groups: { '200': adapterKey('reddit') } },
+        },
+        leases: {},
+      },
+    });
+
+    const mod = await import('./background');
+    await mod.__test__.reconcileTargetLeaseRegistry();
+
+    expect(groups).toHaveLength(1);
+    expect(groups[0].title).toBe('OpenCLI: reddit');
+    expect(mod.__test__.getContainer('automation').groups).toEqual({ [adapterKey('reddit')]: 200 });
+  });
+
+  it('never adopts an ownerless group id left by a pre-per-session build', async () => {
+    const { chrome, tabs, groups } = createChromeMock();
+    tabs.push({ id: 50, windowId: 5, url: 'about:blank', title: 'blank', active: true, status: 'complete', groupId: 200 });
+    groups.push({ id: 200, windowId: 5, title: '', collapsed: false });
+    vi.stubGlobal('chrome', chrome);
+    await chrome.storage.session.set({
+      [REGISTRY_KEY]: {
+        version: 2,
+        contextId: 'user-default',
+        ownedContainers: {
+          // The old ledger: bare ids, no session attached.
           interactive: { windowId: null, groupIds: [200] },
           automation: { windowId: null },
         },
@@ -2387,14 +2638,11 @@ describe('background tab isolation', () => {
     const mod = await import('./background');
     await mod.__test__.reconcileTargetLeaseRegistry();
 
-    // The orphan was adopted and titled — no second "OpenCLI Browser" spawned.
-    expect(groups).toHaveLength(1);
-    expect(groups[0].title).toBe('OpenCLI Browser');
-    const createGroupCalls = chrome.tabs.group.mock.calls.filter((call: any[]) => call[0]?.createProperties);
-    expect(createGroupCalls).toHaveLength(0);
-    const container = mod.__test__.getInteractiveContainer();
-    expect(container.groupId).toBe(200);
-    expect(container.groupIds).toContain(200);
+    // With no session to name it after there is nothing safe to do with it:
+    // it stays as it is, untitled, and no session's group map claims it.
+    expect(groups[0].title).toBe('');
+    expect(chrome.tabGroups.update).not.toHaveBeenCalled();
+    expect(mod.__test__.getInteractiveContainer().groups).toEqual({});
   });
 
   it('prunes a vanished group id from the session ledger on convergence', async () => {
@@ -2405,8 +2653,8 @@ describe('background tab isolation', () => {
         version: 2,
         contextId: 'user-default',
         ownedContainers: {
-          interactive: { windowId: null, groupIds: [300] },
-          automation: { windowId: null },
+          interactive: { windowId: null, groups: { '300': browserKey('recon') }, groupIds: [301] },
+          automation: { windowId: null, groups: { '302': adapterKey('reddit') } },
         },
         leases: {},
       },
@@ -2418,10 +2666,11 @@ describe('background tab isolation', () => {
     expect(chrome.windows.create).not.toHaveBeenCalled();
     const createGroupCalls = chrome.tabs.group.mock.calls.filter((call: any[]) => call[0]?.createProperties);
     expect(createGroupCalls).toHaveLength(0);
-    expect(mod.__test__.getInteractiveContainer().groupIds).not.toContain(300);
-    // The pruned id is gone from the persisted session registry too.
+    expect(mod.__test__.getInteractiveContainer().groupIds).toEqual([]);
+    // The pruned ids are gone from the persisted session registry too.
     const finalRegistry = (await chrome.storage.session.get(REGISTRY_KEY) as any)[REGISTRY_KEY];
-    expect(finalRegistry.ownedContainers.interactive.groupIds).toEqual([]);
+    expect(finalRegistry.ownedContainers.interactive.groups).toEqual({});
+    expect(finalRegistry.ownedContainers.automation.groups).toEqual({});
   });
 
   it('ignores legacy groupIds persisted in the local registry so a recycled id cannot hijack a user group', async () => {
@@ -2484,7 +2733,8 @@ describe('background tab isolation', () => {
     expect(chrome.tabGroups.update).not.toHaveBeenCalled();
     expect(chrome.tabs.group).not.toHaveBeenCalled();
     // And the stale pointer was never adopted into memory.
-    expect(mod.__test__.getInteractiveContainer().groupId).toBeNull();
+    expect(mod.__test__.getInteractiveContainer().groups).toEqual({});
+    expect(mod.__test__.getInteractiveContainer().groupIds).not.toContain(400);
   });
 
   it('ignores legacy container windowIds persisted in the local registry so recycled ids cannot claim user windows', async () => {

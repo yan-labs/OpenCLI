@@ -3352,7 +3352,14 @@ cli({
               // win is the answer to "who owns which tab" — two sessions sharing a
               // window id are sharing a window, and that is usually the whole story.
               const win = e.windowId === null || e.windowId === undefined ? '-' : `win${e.windowId}`;
-              console.log(`  ${(e.session as string).padEnd(34)} ${(e.surface as string).padEnd(9)} ${(e.kind as string).padEnd(7)} ${win.padEnd(10)} ${url}`);
+              // Every session has its own tab group, titled after it. When the
+              // extension could not borrow one of your windows and opened its own,
+              // it says why — that is the "why did a new window appear" answer.
+              const group = typeof e.groupTitle === 'string' && e.groupTitle ? e.groupTitle : '-';
+              const fallback = typeof e.windowFallbackReason === 'string' && e.windowFallbackReason
+                ? `  [new window: ${e.windowFallbackReason}]`
+                : '';
+              console.log(`  ${(e.session as string).padEnd(34)} ${(e.surface as string).padEnd(9)} ${(e.kind as string).padEnd(7)} ${win.padEnd(10)} ${group.padEnd(28)} ${url}${fallback}`);
             }
           }
         }
