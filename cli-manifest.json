@@ -31665,7 +31665,7 @@
     "type": "js",
     "modulePath": "reddit/search.js",
     "sourceFile": "reddit/search.js",
-    "navigateBefore": "https://reddit.com"
+    "navigateBefore": false
   },
   {
     "site": "reddit",
