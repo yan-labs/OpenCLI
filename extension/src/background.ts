@@ -1758,6 +1758,9 @@ async function handleCommand(cmd: Command): Promise<Result> {
 /** Internal blank page used when no user URL is provided. */
 const BLANK_PAGE = 'about:blank';
 
+/** Default navigate() timeout when the command carries no `timeoutMs` (older CLI, or unset). */
+const DEFAULT_NAVIGATE_TIMEOUT_MS = 15000;
+
 /** Check if a URL can be attached via CDP — only allow http(s) and blank pages. */
 function isDebuggableUrl(url?: string): boolean {
   if (!url) return true;  // empty/undefined = tab still loading, allow it
@@ -2197,12 +2200,15 @@ async function handleNavigate(cmd: Command, leaseKey: string): Promise<Result> {
       } catch { /* tab gone */ }
     }, 100);
 
-    // Timeout fallback with warning
+    // Timeout fallback with warning. `cmd.timeoutMs` carries the CLI's --timeout
+    // / OPENCLI_NAV_TIMEOUT_MS value; missing/undefined (older CLI) keeps the
+    // previous hardcoded default so older clients see unchanged behavior.
+    const navTimeoutMs = cmd.timeoutMs ?? DEFAULT_NAVIGATE_TIMEOUT_MS;
     timeoutTimer = setTimeout(() => {
       timedOut = true;
-      console.warn(`[opencli] Navigate to ${targetUrl} timed out after 15s`);
+      console.warn(`[opencli] Navigate to ${targetUrl} timed out after ${navTimeoutMs}ms`);
       finish();
-    }, 15000);
+    }, navTimeoutMs);
   });
 
   let tab = await chrome.tabs.get(tabId);

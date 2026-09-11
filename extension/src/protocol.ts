@@ -63,7 +63,14 @@ export interface Command {
   text?: string;
   /** URL substring filter pattern for network capture actions */
   pattern?: string;
-  /** Download wait timeout in milliseconds */
+  /**
+   * Operation timeout in milliseconds. Used by 'wait-download' (download wait
+   * timeout) and by 'navigate' (how long to wait for the tab to finish loading
+   * before reporting `timedOut: true` — the tab is still usable after that,
+   * see handleNavigate). Missing/undefined on 'navigate' falls back to the
+   * extension's built-in default (15000ms) for compatibility with older CLIs
+   * that predate this field.
+   */
   timeoutMs?: number;
   /** CDP method name for 'cdp' action (e.g. 'Accessibility.getFullAXTree') */
   cdpMethod?: string;

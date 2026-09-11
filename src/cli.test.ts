@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -1508,9 +1508,54 @@ describe('browser tab targeting commands', () => {
 
     await program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'open', 'https://example.com']);
 
-    expect(browserState.page?.goto).toHaveBeenCalledWith('https://example.com');
+    expect(browserState.page?.goto).toHaveBeenCalledWith('https://example.com', { timeoutMs: 15000 });
     expect(consoleLogSpy.mock.calls.flat().join('\n')).toContain('"url": "https://one.example"');
     expect(consoleLogSpy.mock.calls.flat().join('\n')).toContain('"page": "tab-1"');
+  });
+
+  describe('browser open navigation timeout resolution (--timeout > OPENCLI_NAV_TIMEOUT_MS > default)', () => {
+    const ORIGINAL_ENV_VALUE = process.env.OPENCLI_NAV_TIMEOUT_MS;
+
+    afterEach(() => {
+      if (ORIGINAL_ENV_VALUE === undefined) delete process.env.OPENCLI_NAV_TIMEOUT_MS;
+      else process.env.OPENCLI_NAV_TIMEOUT_MS = ORIGINAL_ENV_VALUE;
+    });
+
+    it('uses the built-in default (15000ms) when neither --timeout nor the env var is set', async () => {
+      delete process.env.OPENCLI_NAV_TIMEOUT_MS;
+      const program = createProgram('', '');
+
+      await program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'open', 'https://example.com']);
+
+      expect(browserState.page?.goto).toHaveBeenCalledWith('https://example.com', { timeoutMs: 15000 });
+    });
+
+    it('uses OPENCLI_NAV_TIMEOUT_MS when set and --timeout is absent', async () => {
+      process.env.OPENCLI_NAV_TIMEOUT_MS = '42000';
+      const program = createProgram('', '');
+
+      await program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'open', 'https://example.com']);
+
+      expect(browserState.page?.goto).toHaveBeenCalledWith('https://example.com', { timeoutMs: 42000 });
+    });
+
+    it('prefers the --timeout flag over OPENCLI_NAV_TIMEOUT_MS when both are set', async () => {
+      process.env.OPENCLI_NAV_TIMEOUT_MS = '42000';
+      const program = createProgram('', '');
+
+      await program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'open', 'https://example.com', '--timeout', '60000']);
+
+      expect(browserState.page?.goto).toHaveBeenCalledWith('https://example.com', { timeoutMs: 60000 });
+    });
+
+    it('falls back to the default and warns on an invalid --timeout value', async () => {
+      delete process.env.OPENCLI_NAV_TIMEOUT_MS;
+      const program = createProgram('', '');
+
+      await program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'open', 'https://example.com', '--timeout', 'not-a-number']);
+
+      expect(browserState.page?.goto).toHaveBeenCalledWith('https://example.com', { timeoutMs: 15000 });
+    });
   });
 
   it('lists cross-origin frames via browser frames', async () => {
