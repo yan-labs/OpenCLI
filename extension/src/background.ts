@@ -2148,6 +2148,7 @@ function classifyExtensionError(message: string): string | undefined {
   if (/CDP command .* timed out/.test(message)) return 'cdp_timeout';
   if (/attach failed|Debugger is not attached/.test(message)) return 'attach_failed';
   if (/No tab with id|no longer exists|No window with id/.test(message)) return 'tab_gone';
+  if (/No iframe target found for frame|No session with given id|Cannot find context with specified id/.test(message)) return 'frame_not_attached';
   return undefined;
 }
 
@@ -2176,7 +2177,35 @@ async function handleExec(cmd: Command, leaseKey: string): Promise<Result> {
     }
     if (cmd.execContextId != null) {
       await executor.ensureAttached(tabId, aggressive);
-      const result = await executor.sendDebuggerCommand({ tabId }, 'Runtime.evaluate', {
+      // A context id created in a child OOPIF flatten session is NOT visible
+      // to a Runtime.evaluate sent on the plain {tabId} (tab-level) debuggee.
+      // Sending it there anyway does not error -- each flatten session numbers
+      // its own contexts independently, so it silently evaluates a
+      // same-numbered context in the wrong (main) frame instead. Resolve
+      // which session actually owns this context id and route there; if it
+      // is unknown or its session has since gone away, fail loudly with a
+      // machine-readable code instead of guessing.
+      const owner = executor.resolveContextSession(tabId, cmd.execContextId);
+      if (!owner) {
+        return {
+          id: cmd.id,
+          ok: false,
+          error: `Execution context ${cmd.execContextId} is not known for this tab (use "browser contexts" for current ids)`,
+          errorCode: 'frame_not_attached',
+        };
+      }
+      if (!owner.live) {
+        return {
+          id: cmd.id,
+          ok: false,
+          error: `Execution context ${cmd.execContextId}'s frame session has detached or navigated away; re-run "browser contexts" and retry`,
+          errorCode: 'frame_not_attached',
+        };
+      }
+      const debuggee = (owner.sessionId
+        ? { tabId, sessionId: owner.sessionId }
+        : { tabId }) as chrome.debugger.Debuggee;
+      const result = await executor.sendDebuggerCommand(debuggee, 'Runtime.evaluate', {
         expression: cmd.code,
         contextId: cmd.execContextId,
         returnByValue: true,

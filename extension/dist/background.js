@@ -6,6 +6,7 @@ const DAEMON_PING_URL = `http://${DAEMON_HOST}:${DAEMON_PORT}/ping`;
 const attached = /* @__PURE__ */ new Set();
 const tabFrameContexts = /* @__PURE__ */ new Map();
 const tabAllContexts = /* @__PURE__ */ new Map();
+const tabLiveSessionIds = /* @__PURE__ */ new Map();
 const frameTargets = /* @__PURE__ */ new Map();
 const frameTargetKeys = /* @__PURE__ */ new Map();
 let frameTargetCleanupRegistered = false;
@@ -537,6 +538,7 @@ function registerFrameTracking() {
   chrome.debugger.onEvent.addListener((source, method, params) => {
     const tabId = source.tabId;
     if (!tabId) return;
+    const eventSessionId = source.sessionId;
     if (method === "Runtime.executionContextCreated") {
       const context = params.context;
       if (context?.auxData?.frameId) {
@@ -547,7 +549,8 @@ function registerFrameTracking() {
           id: context.id,
           origin: context.origin || "",
           name: context.name || "",
-          auxData: context.auxData
+          auxData: context.auxData,
+          sessionId: eventSessionId
         });
       }
       if (!context?.auxData?.frameId || context.auxData.isDefault !== true) return;
@@ -555,15 +558,15 @@ function registerFrameTracking() {
       if (!tabFrameContexts.has(tabId)) {
         tabFrameContexts.set(tabId, /* @__PURE__ */ new Map());
       }
-      tabFrameContexts.get(tabId).set(frameId, context.id);
+      tabFrameContexts.get(tabId).set(frameId, { contextId: context.id, sessionId: eventSessionId });
     }
     if (method === "Runtime.executionContextDestroyed") {
       const ctxId = params.executionContextId;
       tabAllContexts.get(tabId)?.delete(ctxId);
       const contexts = tabFrameContexts.get(tabId);
       if (contexts) {
-        for (const [fid, cid] of contexts) {
-          if (cid === ctxId) {
+        for (const [fid, entry] of contexts) {
+          if (entry.contextId === ctxId) {
             contexts.delete(fid);
             break;
           }
@@ -576,6 +579,11 @@ function registerFrameTracking() {
     }
     if (method === "Target.attachedToTarget") {
       const targetInfo = params?.targetInfo;
+      const attachedSessionId = typeof params?.sessionId === "string" ? params.sessionId : void 0;
+      if (attachedSessionId) {
+        if (!tabLiveSessionIds.has(tabId)) tabLiveSessionIds.set(tabId, /* @__PURE__ */ new Set());
+        tabLiveSessionIds.get(tabId).add(attachedSessionId);
+      }
       if (targetInfo?.type === "iframe" && targetInfo.targetId) {
         if (!tabIframeTargets.has(tabId)) tabIframeTargets.set(tabId, /* @__PURE__ */ new Map());
         tabIframeTargets.get(tabId).set(targetInfo.targetId, {
@@ -583,7 +591,7 @@ function registerFrameTracking() {
           title: targetInfo.title || "",
           // Flatten-mode child session id — the preferred way to command this
           // OOPIF (see ensureFrameRoute).
-          sessionId: typeof params?.sessionId === "string" ? params.sessionId : void 0
+          sessionId: attachedSessionId
         });
         tabAttachedEventCounts.set(tabId, (tabAttachedEventCounts.get(tabId) || 0) + 1);
       }
@@ -592,13 +600,31 @@ function registerFrameTracking() {
       const targetId = String(params?.targetId || "");
       if (targetId) tabIframeTargets.get(tabId)?.delete(targetId);
       const sessionId = String(params?.sessionId || "");
-      if (sessionId) clearFrameRoutesForSession(tabId, sessionId);
+      if (sessionId) {
+        tabLiveSessionIds.get(tabId)?.delete(sessionId);
+        clearFrameRoutesForSession(tabId, sessionId);
+        clearContextsForSession(tabId, sessionId);
+      }
+    }
+    if (method === "Target.targetDestroyed" || method === "Target.targetCrashed") {
+      const targetId = String(params?.targetId || "");
+      if (targetId) {
+        const info = tabIframeTargets.get(tabId)?.get(targetId);
+        tabIframeTargets.get(tabId)?.delete(targetId);
+        if (info?.sessionId) {
+          tabLiveSessionIds.get(tabId)?.delete(info.sessionId);
+          clearFrameRoutesForSession(tabId, info.sessionId);
+          clearContextsForSession(tabId, info.sessionId);
+        }
+        clearFrameTarget(targetId);
+      }
     }
   });
   chrome.tabs.onRemoved.addListener((tabId) => {
     tabFrameContexts.delete(tabId);
     tabAllContexts.delete(tabId);
     tabIframeTargets.delete(tabId);
+    tabLiveSessionIds.delete(tabId);
     tabAttachedEventCounts.delete(tabId);
   });
 }
@@ -606,6 +632,13 @@ function getAllContexts(tabId) {
   const contexts = tabAllContexts.get(tabId);
   if (!contexts) return [];
   return Array.from(contexts.values());
+}
+function resolveContextSession(tabId, contextId) {
+  const entry = tabAllContexts.get(tabId)?.get(contextId);
+  if (!entry) return void 0;
+  if (!entry.sessionId) return { sessionId: void 0, live: true };
+  const live = tabLiveSessionIds.get(tabId)?.has(entry.sessionId) ?? false;
+  return { sessionId: entry.sessionId, live };
 }
 async function getFrameTree(tabId) {
   await ensureAttached(tabId);
@@ -616,12 +649,14 @@ async function evaluateInFrame(tabId, expression, frameId, aggressiveRetry = fal
   await sendDebuggerCommand({ tabId }, "Runtime.enable").catch(() => {
   });
   const contexts = tabFrameContexts.get(tabId);
-  const contextId = contexts?.get(frameId);
-  if (contextId !== void 0) {
+  const cached = contexts?.get(frameId);
+  const cacheUsable = cached !== void 0 && (cached.sessionId === void 0 || (tabLiveSessionIds.get(tabId)?.has(cached.sessionId) ?? false));
+  if (cacheUsable && cached) {
+    const debuggee = cached.sessionId ? { tabId, sessionId: cached.sessionId } : { tabId };
     try {
-      const result2 = await sendDebuggerCommand({ tabId }, "Runtime.evaluate", {
+      const result2 = await sendDebuggerCommand(debuggee, "Runtime.evaluate", {
         expression,
-        contextId,
+        contextId: cached.contextId,
         returnByValue: true,
         awaitPromise: true
       }, timeoutMs);
@@ -632,11 +667,13 @@ async function evaluateInFrame(tabId, expression, frameId, aggressiveRetry = fal
       return result2.result?.value;
     } catch (err) {
       const msg = String(err?.message || err);
-      if (!/Cannot find context|context with specified id|Execution context was destroyed/i.test(msg)) {
+      if (!/Cannot find context|context with specified id|Execution context was destroyed|No session with given id|Detached while handling command/i.test(msg)) {
         throw err;
       }
       contexts?.delete(frameId);
     }
+  } else if (cached) {
+    contexts?.delete(frameId);
   }
   const result = await sendCommandInFrameTarget(tabId, frameId, "Runtime.evaluate", {
     expression,
@@ -704,6 +741,20 @@ async function readNetworkCapture(tabId) {
 }
 function hasActiveNetworkCapture(tabId) {
   return networkCaptures.has(tabId);
+}
+function clearContextsForSession(tabId, sessionId) {
+  const frameCtxs = tabFrameContexts.get(tabId);
+  if (frameCtxs) {
+    for (const [fid, entry] of [...frameCtxs.entries()]) {
+      if (entry.sessionId === sessionId) frameCtxs.delete(fid);
+    }
+  }
+  const allCtxs = tabAllContexts.get(tabId);
+  if (allCtxs) {
+    for (const [cid, entry] of [...allCtxs.entries()]) {
+      if (entry.sessionId === sessionId) allCtxs.delete(cid);
+    }
+  }
 }
 function clearFrameRoutesForSession(tabId, sessionId) {
   for (const [key, route] of [...frameRoutes.entries()]) {
@@ -2381,6 +2432,7 @@ function classifyExtensionError(message) {
   if (/CDP command .* timed out/.test(message)) return "cdp_timeout";
   if (/attach failed|Debugger is not attached/.test(message)) return "attach_failed";
   if (/No tab with id|no longer exists|No window with id/.test(message)) return "tab_gone";
+  if (/No iframe target found for frame|No session with given id|Cannot find context with specified id/.test(message)) return "frame_not_attached";
   return void 0;
 }
 function errorResult(id, err) {
@@ -2407,7 +2459,25 @@ async function handleExec(cmd, leaseKey) {
     }
     if (cmd.execContextId != null) {
       await ensureAttached(tabId, aggressive);
-      const result = await sendDebuggerCommand({ tabId }, "Runtime.evaluate", {
+      const owner = resolveContextSession(tabId, cmd.execContextId);
+      if (!owner) {
+        return {
+          id: cmd.id,
+          ok: false,
+          error: `Execution context ${cmd.execContextId} is not known for this tab (use "browser contexts" for current ids)`,
+          errorCode: "frame_not_attached"
+        };
+      }
+      if (!owner.live) {
+        return {
+          id: cmd.id,
+          ok: false,
+          error: `Execution context ${cmd.execContextId}'s frame session has detached or navigated away; re-run "browser contexts" and retry`,
+          errorCode: "frame_not_attached"
+        };
+      }
+      const debuggee = owner.sessionId ? { tabId, sessionId: owner.sessionId } : { tabId };
+      const result = await sendDebuggerCommand(debuggee, "Runtime.evaluate", {
         expression: cmd.code,
         contextId: cmd.execContextId,
         returnByValue: true,

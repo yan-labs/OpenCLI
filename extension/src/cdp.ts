@@ -8,8 +8,24 @@
 
 const attached = new Set<number>();
 
-const tabFrameContexts = new Map<number, Map<string, number>>();
-const tabAllContexts = new Map<number, Map<number, { id: number; origin: string; name: string; auxData: any }>>();
+/**
+ * `sessionId` is the flatten-mode CDP session (per chrome.debugger's `source`
+ * param) that the Runtime.executionContextCreated event actually arrived on.
+ * A context created in a child OOPIF session is NOT visible to a
+ * `Runtime.evaluate` sent on the tab-level `{tabId}` debuggee — each flatten
+ * session has its own independently-numbered Runtime domain, so a stray
+ * `{tabId}`-only send with a child session's contextId does not error, it
+ * silently evaluates against whatever context happens to own that same
+ * small integer in the MAIN frame's session. Recording sessionId here is
+ * what lets evaluateInFrame's cached-context fast path (and the CLI's
+ * `eval --context <id>` path in background.ts) address the correct session
+ * instead of guessing tabId-only and getting a wrong-but-successful result.
+ * Undefined sessionId means the context belongs to the tab-level session.
+ */
+const tabFrameContexts = new Map<number, Map<string, { contextId: number; sessionId?: string }>>();
+const tabAllContexts = new Map<number, Map<number, { id: number; origin: string; name: string; auxData: any; sessionId?: string }>>();
+/** Child flatten-mode sessionIds currently attached per tab (added on Target.attachedToTarget, removed on detach/destroy/crash). A route or cached context whose sessionId is missing here is stale and must not be used. */
+const tabLiveSessionIds = new Map<number, Set<string>>();
 const frameTargets = new Map<string, string>();
 const frameTargetKeys = new Map<string, string>();
 let frameTargetCleanupRegistered = false;
@@ -893,6 +909,11 @@ export function registerFrameTracking(): void {
   chrome.debugger.onEvent.addListener((source, method, params: any) => {
     const tabId = source.tabId;
     if (!tabId) return;
+    // Chrome 106+ stamps flatten-mode child-session events with
+    // source.sessionId (same DebuggerSessionTarget widening as the debuggee
+    // side — see the type above). Undefined means this event came from the
+    // tab-level session itself.
+    const eventSessionId = (source as DebuggerSessionTarget).sessionId;
 
     if (method === 'Runtime.executionContextCreated') {
       const context = params.context;
@@ -906,6 +927,7 @@ export function registerFrameTracking(): void {
           origin: context.origin || '',
           name: context.name || '',
           auxData: context.auxData,
+          sessionId: eventSessionId,
         });
       }
       if (!context?.auxData?.frameId || context.auxData.isDefault !== true) return;
@@ -913,7 +935,7 @@ export function registerFrameTracking(): void {
       if (!tabFrameContexts.has(tabId)) {
         tabFrameContexts.set(tabId, new Map());
       }
-      tabFrameContexts.get(tabId)!.set(frameId, context.id);
+      tabFrameContexts.get(tabId)!.set(frameId, { contextId: context.id, sessionId: eventSessionId });
     }
 
     if (method === 'Runtime.executionContextDestroyed') {
@@ -921,8 +943,8 @@ export function registerFrameTracking(): void {
       tabAllContexts.get(tabId)?.delete(ctxId);
       const contexts = tabFrameContexts.get(tabId);
       if (contexts) {
-        for (const [fid, cid] of contexts) {
-          if (cid === ctxId) { contexts.delete(fid); break; }
+        for (const [fid, entry] of contexts) {
+          if (entry.contextId === ctxId) { contexts.delete(fid); break; }
         }
       }
     }
@@ -934,6 +956,11 @@ export function registerFrameTracking(): void {
 
     if (method === 'Target.attachedToTarget') {
       const targetInfo = params?.targetInfo as { targetId?: string; type?: string; url?: string; title?: string } | undefined;
+      const attachedSessionId = typeof params?.sessionId === 'string' ? params.sessionId : undefined;
+      if (attachedSessionId) {
+        if (!tabLiveSessionIds.has(tabId)) tabLiveSessionIds.set(tabId, new Set());
+        tabLiveSessionIds.get(tabId)!.add(attachedSessionId);
+      }
       if (targetInfo?.type === 'iframe' && targetInfo.targetId) {
         if (!tabIframeTargets.has(tabId)) tabIframeTargets.set(tabId, new Map());
         tabIframeTargets.get(tabId)!.set(targetInfo.targetId, {
@@ -941,7 +968,7 @@ export function registerFrameTracking(): void {
           title: targetInfo.title || '',
           // Flatten-mode child session id — the preferred way to command this
           // OOPIF (see ensureFrameRoute).
-          sessionId: typeof params?.sessionId === 'string' ? params.sessionId : undefined,
+          sessionId: attachedSessionId,
         });
         tabAttachedEventCounts.set(tabId, (tabAttachedEventCounts.get(tabId) || 0) + 1);
       }
@@ -951,7 +978,32 @@ export function registerFrameTracking(): void {
       const targetId = String(params?.targetId || '');
       if (targetId) tabIframeTargets.get(tabId)?.delete(targetId);
       const sessionId = String(params?.sessionId || '');
-      if (sessionId) clearFrameRoutesForSession(tabId, sessionId);
+      if (sessionId) {
+        tabLiveSessionIds.get(tabId)?.delete(sessionId);
+        clearFrameRoutesForSession(tabId, sessionId);
+        clearContextsForSession(tabId, sessionId);
+      }
+    }
+
+    // Target.targetDestroyed / Target.targetCrashed carry only targetId (no
+    // sessionId) but mean the same thing for routing purposes: whatever
+    // route or cached context pointed at that target is now dead and must
+    // not be reused silently. Chrome does not guarantee detachedFromTarget
+    // also fires in every case (e.g. the tab-level session going away out
+    // from under a still-listed OOPIF), so this is a second, independent
+    // invalidation path rather than relying on detachedFromTarget alone.
+    if (method === 'Target.targetDestroyed' || method === 'Target.targetCrashed') {
+      const targetId = String(params?.targetId || '');
+      if (targetId) {
+        const info = tabIframeTargets.get(tabId)?.get(targetId);
+        tabIframeTargets.get(tabId)?.delete(targetId);
+        if (info?.sessionId) {
+          tabLiveSessionIds.get(tabId)?.delete(info.sessionId);
+          clearFrameRoutesForSession(tabId, info.sessionId);
+          clearContextsForSession(tabId, info.sessionId);
+        }
+        clearFrameTarget(targetId);
+      }
     }
   });
 
@@ -959,14 +1011,34 @@ export function registerFrameTracking(): void {
     tabFrameContexts.delete(tabId);
     tabAllContexts.delete(tabId);
     tabIframeTargets.delete(tabId);
+    tabLiveSessionIds.delete(tabId);
     tabAttachedEventCounts.delete(tabId);
   });
 }
 
-export function getAllContexts(tabId: number): Array<{ id: number; origin: string; name: string; auxData: any }> {
+export function getAllContexts(tabId: number): Array<{ id: number; origin: string; name: string; auxData: any; sessionId?: string }> {
   const contexts = tabAllContexts.get(tabId);
   if (!contexts) return [];
   return Array.from(contexts.values());
+}
+
+/**
+ * Which flatten-mode session (undefined = tab-level) a given execution
+ * context id belongs to, and whether that session is still live. Used by
+ * background.ts's `eval --context <id>` handling to route the command to
+ * the session that actually owns the context instead of guessing
+ * `{tabId}`-only — which, for a child-session context id, does not error,
+ * it silently evaluates a same-numbered context in the wrong (main) frame.
+ */
+export function resolveContextSession(
+  tabId: number,
+  contextId: number,
+): { sessionId?: string; live: boolean } | undefined {
+  const entry = tabAllContexts.get(tabId)?.get(contextId);
+  if (!entry) return undefined;
+  if (!entry.sessionId) return { sessionId: undefined, live: true };
+  const live = tabLiveSessionIds.get(tabId)?.has(entry.sessionId) ?? false;
+  return { sessionId: entry.sessionId, live };
 }
 
 export async function getFrameTree(tabId: number): Promise<any> {
@@ -986,13 +1058,25 @@ export async function evaluateInFrame(
   await sendDebuggerCommand({ tabId }, 'Runtime.enable').catch(() => {});
 
   const contexts = tabFrameContexts.get(tabId);
-  const contextId = contexts?.get(frameId);
+  const cached = contexts?.get(frameId);
 
-  if (contextId !== undefined) {
+  // A cached context tied to a child flatten-mode session MUST be routed via
+  // {tabId, sessionId} — sending it on the plain {tabId} (tab-level) debuggee
+  // does not error, it silently evaluates a same-numbered context in the
+  // main frame's own session instead (each flatten session numbers its
+  // Runtime contexts independently). If the owning session is no longer
+  // live, treat the cache as stale rather than guessing.
+  const cacheUsable = cached !== undefined
+    && (cached.sessionId === undefined || (tabLiveSessionIds.get(tabId)?.has(cached.sessionId) ?? false));
+
+  if (cacheUsable && cached) {
+    const debuggee = cached.sessionId
+      ? ({ tabId, sessionId: cached.sessionId } as DebuggerSessionTarget as chrome.debugger.Debuggee)
+      : ({ tabId } as chrome.debugger.Debuggee);
     try {
-      const result = await sendDebuggerCommand({ tabId }, 'Runtime.evaluate', {
+      const result = await sendDebuggerCommand(debuggee, 'Runtime.evaluate', {
         expression,
-        contextId,
+        contextId: cached.contextId,
         returnByValue: true,
         awaitPromise: true,
       }, timeoutMs) as {
@@ -1014,11 +1098,15 @@ export async function evaluateInFrame(
       // fall through to the frame-target path instead of failing (evaluate()
       // likewise re-resolves on a dead context). Re-throw genuine page errors.
       const msg = String((err as { message?: string })?.message || err);
-      if (!/Cannot find context|context with specified id|Execution context was destroyed/i.test(msg)) {
+      if (!/Cannot find context|context with specified id|Execution context was destroyed|No session with given id|Detached while handling command/i.test(msg)) {
         throw err;
       }
       contexts?.delete(frameId);
     }
+  } else if (cached) {
+    // Cache hit but the owning session is no longer live — drop it instead
+    // of ever sending the stale contextId anywhere.
+    contexts?.delete(frameId);
   }
 
   // No cached context, or the cached one went stale: resolve via the frame
@@ -1114,6 +1202,30 @@ export async function readNetworkCapture(tabId: number): Promise<NetworkCaptureE
 
 export function hasActiveNetworkCapture(tabId: number): boolean {
   return networkCaptures.has(tabId);
+}
+
+/**
+ * Drop any tabFrameContexts / tabAllContexts entries attributed to a
+ * flatten-mode session that just detached, was destroyed, or crashed — a
+ * cached contextId for a dead session must never be reused; a numerically
+ * identical contextId can legitimately exist in a different (e.g. the
+ * tab-level) session and silently produce a wrong-frame result instead of
+ * an error. See evaluateInFrame's fast path and handleExec's
+ * `cmd.execContextId` branch in background.ts.
+ */
+function clearContextsForSession(tabId: number, sessionId: string): void {
+  const frameCtxs = tabFrameContexts.get(tabId);
+  if (frameCtxs) {
+    for (const [fid, entry] of [...frameCtxs.entries()]) {
+      if (entry.sessionId === sessionId) frameCtxs.delete(fid);
+    }
+  }
+  const allCtxs = tabAllContexts.get(tabId);
+  if (allCtxs) {
+    for (const [cid, entry] of [...allCtxs.entries()]) {
+      if (entry.sessionId === sessionId) allCtxs.delete(cid);
+    }
+  }
 }
 
 /** Drop any cached session route whose flatten-mode session just went away. */
