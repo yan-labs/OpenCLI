@@ -1876,7 +1876,7 @@ async function enumerateFramesForTab(tabId: number): Promise<Array<{ index: numb
 
   let iframeTargets: Array<{ targetId: string; url: string; title: string }> = [];
   try {
-    iframeTargets = await executor.listIframeTargets(tabId);
+    iframeTargets = (await executor.listIframeTargets(tabId)).targets;
   } catch {
     // OOPIF discovery is best-effort — fall back to the frame-tree-only list.
   }

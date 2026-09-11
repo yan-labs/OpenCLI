@@ -9,6 +9,8 @@ const tabAllContexts = /* @__PURE__ */ new Map();
 const frameTargets = /* @__PURE__ */ new Map();
 const frameTargetKeys = /* @__PURE__ */ new Map();
 let frameTargetCleanupRegistered = false;
+const tabIframeTargets = /* @__PURE__ */ new Map();
+const tabAttachedEventCounts = /* @__PURE__ */ new Map();
 const CDP_RESPONSE_BODY_CAPTURE_LIMIT = 8 * 1024 * 1024;
 const CDP_REQUEST_BODY_CAPTURE_LIMIT = 1 * 1024 * 1024;
 const networkCaptures = /* @__PURE__ */ new Map();
@@ -384,45 +386,88 @@ async function resolveFrameTargetId(tabId, frameId, targetUrl) {
   const candidates = targets.filter((target) => target.type === "iframe").map((target) => `${target.targetId || target.id || "?"} ${target.url || ""}`).join("; ");
   throw new Error(`No iframe target found for frame ${frameId}${targetUrl ? ` (${targetUrl})` : ""}. Candidates: ${candidates || "none"}`);
 }
+async function waitForIframeAttachEvents(tabId, maxWaitMs = 500) {
+  const start = Date.now();
+  const tickMs = 50;
+  let lastSize = tabIframeTargets.get(tabId)?.size ?? 0;
+  let stableTicks = 0;
+  while (Date.now() - start < maxWaitMs) {
+    await new Promise((resolve) => setTimeout(resolve, tickMs));
+    const size = tabIframeTargets.get(tabId)?.size ?? 0;
+    if (size === lastSize) {
+      stableTicks += 1;
+      if (stableTicks >= 2 && size > 0) return;
+    } else {
+      stableTicks = 0;
+      lastSize = size;
+    }
+  }
+}
 async function listIframeTargets(tabId) {
   await ensureAttached(tabId);
   await sendDebuggerCommand({ tabId }, "Target.setDiscoverTargets", { discover: true }).catch(() => {
   });
-  await sendDebuggerCommand({ tabId }, "Target.setAutoAttach", {
-    autoAttach: true,
-    waitForDebuggerOnStart: false,
-    flatten: true,
-    filter: [{ type: "iframe", exclude: false }]
-  }).catch(() => {
-  });
-  const result = await sendDebuggerCommand({ tabId }, "Target.getTargets").catch(() => null);
-  const targets = result?.targetInfos ?? [];
-  const candidates = targets.filter((t) => t.type === "iframe").map((t) => ({ targetId: t.targetId || t.id || "", url: t.url || "", title: t.title || "" })).filter((t) => t.targetId);
-  if (candidates.length === 0) return [];
-  let domFrameUrls = [];
+  let autoAttachError;
   try {
-    const raw = await evaluate(
-      tabId,
-      `(() => { const out = []; const walk = (root) => { for (const el of root.querySelectorAll('*')) { if (el.tagName === 'IFRAME' && el.src) out.push(el.src); if (el.shadowRoot) walk(el.shadowRoot); } }; walk(document); return out; })()`
-    );
-    if (Array.isArray(raw)) domFrameUrls = raw;
-  } catch {
+    await sendDebuggerCommand({ tabId }, "Target.setAutoAttach", {
+      autoAttach: true,
+      waitForDebuggerOnStart: false,
+      flatten: true,
+      filter: [{ type: "iframe", exclude: false }]
+    });
+  } catch (err) {
+    autoAttachError = err instanceof Error ? err.message : String(err);
   }
-  if (domFrameUrls.length === 0) return candidates;
-  const domOrigins = /* @__PURE__ */ new Set();
-  for (const url of domFrameUrls) {
+  await waitForIframeAttachEvents(tabId);
+  const eventCandidates = Array.from(tabIframeTargets.get(tabId)?.entries() ?? []).map(([targetId, info]) => ({ targetId, url: info.url, title: info.title }));
+  const knownTargetIds = new Set(eventCandidates.map((c) => c.targetId));
+  let getTargetsError;
+  let getTargetsCandidates = [];
+  try {
+    const result = await sendDebuggerCommand({ tabId }, "Target.getTargets");
+    const targets = result?.targetInfos ?? [];
+    getTargetsCandidates = targets.filter((t) => t.type === "iframe").map((t) => ({ targetId: t.targetId || t.id || "", url: t.url || "", title: t.title || "" })).filter((t) => t.targetId && !knownTargetIds.has(t.targetId));
+  } catch (err) {
+    getTargetsError = err instanceof Error ? err.message : String(err);
+  }
+  const getTargetsIframeCount = getTargetsCandidates.length;
+  let domFrameUrls = [];
+  if (getTargetsCandidates.length > 0) {
     try {
-      domOrigins.add(new URL(url).origin);
+      const raw = await evaluate(
+        tabId,
+        `(() => { const out = []; const walk = (root) => { for (const el of root.querySelectorAll('*')) { if (el.tagName === 'IFRAME' && el.src) out.push(el.src); if (el.shadowRoot) walk(el.shadowRoot); } }; walk(document); return out; })()`
+      );
+      if (Array.isArray(raw)) domFrameUrls = raw;
     } catch {
     }
-  }
-  return candidates.filter((c) => domFrameUrls.includes(c.url) || (() => {
-    try {
-      return domOrigins.has(new URL(c.url).origin);
-    } catch {
-      return false;
+    if (domFrameUrls.length > 0) {
+      const domOrigins = /* @__PURE__ */ new Set();
+      for (const url of domFrameUrls) {
+        try {
+          domOrigins.add(new URL(url).origin);
+        } catch {
+        }
+      }
+      getTargetsCandidates = getTargetsCandidates.filter((c) => domFrameUrls.includes(c.url) || (() => {
+        try {
+          return domOrigins.has(new URL(c.url).origin);
+        } catch {
+          return false;
+        }
+      })());
     }
-  })());
+  }
+  return {
+    targets: [...eventCandidates, ...getTargetsCandidates],
+    debug: {
+      autoAttachError,
+      getTargetsError,
+      getTargetsIframeCount,
+      attachedEventCount: eventCandidates.length,
+      domFrameUrls
+    }
+  };
 }
 async function sendCommandInFrameTarget(tabId, frameId, method, params = {}, aggressiveRetry = false, timeoutMs = CDP_COMMAND_TIMEOUT_MS, targetUrl) {
   const targetId = await ensureFrameTarget(tabId, frameId, aggressiveRetry, targetUrl);
@@ -475,10 +520,27 @@ function registerFrameTracking() {
       tabFrameContexts.delete(tabId);
       tabAllContexts.delete(tabId);
     }
+    if (method === "Target.attachedToTarget") {
+      const targetInfo = params?.targetInfo;
+      if (targetInfo?.type === "iframe" && targetInfo.targetId) {
+        if (!tabIframeTargets.has(tabId)) tabIframeTargets.set(tabId, /* @__PURE__ */ new Map());
+        tabIframeTargets.get(tabId).set(targetInfo.targetId, {
+          url: targetInfo.url || "",
+          title: targetInfo.title || ""
+        });
+        tabAttachedEventCounts.set(tabId, (tabAttachedEventCounts.get(tabId) || 0) + 1);
+      }
+    }
+    if (method === "Target.detachedFromTarget") {
+      const targetId = String(params?.targetId || "");
+      if (targetId) tabIframeTargets.get(tabId)?.delete(targetId);
+    }
   });
   chrome.tabs.onRemoved.addListener((tabId) => {
     tabFrameContexts.delete(tabId);
     tabAllContexts.delete(tabId);
+    tabIframeTargets.delete(tabId);
+    tabAttachedEventCounts.delete(tabId);
   });
 }
 function getAllContexts(tabId) {
@@ -601,6 +663,8 @@ async function detach(tabId) {
   networkCaptures.delete(tabId);
   tabFrameContexts.delete(tabId);
   tabAllContexts.delete(tabId);
+  tabIframeTargets.delete(tabId);
+  tabAttachedEventCounts.delete(tabId);
   try {
     await chrome.debugger.detach({ tabId });
   } catch {
@@ -612,6 +676,8 @@ function registerListeners() {
     networkCaptures.delete(tabId);
     tabFrameContexts.delete(tabId);
     tabAllContexts.delete(tabId);
+    tabIframeTargets.delete(tabId);
+    tabAttachedEventCounts.delete(tabId);
     clearFrameTargetsForTab(tabId);
   });
   chrome.debugger.onDetach.addListener((source) => {
@@ -620,6 +686,8 @@ function registerListeners() {
       networkCaptures.delete(source.tabId);
       tabFrameContexts.delete(source.tabId);
       tabAllContexts.delete(source.tabId);
+      tabIframeTargets.delete(source.tabId);
+      tabAttachedEventCounts.delete(source.tabId);
       clearFrameTargetsForTab(source.tabId);
       return;
     }
@@ -1981,6 +2049,7 @@ async function handleCommand(cmd) {
   }
 }
 const BLANK_PAGE = "about:blank";
+const DEFAULT_NAVIGATE_TIMEOUT_MS = 15e3;
 function isDebuggableUrl(url) {
   if (!url) return true;
   return url.startsWith("http://") || url.startsWith("https://") || url === "about:blank" || url.startsWith("data:");
@@ -2042,7 +2111,7 @@ async function enumerateFramesForTab(tabId) {
   const knownFrameIds = new Set(frames.map((f) => f.frameId));
   let iframeTargets = [];
   try {
-    iframeTargets = await listIframeTargets(tabId);
+    iframeTargets = (await listIframeTargets(tabId)).targets;
   } catch {
   }
   for (const target of iframeTargets) {
@@ -2350,11 +2419,12 @@ async function handleNavigate(cmd, leaseKey) {
       } catch {
       }
     }, 100);
+    const navTimeoutMs = cmd.timeoutMs ?? DEFAULT_NAVIGATE_TIMEOUT_MS;
     timeoutTimer = setTimeout(() => {
       timedOut = true;
-      console.warn(`[opencli] Navigate to ${targetUrl} timed out after 15s`);
+      console.warn(`[opencli] Navigate to ${targetUrl} timed out after ${navTimeoutMs}ms`);
       finish();
-    }, 15e3);
+    }, navTimeoutMs);
   });
   let tab = await chrome.tabs.get(tabId);
   const postNavigationSession = automationSessions.get(leaseKey);

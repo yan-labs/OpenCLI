@@ -87,8 +87,50 @@ describe('CDPBridge cookies', () => {
 
     expect(send.mock.calls).toEqual([
       ['Input.insertText', { text: 'hello' }],
-      ['Input.dispatchKeyEvent', { type: 'keyDown', key: 'a', modifiers: 2 }],
-      ['Input.dispatchKeyEvent', { type: 'keyUp', key: 'a', modifiers: 2 }],
+      [
+        'Input.dispatchKeyEvent',
+        {
+          type: 'keyDown',
+          key: 'Control',
+          code: 'ControlLeft',
+          modifiers: 0,
+          windowsVirtualKeyCode: 17,
+          nativeVirtualKeyCode: 17,
+        },
+      ],
+      [
+        'Input.dispatchKeyEvent',
+        {
+          type: 'keyDown',
+          key: 'a',
+          code: 'KeyA',
+          modifiers: 2,
+          windowsVirtualKeyCode: 65,
+          nativeVirtualKeyCode: 65,
+        },
+      ],
+      [
+        'Input.dispatchKeyEvent',
+        {
+          type: 'keyUp',
+          key: 'a',
+          code: 'KeyA',
+          modifiers: 2,
+          windowsVirtualKeyCode: 65,
+          nativeVirtualKeyCode: 65,
+        },
+      ],
+      [
+        'Input.dispatchKeyEvent',
+        {
+          type: 'keyUp',
+          key: 'Control',
+          code: 'ControlLeft',
+          modifiers: 0,
+          windowsVirtualKeyCode: 17,
+          nativeVirtualKeyCode: 17,
+        },
+      ],
       ['Input.dispatchMouseEvent', { type: 'mouseMoved', x: 10, y: 20 }],
       ['Input.dispatchMouseEvent', { type: 'mousePressed', x: 10, y: 20, button: 'left', clickCount: 1 }],
       ['Input.dispatchMouseEvent', { type: 'mouseReleased', x: 10, y: 20, button: 'left', clickCount: 1 }],
