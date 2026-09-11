@@ -8,6 +8,7 @@ import {
   isUnknownOutcomeError,
   requestDaemonShutdown,
   sendCommand,
+  sendCommandFull,
   setDaemonCommandTimeoutSeconds,
   setDaemonRunContext,
 } from './daemon-client.js';
@@ -629,6 +630,41 @@ describe('daemon-client', () => {
     const body = JSON.parse(String(fetchMock.mock.calls[0][1]?.body)) as { timeout?: number };
     // 240s extension wait + 15s margin
     expect(body.timeout).toBe(255);
+  });
+
+  it('sendCommandFull forwards navigate timeoutMs in the request body and extends body.timeout past it', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve({ id: 'server', ok: true, data: { url: 'https://example.com', timedOut: false } }),
+    } as Response);
+
+    await sendCommandFull('navigate', { url: 'https://example.com', timeoutMs: 200_000 });
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0][1]?.body)) as { timeout?: number; timeoutMs?: number; action?: string; url?: string };
+    expect(body.action).toBe('navigate');
+    expect(body.url).toBe('https://example.com');
+    // The navigate command's own timeoutMs field must reach the extension unchanged...
+    expect(body.timeoutMs).toBe(200_000);
+    // ...and the daemon-side deadline must be extended past it (200s nav + 15s
+    // margin = 215s, which exceeds the 120s default so it wins the max()).
+    expect(body.timeout).toBe(215);
+  });
+
+  it('sendCommandFull omits timeoutMs from the request body when navigate is called without it (old-CLI-shaped call)', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve({ id: 'server', ok: true, data: { url: 'https://example.com', timedOut: false } }),
+    } as Response);
+
+    await sendCommandFull('navigate', { url: 'https://example.com' });
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0][1]?.body)) as { timeout?: number; timeoutMs?: number };
+    expect(body.timeoutMs).toBeUndefined();
+    expect(body.timeout).toBe(120);
   });
 
   it('setDaemonCommandTimeoutSeconds raises the transport deadline for the user --timeout', async () => {

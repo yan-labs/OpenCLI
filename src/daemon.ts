@@ -34,6 +34,7 @@ import {
   buildCommandTimeoutFailure,
   buildExtensionDisconnectFailure,
   getResponseCorsHeaders,
+  isProcessAlive,
   resolveProfileRoute,
 } from './daemon-utils.js';
 import {
@@ -95,17 +96,6 @@ const pending = new Map<string, PendingEntry>();
 // concurrent adapter and browser-surface writes so two processes cannot drive
 // the same Chrome tab. Stale leases self-expire (see session-lease.ts).
 const sessionLeases = new SessionLeaseRegistry();
-
-/** A TTL-stale lease holder with a command still in flight is alive, not dead. */
-/** Signal 0 probes existence without delivering anything; EPERM still means alive. */
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException)?.code === 'EPERM';
-  }
-}
 
 function runHasPendingWork(runId: string): boolean {
   for (const entry of pending.values()) {
@@ -436,6 +426,18 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
             retryAfterMs: 2_000,
           });
           return;
+        }
+        if (outcome.reclaimedFrom) {
+          const heldSeconds = Math.max(0, Math.round((now - outcome.reclaimedFrom.startedAt) / 1000));
+          const prevPid = outcome.reclaimedFrom.pid != null ? String(outcome.reclaimedFrom.pid) : 'unknown';
+          const reason = outcome.reclaimReason === 'client_dead'
+            ? 'its client process is gone (stale lock)'
+            : 'its TTL expired';
+          log.warn(
+            `[daemon] Session ${key} lock reclaimed from ${outcome.reclaimedFrom.command} ` +
+            `(pid ${prevPid}, runId=${outcome.reclaimedFrom.runId}), held for ${heldSeconds}s — ${reason}; ` +
+            `granting to ${body.command ?? body.action} (runId=${body.runId})`,
+          );
         }
         leaseKey = key;
         leaseRunId = body.runId;

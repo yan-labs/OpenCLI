@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   COMMAND_RESULT_UNKNOWN_CODE,
@@ -8,8 +8,38 @@ import {
   buildExtensionDisconnectFailure,
   commandResultUnknownMessage,
   getResponseCorsHeaders,
+  isProcessAlive,
   resolveProfileRoute,
 } from './daemon-utils.js';
+
+describe('isProcessAlive', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('is alive when signalling the pid succeeds', () => {
+    vi.spyOn(process, 'kill').mockReturnValue(true as never);
+    expect(isProcessAlive(12345)).toBe(true);
+  });
+
+  it('is dead when the pid no longer exists (ESRCH)', () => {
+    vi.spyOn(process, 'kill').mockImplementation(() => {
+      const err = new Error('kill ESRCH') as NodeJS.ErrnoException;
+      err.code = 'ESRCH';
+      throw err;
+    });
+    expect(isProcessAlive(49191)).toBe(false);
+  });
+
+  it('is alive when the pid belongs to another user (EPERM)', () => {
+    vi.spyOn(process, 'kill').mockImplementation(() => {
+      const err = new Error('kill EPERM') as NodeJS.ErrnoException;
+      err.code = 'EPERM';
+      throw err;
+    });
+    expect(isProcessAlive(1)).toBe(true);
+  });
+});
 
 describe('getResponseCorsHeaders', () => {
   it('allows the Browser Bridge extension origin to read /ping', () => {

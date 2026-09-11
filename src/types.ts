@@ -70,7 +70,7 @@ export interface FetchJsonOptions {
 export type BrowserEvaluateFunction<Args extends unknown[] = unknown[], Result = unknown> = (...args: Args) => Result | Promise<Result>;
 
 export interface IPage {
-  goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: number }): Promise<void>;
+  goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: number; timeoutMs?: number }): Promise<void>;
   evaluate<T = any>(js: string): Promise<T>;
   evaluate<Args extends unknown[], T>(fn: BrowserEvaluateFunction<Args, T>, ...args: Args): Promise<Awaited<T>>;
   /** Safely evaluate JS with pre-serialized arguments — prevents injection. */

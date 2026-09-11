@@ -787,6 +787,114 @@ describe('background tab isolation', () => {
     expect(detachMock).not.toHaveBeenCalled();
   });
 
+  /**
+   * Both of these navigate-timeout tests must keep the tab looking permanently
+   * "not yet at the target URL" — otherwise handleNavigate's own fast path
+   * ("tab already at target and complete") returns before ever scheduling its
+   * wait/timeout, and the test would pass for the wrong reason. `chrome.tabs.update`
+   * is therefore a deliberate no-op (never mutates url/status), for BOTH the
+   * pre-navigation update inside createOwnedTabLeaseUnlocked and handleNavigate's
+   * own update call. Once the real wait/timeout is scheduled, the test finishes
+   * it by invoking the captured timeout callback directly (the same code path
+   * `finish()` would take on a real timeout) instead of waiting out the delay
+   * in real time or leaving a live timer dangling into a later test.
+   */
+  it('schedules the navigate timeout fallback at 15000ms when cmd.timeoutMs is absent (old-CLI compatibility)', async () => {
+    const { chrome, tabs } = createChromeMock();
+    chrome.tabs.update = vi.fn(async (tabId: number) => {
+      const tab = tabs.find((entry) => entry.id === tabId);
+      if (!tab) throw new Error(`Unknown tab ${tabId}`);
+      return tab;
+    });
+    vi.stubGlobal('chrome', chrome);
+    vi.doMock('./cdp', () => ({
+      registerListeners: vi.fn(),
+      hasActiveNetworkCapture: vi.fn(() => false),
+      detach: vi.fn(async () => {}),
+    }));
+
+    const mod = await import('./background');
+    mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
+
+    const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+    try {
+      const resultPromise = mod.__test__.handleNavigate(
+        { id: 'nav-default-timeout', action: 'navigate', url: 'https://eos.douyin.com/livesite/default-timeout', session: adapterKey('twitter') },
+        adapterKey('twitter'),
+      );
+
+      // Let the mandatory internal waits (the 300ms pre-navigation settle inside
+      // createOwnedTabLeaseUnlocked, plus microtask chains) elapse for real, so
+      // handleNavigate's own checkTimer/timeoutTimer are definitely scheduled by
+      // the time we inspect the spy below.
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
+      const timeoutCall = setTimeoutSpy.mock.calls.find(([, delay]) => delay === 15000);
+      expect(timeoutCall).toBeTruthy();
+
+      // Fire the captured callback directly instead of waiting out 15s of real
+      // time or leaving the timer dangling into a later test.
+      (timeoutCall![0] as () => void)();
+      const result = await resultPromise;
+
+      expect(result.ok).toBe(true);
+      expect((result as { data?: { timedOut?: boolean } }).data?.timedOut).toBe(true);
+    } finally {
+      // handleNavigate's success path arms a real idle timer (30s default for
+      // adapter sessions) on the lease. Release it here — while `chrome` is
+      // still stubbed — so it doesn't fire after this test (and its stub)
+      // have torn down, which would surface as an unhandled rejection later
+      // in the run instead of a clean pass/fail here.
+      await mod.__test__.releaseLease(adapterKey('twitter'), 'test cleanup');
+      setTimeoutSpy.mockRestore();
+    }
+  });
+
+  it('schedules the navigate timeout fallback at cmd.timeoutMs (not the 15000ms default) when the CLI passes --timeout / OPENCLI_NAV_TIMEOUT_MS', async () => {
+    const { chrome, tabs } = createChromeMock();
+    chrome.tabs.update = vi.fn(async (tabId: number) => {
+      const tab = tabs.find((entry) => entry.id === tabId);
+      if (!tab) throw new Error(`Unknown tab ${tabId}`);
+      return tab;
+    });
+    vi.stubGlobal('chrome', chrome);
+    vi.doMock('./cdp', () => ({
+      registerListeners: vi.fn(),
+      hasActiveNetworkCapture: vi.fn(() => false),
+      detach: vi.fn(async () => {}),
+    }));
+
+    const mod = await import('./background');
+    mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
+
+    const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+    try {
+      const resultPromise = mod.__test__.handleNavigate(
+        { id: 'nav-custom-timeout', action: 'navigate', url: 'https://eos.douyin.com/livesite/custom-timeout', session: adapterKey('twitter'), timeoutMs: 45000 },
+        adapterKey('twitter'),
+      );
+
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
+      const delays = setTimeoutSpy.mock.calls.map(([, delay]) => delay);
+      const timeoutCall = setTimeoutSpy.mock.calls.find(([, delay]) => delay === 45000);
+      expect(timeoutCall).toBeTruthy();
+      expect(delays).not.toContain(15000);
+
+      (timeoutCall![0] as () => void)();
+      const result = await resultPromise;
+
+      expect(result.ok).toBe(true);
+      expect((result as { data?: { timedOut?: boolean } }).data?.timedOut).toBe(true);
+    } finally {
+      // See the identical comment in the previous test: release the lease
+      // while `chrome` is still stubbed so its real idle timer doesn't fire
+      // later in the run against an already-torn-down stub.
+      await mod.__test__.releaseLease(adapterKey('twitter'), 'test cleanup');
+      setTimeoutSpy.mockRestore();
+    }
+  });
+
   it('keeps hash routes distinct when comparing target URLs', async () => {
     const { chrome } = createChromeMock();
     vi.stubGlobal('chrome', chrome);

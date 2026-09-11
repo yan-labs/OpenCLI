@@ -950,4 +950,50 @@ describe('BasePage.sleep', () => {
     expect(evalSpy).not.toHaveBeenCalled();
     expect(page.scripts).toHaveLength(0);
   });
+
+  it('always blocks for the full requested duration', async () => {
+    const page = new ActionPage();
+    const seconds = 0.3;
+    const start = Date.now();
+
+    await page.sleep(seconds);
+
+    expect(Date.now() - start).toBeGreaterThanOrEqual(seconds * 1000 - 20);
+  });
+});
+
+// Regression test for the "opencli browser <session> wait time <N>" bug:
+// `wait(n)` for n>=1 is a DOM-stability heuristic — it resolves as soon as
+// `evaluate()` (a MutationObserver-driven page script) settles, which can be
+// almost instantly. That's fine for "wait after this click", but it silently
+// broke the explicit `wait time N` command, whose entire job is a fixed
+// throttle (e.g. spacing out requests to a quota-limited site) that must
+// block for the full N seconds regardless of page activity. The fix in
+// src/cli.ts makes `wait time` call `sleep(n)` instead of `wait(n)` — this
+// test locks in why: `wait()` can return far short of the requested time
+// when the page's evaluate() resolves quickly (e.g. an idle/stable DOM),
+// while `sleep()` cannot.
+describe('BasePage.wait vs sleep (regression: wait time must not return early)', () => {
+  it('wait(n>=1) can resolve much faster than n seconds when evaluate() settles immediately', async () => {
+    const page = new ActionPage();
+    // ActionPage.evaluate() resolves on the next microtask (no real delay),
+    // simulating an extension-driven DOM-stable probe that settles fast.
+    const seconds = 1.2;
+    const start = Date.now();
+
+    await page.wait(seconds);
+
+    // The bug: wait() returns almost immediately instead of blocking ~1200ms.
+    expect(Date.now() - start).toBeLessThan(seconds * 1000 - 200);
+  });
+
+  it('sleep(n) blocks for the full n seconds regardless of page activity', async () => {
+    const page = new ActionPage();
+    const seconds = 1.2;
+    const start = Date.now();
+
+    await page.sleep(seconds);
+
+    expect(Date.now() - start).toBeGreaterThanOrEqual(seconds * 1000 - 20);
+  });
 });
