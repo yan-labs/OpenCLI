@@ -133,6 +133,8 @@ export interface IPage {
    * Useful for rich editors that ignore synthetic DOM value/text mutations.
    */
   insertText?(text: string): Promise<void>;
+  /** Read the system clipboard as plain text via an offscreen document. */
+  readClipboard?(): Promise<string>;
   closeWindow?(): Promise<void>;
   /** Returns the current page URL, or null if unavailable. */
   getCurrentUrl?(): Promise<string | null>;
@@ -146,8 +148,11 @@ export interface IPage {
   handleJavaScriptDialog?(accept: boolean, promptText?: string): Promise<void>;
   /** List cross-origin iframe targets in snapshot order. */
   frames?(): Promise<Array<{ index: number; frameId: string; url: string; name: string }>>;
+  /** List all JS execution contexts including content script isolated worlds. */
+  contexts?(): Promise<Array<{ id: number; origin: string; name: string; auxData: any }>>;
   /** Evaluate JavaScript inside a cross-origin iframe identified by its frame index. */
   evaluateInFrame?(js: string, frameIndex: number): Promise<unknown>;
+  evaluateInContext?(js: string, contextId: number): Promise<unknown>;
   /** Click at native coordinates via CDP Input.dispatchMouseEvent. */
   nativeClick?(x: number, y: number): Promise<void>;
   /** Type text via CDP Input.insertText. */

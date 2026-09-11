@@ -20,7 +20,9 @@ export type Action =
   | 'network-capture-read'
   | 'wait-download'
   | 'cdp'
-  | 'frames';
+  | 'frames'
+  | 'contexts'
+  | 'clipboard';
 
 export interface Command {
   /** Unique request ID */
@@ -75,6 +77,19 @@ export interface Command {
   idleTimeout?: number;
   /** Frame index for cross-frame operations (0-based, from 'frames' action) */
   frameIndex?: number;
+  /**
+   * When true, the 'frames' action returns `{ frames, debug }` instead of a
+   * bare array, where `debug` surfaces OOPIF-discovery diagnostics (event
+   * counts, getTargets/autoAttach errors, DOM frame URLs) instead of
+   * swallowing them — see cdp.ts listIframeTargets.
+   */
+  debug?: boolean;
+  /**
+   * CDP Runtime execution context ID for cross-world evaluation (e.g. a
+   * content script's isolated world), from the 'contexts' action. Distinct
+   * from `contextId` below, which identifies a browser profile/context.
+   */
+  execContextId?: number;
   /** Browser profile/context REQUIRED by the CLI (--profile / env). Used by the daemon for strict routing. */
   contextId?: string;
   /**

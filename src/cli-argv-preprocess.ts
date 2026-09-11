@@ -23,6 +23,7 @@ const BROWSER_SUBCOMMAND_NAMES: ReadonlySet<string> = new Set([
   'click',
   'close',
   'console',
+  'contexts',
   'dblclick',
   'dialog',
   'drag',

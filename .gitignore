@@ -25,3 +25,6 @@ docs/.vitepress/cache
 *.db
 autoresearch/results/
 autoresearch-results.tsv
+
+# 内部 rankup 记录，不进公开 fork
+.rankup/

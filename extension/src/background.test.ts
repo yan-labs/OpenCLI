@@ -343,6 +343,45 @@ describe('background tab isolation', () => {
     ]);
   });
 
+  it('falls back to chrome.debugger OOPIF targets for a cross-origin iframe missing from the frame tree', async () => {
+    // Under Chrome's site isolation a cross-origin iframe is an out-of-process
+    // target: Page.getFrameTree's childFrames on the parent session can be
+    // empty even though the iframe is really there. enumerateFramesForTab
+    // must recover it from Target.getTargets instead of returning [].
+    const { chrome } = createChromeMock();
+    chrome.debugger.sendCommand = vi.fn(async (_target: unknown, method: string) => {
+      if (method === 'Runtime.enable') return {};
+      if (method === 'Runtime.evaluate') return { result: { value: 1 } };
+      if (method === 'Page.getFrameTree') {
+        return {
+          frameTree: {
+            frame: { id: 'root', url: 'https://main.example/' },
+            // No childFrames — the OOPIF is invisible from here.
+          },
+        };
+      }
+      if (method === 'Target.getTargets') {
+        return {
+          targetInfos: [
+            { targetId: 'oopif-1', type: 'iframe', url: 'https://cross.example/widget', title: 'cross-widget' },
+          ],
+        };
+      }
+      return {};
+    });
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./background');
+    mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
+
+    const result = await mod.__test__.handleCommand({ id: 'frames', action: 'frames', session: 'twitter', surface: 'adapter' });
+
+    expect(result.ok).toBe(true);
+    expect(result.data).toEqual([
+      { index: 0, frameId: 'oopif-1', url: 'https://cross.example/widget', name: 'cross-widget' },
+    ]);
+  });
+
   it('does not parse lease-key separators from command session fields', async () => {
     const { chrome } = createChromeMock();
     vi.stubGlobal('chrome', chrome);
@@ -847,6 +886,21 @@ describe('background tab isolation', () => {
     await import('./background');
 
     expect(chrome.alarms.create).toHaveBeenCalledWith('keepalive', { periodInMinutes: 0.5 });
+  });
+
+  it('retries a WebSocket handshake that never opens or closes', async () => {
+    vi.useFakeTimers();
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true })));
+    const mod = await import('./background');
+    await mod.__test__.connectForTest();
+    const socket = MockWebSocket.instances[0];
+    expect(socket.readyState).toBe(MockWebSocket.CONNECTING);
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect(socket.readyState).toBe(MockWebSocket.CLOSED);
+    expect(MockWebSocket.instances.length).toBeGreaterThan(1);
+    mod.__test__.resetReconnectState();
   });
 
   it('reconnect delay backs off exponentially with a 15s cap and resets on success', async () => {

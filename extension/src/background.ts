@@ -20,6 +20,7 @@ const CONTEXT_ID_KEY = 'opencli_context_id_v1';
 let currentContextId = 'default';
 let contextIdPromise: Promise<string> | null = null;
 let connectInFlight: Promise<void> | null = null;
+let handshakeTimer: ReturnType<typeof setTimeout> | null = null;
 // Startup readiness gate. A MV3 service worker can be woken by an event
 // (alarm, window/tab removal) before initialize()'s recovery chain has
 // rehydrated in-memory lease/container state from storage. Event handlers that
@@ -173,8 +174,20 @@ async function connectAttempt(): Promise<void> {
     return;
   }
 
+  if (handshakeTimer) clearTimeout(handshakeTimer);
+  handshakeTimer = setTimeout(() => {
+    if (ws !== thisWs || thisWs.readyState !== WebSocket.CONNECTING) return;
+    console.warn('[opencli] Daemon WebSocket handshake timed out; reconnecting');
+    // Release the guard before close: Chrome may delay the close event too.
+    ws = null;
+    thisWs.close();
+    scheduleReconnect();
+  }, 10_000);
+
   thisWs.onopen = () => {
     if (ws !== thisWs) return;
+    if (handshakeTimer) clearTimeout(handshakeTimer);
+    handshakeTimer = null;
     console.log('[opencli] Connected to daemon');
     reconnectAttempts = 0; // Reset on successful connection
     if (reconnectTimer) {
@@ -197,9 +210,17 @@ async function connectAttempt(): Promise<void> {
 
   thisWs.onmessage = async (event) => {
     if (ws !== thisWs) return;
+    let stallTimer: ReturnType<typeof setTimeout> | undefined;
     try {
       const command = JSON.parse(event.data as string) as Command;
-      const result = await executeWithJournal(command, handleCommand);
+      let stage = 'journal storage';
+      stallTimer = setTimeout(() => {
+        console.warn(`[opencli] Command ${command.id} action=${command.action} still waiting at ${stage} after 5s`);
+      }, 5_000);
+      const result = await executeWithJournal(command, (cmd) => {
+        stage = 'Chrome API handler';
+        return handleCommand(cmd);
+      });
       // The socket may have been replaced while a long command ran. Deliver
       // the result on the freshest open socket — the daemon correlates by id,
       // and the journal replays it if this delivery is lost too.
@@ -207,12 +228,16 @@ async function connectAttempt(): Promise<void> {
       safeSend(target, result);
     } catch (err) {
       console.error('[opencli] Message handling error:', err);
+    } finally {
+      if (stallTimer) clearTimeout(stallTimer);
     }
   };
 
   thisWs.onclose = () => {
     stopWsKeepalive(thisWs);
     if (ws !== thisWs) return;
+    if (handshakeTimer) clearTimeout(handshakeTimer);
+    handshakeTimer = null;
     console.log('[opencli] Disconnected from daemon');
     ws = null;
     scheduleReconnect();
@@ -1739,6 +1764,10 @@ async function handleCommand(cmd: Command): Promise<Result> {
         return await handleWaitDownload(cmd);
       case 'frames':
         return await handleFrames(cmd, leaseKey);
+      case 'contexts':
+        return await handleContexts(cmd, leaseKey);
+      case 'clipboard':
+        return await handleClipboard(cmd);
       default:
         return { id: cmd.id, ok: false, error: `Unknown action: ${cmd.action}` };
     }
@@ -1826,6 +1855,38 @@ function enumerateCrossOriginFrames(tree: any): Array<{ index: number; frameId: 
   const rootFrame = tree?.frameTree?.frame;
   const rootUrl = rootFrame?.url || rootFrame?.unreachableUrl || '';
   collect(tree.frameTree, getUrlOrigin(rootUrl));
+  return frames;
+}
+
+/**
+ * Cross-origin frame list for a tab, merging Page.getFrameTree's childFrames
+ * (same-process frames) with chrome.debugger's OOPIF targets (cross-origin
+ * frames that site isolation moves out of the parent page's frame tree, so
+ * they never show up as childFrames — see executor.listIframeTargets).
+ * Shared by handleFrames and handleExec's frameIndex branch so both use the
+ * same index ordering.
+ */
+async function enumerateFramesForTab(tabId: number): Promise<Array<{ index: number; frameId: string; url: string; name: string }>> {
+  const tree = await executor.getFrameTree(tabId);
+  const frames = enumerateCrossOriginFrames(tree);
+  const knownFrameIds = new Set(frames.map((f) => f.frameId));
+
+  let iframeTargets: Array<{ targetId: string; url: string; title: string }> = [];
+  try {
+    iframeTargets = await executor.listIframeTargets(tabId);
+  } catch {
+    // OOPIF discovery is best-effort — fall back to the frame-tree-only list.
+  }
+  for (const target of iframeTargets) {
+    if (!target.targetId || knownFrameIds.has(target.targetId)) continue;
+    knownFrameIds.add(target.targetId);
+    frames.push({
+      index: frames.length,
+      frameId: target.targetId,
+      url: target.url,
+      name: target.title || '',
+    });
+  }
   return frames;
 }
 
@@ -2098,13 +2159,31 @@ async function handleExec(cmd: Command, leaseKey: string): Promise<Result> {
   try {
     const aggressive = getSurfaceFromKey(leaseKey) === 'browser';
     if (cmd.frameIndex != null) {
-      const tree = await executor.getFrameTree(tabId);
-      const frames = enumerateCrossOriginFrames(tree);
+      const frames = await enumerateFramesForTab(tabId);
       if (cmd.frameIndex < 0 || cmd.frameIndex >= frames.length) {
         return { id: cmd.id, ok: false, error: `Frame index ${cmd.frameIndex} out of range (${frames.length} cross-origin frames available)` };
       }
       const data = await executor.evaluateInFrame(tabId, cmd.code, frames[cmd.frameIndex].frameId, aggressive, commandCdpTimeoutMs(cmd));
       return pageScopedResult(cmd.id, tabId, data);
+    }
+    if (cmd.execContextId != null) {
+      await executor.ensureAttached(tabId, aggressive);
+      const result = await executor.sendDebuggerCommand({ tabId }, 'Runtime.evaluate', {
+        expression: cmd.code,
+        contextId: cmd.execContextId,
+        returnByValue: true,
+        awaitPromise: true,
+      }, commandCdpTimeoutMs(cmd)) as {
+        result?: { value?: unknown };
+        exceptionDetails?: { exception?: { description?: string }; text?: string };
+      };
+      if (result.exceptionDetails) {
+        const errMsg = result.exceptionDetails.exception?.description
+          || result.exceptionDetails.text
+          || 'Evaluation error in context';
+        return { id: cmd.id, ok: false, error: errMsg };
+      }
+      return pageScopedResult(cmd.id, tabId, result.result?.value);
     }
     const data = await executor.evaluateAsync(tabId, cmd.code, aggressive, commandCdpTimeoutMs(cmd));
     return pageScopedResult(cmd.id, tabId, data);
@@ -2117,8 +2196,21 @@ async function handleFrames(cmd: Command, leaseKey: string): Promise<Result> {
   const cmdTabId = await resolveCommandTabId(cmd);
   const tabId = await resolveTabId(cmdTabId, leaseKey);
   try {
-    const tree = await executor.getFrameTree(tabId);
-    return { id: cmd.id, ok: true, data: enumerateCrossOriginFrames(tree) };
+    const frames = await enumerateFramesForTab(tabId);
+    return { id: cmd.id, ok: true, data: frames };
+  } catch (err) {
+    return errorResult(cmd.id, err);
+  }
+}
+
+async function handleContexts(cmd: Command, leaseKey: string): Promise<Result> {
+  const cmdTabId = await resolveCommandTabId(cmd);
+  const tabId = await resolveTabId(cmdTabId, leaseKey);
+  try {
+    const aggressive = getSurfaceFromKey(leaseKey) === 'browser';
+    await executor.ensureAttached(tabId, aggressive);
+    const contexts = executor.getAllContexts(tabId);
+    return { id: cmd.id, ok: true, data: contexts };
   } catch (err) {
     return errorResult(cmd.id, err);
   }
@@ -2391,8 +2483,11 @@ const CDP_ALLOWLIST = new Set([
   'Page.captureScreenshot',
   'Page.getFrameTree',
   'Page.handleJavaScriptDialog',
-  // Runtime.enable needed for CDP attach setup (Runtime.evaluate goes through 'exec' action)
+  // Runtime.enable needed for CDP attach setup (Runtime.evaluate normally goes through
+  // the 'exec' action, but is also allowlisted here for contextId-scoped passthrough
+  // evaluation, e.g. content script isolated worlds discovered via the 'contexts' action)
   'Runtime.enable',
+  'Runtime.evaluate',
   // Emulation (used by screenshot full-page)
   'Emulation.setDeviceMetricsOverride',
   'Emulation.clearDeviceMetricsOverride',
@@ -2580,6 +2675,54 @@ async function handleWaitDownload(cmd: Command): Promise<Result> {
   try {
     const data = await executor.waitForDownload(cmd.pattern ?? '', cmd.timeoutMs ?? 30000);
     return { id: cmd.id, ok: true, data };
+  } catch (err) {
+    return errorResult(cmd.id, err);
+  }
+}
+
+// ─── Clipboard (offscreen document) ────────────────────────────────
+//
+// MV3 service workers have no `document`, and a normal tab's
+// document.execCommand/navigator.clipboard calls are gated behind document
+// focus — opencli's automation tabs run in background windows by default,
+// so that path is essentially never usable. chrome.offscreen with reason
+// `CLIPBOARD` is the documented, focus-exempt way to do clipboard I/O from
+// a service worker. The offscreen document is kept alive indefinitely as a
+// singleton (same pattern as the owned container windows below) rather than
+// closed/recreated per call — there is no per-call cleanup need since it
+// holds no per-session state.
+
+let offscreenDocPromise: Promise<void> | null = null;
+
+async function ensureOffscreenDocument(): Promise<void> {
+  if (await chrome.offscreen.hasDocument()) return;
+  if (offscreenDocPromise) return offscreenDocPromise;
+  offscreenDocPromise = chrome.offscreen.createDocument({
+    url: 'offscreen.html',
+    reasons: ['CLIPBOARD' as chrome.offscreen.Reason],
+    justification: 'Read the system clipboard for the opencli "clipboard" command.',
+  }).finally(() => { offscreenDocPromise = null; });
+  return offscreenDocPromise;
+}
+
+async function readSystemClipboard(timeoutMs = 5000): Promise<string> {
+  await ensureOffscreenDocument();
+  const response = await new Promise<{ text?: string; error?: string }>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('offscreen clipboard read timed out')), timeoutMs);
+    chrome.runtime.sendMessage({ type: 'opencli-read-clipboard' }, (resp) => {
+      clearTimeout(timer);
+      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+      else resolve(resp ?? {});
+    });
+  });
+  if (response.error) throw new Error(response.error);
+  return response.text ?? '';
+}
+
+async function handleClipboard(cmd: Command): Promise<Result> {
+  try {
+    const text = await readSystemClipboard();
+    return { id: cmd.id, ok: true, data: { text } };
   } catch (err) {
     return errorResult(cmd.id, err);
   }
@@ -2829,6 +2972,8 @@ export const __test__ = {
   setReconnectAttempts: (value: number) => { reconnectAttempts = value; },
   nextReconnectDelayMs,
   resetReconnectState: () => {
+    if (handshakeTimer) clearTimeout(handshakeTimer);
+    handshakeTimer = null;
     if (reconnectTimer) clearTimeout(reconnectTimer);
     reconnectTimer = null;
     reconnectAttempts = 0;

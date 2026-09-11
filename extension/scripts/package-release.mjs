@@ -45,8 +45,13 @@ function addLocalAsset(files, ref) {
   if (isLocalAsset(ref)) files.add(ref);
 }
 
+// Assets loaded only at runtime via chrome.offscreen.createDocument() (or
+// similar dynamic APIs), so they have no manifest.json field to discover
+// them from. Keep this list in sync with any such runtime-only entry points.
+const RUNTIME_ONLY_ASSETS = ['offscreen.html'];
+
 function collectManifestEntrypoints(manifest) {
-  const files = new Set(['manifest.json']);
+  const files = new Set(['manifest.json', ...RUNTIME_ONLY_ASSETS]);
 
   addLocalAsset(files, manifest.background?.service_worker);
   addLocalAsset(files, manifest.action?.default_popup);
@@ -106,6 +111,11 @@ async function collectManifestAssets(manifest) {
   if (manifest.side_panel?.default_path) htmlPages.push(manifest.side_panel.default_path);
   for (const page of manifest.sandbox?.pages ?? []) htmlPages.push(page);
   for (const overridePage of Object.values(manifest.chrome_url_overrides ?? {})) htmlPages.push(overridePage);
+  // RUNTIME_ONLY_ASSETS that are themselves HTML pages need their own
+  // src/href dependencies (e.g. offscreen.html -> dist/offscreen.js) resolved too.
+  for (const asset of RUNTIME_ONLY_ASSETS) {
+    if (asset.endsWith('.html')) htmlPages.push(asset);
+  }
 
   const visited = new Set();
   for (const htmlPage of htmlPages) {

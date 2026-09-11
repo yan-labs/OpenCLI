@@ -9,9 +9,35 @@
 const attached = new Set<number>();
 
 const tabFrameContexts = new Map<number, Map<string, number>>();
+const tabAllContexts = new Map<number, Map<number, { id: number; origin: string; name: string; auxData: any }>>();
 const frameTargets = new Map<string, string>();
 const frameTargetKeys = new Map<string, string>();
 let frameTargetCleanupRegistered = false;
+
+/**
+ * OOPIF (out-of-process iframe) targets discovered via CDP `Target.attachedToTarget`
+ * events, keyed by tabId then targetId. Populated by registerFrameTracking's
+ * onEvent listener once `Target.setAutoAttach` is armed for a tab (see
+ * listIframeTargets / ensureFrameTarget). This is the primary discovery path —
+ * Chrome pushes an event as each matching sub-target attaches, which is more
+ * reliable than a one-shot `Target.getTargets` snapshot that can race target
+ * creation or (per anecdotal real-world testing, see listIframeTargets) simply
+ * come back empty for a tab-level chrome.debugger session in some cases.
+ *
+ * Attribution: events for sub-targets auto-attached under a tab-level
+ * `chrome.debugger.attach({tabId})` session arrive through chrome.debugger's
+ * onEvent with `source.tabId` set to that SAME parent tab (this mirrors the
+ * pre-existing Runtime.executionContextCreated handling below, which has
+ * relied on the identical fact for child-frame execution contexts). The CDP
+ * wire-level `sessionId` that flatten mode multiplexes onto these events is
+ * not exposed by the chrome.debugger extension API at all (confirmed against
+ * the installed @types/chrome: `chrome.debugger.Debuggee` has only
+ * `tabId | extensionId | targetId`, no `sessionId` field) — so tabId is the
+ * only attribution signal available here, and it is the correct one.
+ */
+const tabIframeTargets = new Map<number, Map<string, { url: string; title: string }>>();
+/** Diagnostic counters: total Target.attachedToTarget (iframe) events seen per tab, for the 'debug' frames output. Not reset between calls — it is a lifetime counter surfaced as a coarse "did events fire at all" signal. */
+const tabAttachedEventCounts = new Map<number, number>();
 
 // Large cap so agents stop hitting silent JSON.parse failures on real API bodies.
 // See src/browser/cdp.ts CDP_RESPONSE_BODY_CAPTURE_LIMIT for the matching constant
@@ -587,6 +613,143 @@ async function resolveFrameTargetId(tabId: number, frameId: string, targetUrl?: 
   throw new Error(`No iframe target found for frame ${frameId}${targetUrl ? ` (${targetUrl})` : ''}. Candidates: ${candidates || 'none'}`);
 }
 
+export type IframeTargetInfo = { targetId: string; url: string; title: string };
+
+export type IframeDiscoveryDebug = {
+  /** Error from Target.setAutoAttach, if it rejected (normally swallowed). */
+  autoAttachError?: string;
+  /** Error from Target.getTargets, if it rejected (normally swallowed). */
+  getTargetsError?: string;
+  /** How many type==='iframe' entries Target.getTargets returned, before DOM filtering. */
+  getTargetsIframeCount: number;
+  /** How many Target.attachedToTarget (iframe) events had landed in tabIframeTargets by the time discovery finished. */
+  attachedEventCount: number;
+  /** <iframe src> URLs found by walking the tab's DOM (including shadow roots), used to filter getTargets candidates. */
+  domFrameUrls: string[];
+};
+
+/**
+ * Poll tabIframeTargets for this tab until it stops growing (2 consecutive
+ * empty ticks) or maxWaitMs elapses, so callers give chrome.debugger time to
+ * deliver Target.attachedToTarget events after Target.setAutoAttach arms —
+ * those events are asynchronous and are not guaranteed to have landed by the
+ * time setAutoAttach's own promise resolves.
+ */
+async function waitForIframeAttachEvents(tabId: number, maxWaitMs = 500): Promise<void> {
+  const start = Date.now();
+  const tickMs = 50;
+  let lastSize = tabIframeTargets.get(tabId)?.size ?? 0;
+  let stableTicks = 0;
+  while (Date.now() - start < maxWaitMs) {
+    await new Promise((resolve) => setTimeout(resolve, tickMs));
+    const size = tabIframeTargets.get(tabId)?.size ?? 0;
+    if (size === lastSize) {
+      stableTicks += 1;
+      if (stableTicks >= 2 && size > 0) return;
+    } else {
+      stableTicks = 0;
+      lastSize = size;
+    }
+  }
+}
+
+/**
+ * List OOPIF (out-of-process iframe) targets for a tab, for cross-origin
+ * iframes that Page.getFrameTree's childFrames omits under Chrome's site
+ * isolation.
+ *
+ * Primary source: `Target.attachedToTarget` events, collected into
+ * tabIframeTargets by registerFrameTracking as they land (see that map's own
+ * doc comment for why source.tabId is trustworthy attribution here). This is
+ * the reliable path — real-world testing found `Target.getTargets` can come
+ * back empty for a tab-level chrome.debugger session even when a matching
+ * OOPIF genuinely exists (e.g. a shadow-DOM-hosted cross-origin iframe
+ * injected by another extension), so a getTargets snapshot alone is not
+ * sufficient.
+ *
+ * Secondary source: `Target.getTargets`, kept as a supplementary candidate
+ * list in case autoAttach events are slow or the target attached before
+ * tracking was armed. Because Target.getTargets is a CDP-spec browser-global
+ * command and it is undocumented whether chrome.debugger's per-tab
+ * attachment narrows its result to this tab, every getTargets candidate is
+ * cross-checked against this tab's own DOM (the <iframe> elements' `src`,
+ * walking shadow roots, by exact URL or, failing that, origin) before being
+ * trusted — event-sourced candidates are NOT filtered this way since they are
+ * already tab-scoped by construction. If the DOM can't be read (e.g. CSP or a
+ * timing race), getTargets candidates are kept unfiltered rather than
+ * silently dropped, since an unverified frame is still more useful than none.
+ */
+export async function listIframeTargets(tabId: number): Promise<{ targets: IframeTargetInfo[]; debug: IframeDiscoveryDebug }> {
+  await ensureAttached(tabId);
+  await sendDebuggerCommand({ tabId }, 'Target.setDiscoverTargets', { discover: true }).catch(() => {});
+
+  let autoAttachError: string | undefined;
+  try {
+    await sendDebuggerCommand({ tabId }, 'Target.setAutoAttach', {
+      autoAttach: true,
+      waitForDebuggerOnStart: false,
+      flatten: true,
+      filter: [{ type: 'iframe', exclude: false }],
+    });
+  } catch (err) {
+    autoAttachError = err instanceof Error ? err.message : String(err);
+  }
+
+  await waitForIframeAttachEvents(tabId);
+
+  const eventCandidates: IframeTargetInfo[] = Array.from(tabIframeTargets.get(tabId)?.entries() ?? [])
+    .map(([targetId, info]) => ({ targetId, url: info.url, title: info.title }));
+  const knownTargetIds = new Set(eventCandidates.map((c) => c.targetId));
+
+  let getTargetsError: string | undefined;
+  let getTargetsCandidates: IframeTargetInfo[] = [];
+  try {
+    const result = await sendDebuggerCommand({ tabId }, 'Target.getTargets') as
+      { targetInfos?: Array<{ targetId?: string; id?: string; type?: string; url?: string; title?: string }> };
+    const targets = result?.targetInfos ?? [];
+    getTargetsCandidates = targets
+      .filter((t) => t.type === 'iframe')
+      .map((t) => ({ targetId: t.targetId || t.id || '', url: t.url || '', title: t.title || '' }))
+      .filter((t) => t.targetId && !knownTargetIds.has(t.targetId));
+  } catch (err) {
+    getTargetsError = err instanceof Error ? err.message : String(err);
+  }
+  const getTargetsIframeCount = getTargetsCandidates.length;
+
+  let domFrameUrls: string[] = [];
+  if (getTargetsCandidates.length > 0) {
+    try {
+      const raw = await evaluate(
+        tabId,
+        `(() => { const out = []; const walk = (root) => { for (const el of root.querySelectorAll('*')) { if (el.tagName === 'IFRAME' && el.src) out.push(el.src); if (el.shadowRoot) walk(el.shadowRoot); } }; walk(document); return out; })()`,
+      );
+      if (Array.isArray(raw)) domFrameUrls = raw as string[];
+    } catch {
+      // Can't verify — fall through and trust getTargets' own scoping.
+    }
+    if (domFrameUrls.length > 0) {
+      const domOrigins = new Set<string>();
+      for (const url of domFrameUrls) {
+        try { domOrigins.add(new URL(url).origin); } catch { /* ignore */ }
+      }
+      getTargetsCandidates = getTargetsCandidates.filter((c) => domFrameUrls.includes(c.url) || (() => {
+        try { return domOrigins.has(new URL(c.url).origin); } catch { return false; }
+      })());
+    }
+  }
+
+  return {
+    targets: [...eventCandidates, ...getTargetsCandidates],
+    debug: {
+      autoAttachError,
+      getTargetsError,
+      getTargetsIframeCount,
+      attachedEventCount: eventCandidates.length,
+      domFrameUrls,
+    },
+  };
+}
+
 export async function sendCommandInFrameTarget(
   tabId: number,
   frameId: string,
@@ -617,6 +780,18 @@ export function registerFrameTracking(): void {
 
     if (method === 'Runtime.executionContextCreated') {
       const context = params.context;
+      // Store ALL contexts (including content script isolated worlds)
+      if (context?.auxData?.frameId) {
+        if (!tabAllContexts.has(tabId)) {
+          tabAllContexts.set(tabId, new Map());
+        }
+        tabAllContexts.get(tabId)!.set(context.id, {
+          id: context.id,
+          origin: context.origin || '',
+          name: context.name || '',
+          auxData: context.auxData,
+        });
+      }
       if (!context?.auxData?.frameId || context.auxData.isDefault !== true) return;
       const frameId = context.auxData.frameId as string;
       if (!tabFrameContexts.has(tabId)) {
@@ -627,6 +802,7 @@ export function registerFrameTracking(): void {
 
     if (method === 'Runtime.executionContextDestroyed') {
       const ctxId = params.executionContextId;
+      tabAllContexts.get(tabId)?.delete(ctxId);
       const contexts = tabFrameContexts.get(tabId);
       if (contexts) {
         for (const [fid, cid] of contexts) {
@@ -637,12 +813,39 @@ export function registerFrameTracking(): void {
 
     if (method === 'Runtime.executionContextsCleared') {
       tabFrameContexts.delete(tabId);
+      tabAllContexts.delete(tabId);
+    }
+
+    if (method === 'Target.attachedToTarget') {
+      const targetInfo = params?.targetInfo as { targetId?: string; type?: string; url?: string; title?: string } | undefined;
+      if (targetInfo?.type === 'iframe' && targetInfo.targetId) {
+        if (!tabIframeTargets.has(tabId)) tabIframeTargets.set(tabId, new Map());
+        tabIframeTargets.get(tabId)!.set(targetInfo.targetId, {
+          url: targetInfo.url || '',
+          title: targetInfo.title || '',
+        });
+        tabAttachedEventCounts.set(tabId, (tabAttachedEventCounts.get(tabId) || 0) + 1);
+      }
+    }
+
+    if (method === 'Target.detachedFromTarget') {
+      const targetId = String(params?.targetId || '');
+      if (targetId) tabIframeTargets.get(tabId)?.delete(targetId);
     }
   });
 
   chrome.tabs.onRemoved.addListener((tabId) => {
     tabFrameContexts.delete(tabId);
+    tabAllContexts.delete(tabId);
+    tabIframeTargets.delete(tabId);
+    tabAttachedEventCounts.delete(tabId);
   });
+}
+
+export function getAllContexts(tabId: number): Array<{ id: number; origin: string; name: string; auxData: any }> {
+  const contexts = tabAllContexts.get(tabId);
+  if (!contexts) return [];
+  return Array.from(contexts.values());
 }
 
 export async function getFrameTree(tabId: number): Promise<any> {
@@ -806,6 +1009,9 @@ export async function detach(tabId: number): Promise<void> {
   attached.delete(tabId);
   networkCaptures.delete(tabId);
   tabFrameContexts.delete(tabId);
+  tabAllContexts.delete(tabId);
+  tabIframeTargets.delete(tabId);
+  tabAttachedEventCounts.delete(tabId);
   try { await chrome.debugger.detach({ tabId }); } catch { /* ignore */ }
 }
 
@@ -814,6 +1020,9 @@ export function registerListeners(): void {
     attached.delete(tabId);
     networkCaptures.delete(tabId);
     tabFrameContexts.delete(tabId);
+    tabAllContexts.delete(tabId);
+    tabIframeTargets.delete(tabId);
+    tabAttachedEventCounts.delete(tabId);
     clearFrameTargetsForTab(tabId);
   });
   chrome.debugger.onDetach.addListener((source) => {
@@ -821,6 +1030,9 @@ export function registerListeners(): void {
       attached.delete(source.tabId);
       networkCaptures.delete(source.tabId);
       tabFrameContexts.delete(source.tabId);
+      tabAllContexts.delete(source.tabId);
+      tabIframeTargets.delete(source.tabId);
+      tabAttachedEventCounts.delete(source.tabId);
       clearFrameTargetsForTab(source.tabId);
       return;
     }

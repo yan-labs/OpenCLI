@@ -1088,7 +1088,7 @@ Examples:
   }
 
   const browserReadCommands = new Set([
-    'state', 'frames', 'screenshot', 'console', 'find', 'wait', 'extract',
+    'state', 'frames', 'screenshot', 'console', 'find', 'wait', 'extract', 'clipboard',
   ]);
 
   function browserCommandAccess(command: Command | undefined, args: unknown[]): 'read' | 'write' {
@@ -1368,6 +1368,12 @@ Examples:
     .action(browserAction(async (page) => {
       const frames = await page.frames?.() ?? [];
       console.log(JSON.stringify(frames, null, 2));
+    }));
+
+  addBrowserTabOption(browser.command('contexts').description('List all JS execution contexts including content script isolated worlds'))
+    .action(browserAction(async (page) => {
+      const contexts = await page.contexts?.() ?? [];
+      console.log(JSON.stringify(contexts, null, 2));
     }));
 
   addBrowserTabOption(browser.command('screenshot').argument('[path]', 'Save to file (base64 if omitted)'))
@@ -2548,11 +2554,23 @@ Examples:
     browser.command('eval')
       .argument('<js>', 'JavaScript code')
       .option('--frame <index>', 'Cross-origin iframe index from "browser frames"')
+      .option('--context <id>', 'Execution context ID (from "browser contexts")', (v: string) => parseInt(v, 10))
       .description('Execute JS in page context, return result'),
   )
     .action(browserAction(async (page, js, opts) => {
       let result: unknown;
-      if (opts.frame !== undefined) {
+      if (opts.context !== undefined) {
+        const contextId = opts.context;
+        if (!Number.isInteger(contextId)) {
+          console.error(`Invalid context id "${opts.context}". Use an ID from "browser contexts".`);
+          process.exitCode = EXIT_CODES.USAGE_ERROR;
+          return;
+        }
+        if (!page.evaluateInContext) {
+          throw new Error('This browser session does not support context-targeted evaluation');
+        }
+        result = await page.evaluateInContext(js, contextId);
+      } else if (opts.frame !== undefined) {
         const frameIndex = Number.parseInt(opts.frame, 10);
         if (!Number.isInteger(frameIndex) || frameIndex < 0) {
           console.error(`Invalid frame index "${opts.frame}". Use a 0-based index from "browser frames".`);
@@ -2568,6 +2586,20 @@ Examples:
       }
       if (typeof result === 'string') console.log(result);
       else console.log(JSON.stringify(result, null, 2));
+    }));
+
+  // ── Clipboard ──
+
+  addBrowserTabOption(
+    browser.command('clipboard')
+      .description('Read the system clipboard as plain text'),
+  )
+    .action(browserAction(async (page) => {
+      if (!page.readClipboard) {
+        throw new Error('This browser session does not support clipboard reads');
+      }
+      const text = await page.readClipboard();
+      console.log(text);
     }));
 
   // ── Extract (content reading) ──

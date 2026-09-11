@@ -342,14 +342,29 @@ export class Page extends CDPBasePage {
     }
   }
 
+  async readClipboard(): Promise<string> {
+    const result = await sendCommand('clipboard', { ...this._cmdOpts() }) as { text?: string };
+    return result?.text ?? '';
+  }
+
   async frames(): Promise<Array<{ index: number; frameId: string; url: string; name: string }>> {
     const result = await sendCommand('frames', { ...this._cmdOpts() });
+    return Array.isArray(result) ? result : [];
+  }
+
+  async contexts(): Promise<Array<{ id: number; origin: string; name: string; auxData: any }>> {
+    const result = await sendCommand('contexts', { ...this._cmdOpts() });
     return Array.isArray(result) ? result : [];
   }
 
   async evaluateInFrame(js: string, frameIndex: number): Promise<unknown> {
     const code = buildEvaluateExpression(js);
     return sendCommand('exec', { code, frameIndex, ...this._cmdOpts() });
+  }
+
+  async evaluateInContext(js: string, contextId: number): Promise<unknown> {
+    const code = buildEvaluateExpression(js);
+    return sendCommand('exec', { code, execContextId: contextId, ...this._cmdOpts() });
   }
 
   async cdp(method: string, params: Record<string, unknown> = {}): Promise<unknown> {

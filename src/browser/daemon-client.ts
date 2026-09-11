@@ -205,7 +205,7 @@ function isPreConnectFetchError(err: unknown): boolean {
 
 export interface DaemonCommand {
   id: string;
-  action: 'exec' | 'navigate' | 'tabs' | 'cookies' | 'screenshot' | 'close-window' | 'sessions' | 'set-file-input' | 'insert-text' | 'bind' | 'network-capture-start' | 'network-capture-read' | 'wait-download' | 'cdp' | 'frames' | 'lease-release';
+  action: 'exec' | 'navigate' | 'tabs' | 'cookies' | 'screenshot' | 'close-window' | 'sessions' | 'set-file-input' | 'insert-text' | 'bind' | 'network-capture-start' | 'network-capture-read' | 'wait-download' | 'cdp' | 'frames' | 'contexts' | 'clipboard' | 'lease-release';
   /** Target page identity (targetId). Cross-layer contract with the extension. */
   page?: string;
   code?: string;
@@ -243,6 +243,14 @@ export interface DaemonCommand {
   idleTimeout?: number;
   /** Frame index for cross-frame operations (0-based, from 'frames' action) */
   frameIndex?: number;
+  /** When true, the 'frames' action returns `{ frames, debug }` diagnostics instead of a bare array. */
+  debug?: boolean;
+  /**
+   * CDP Runtime execution context ID for cross-world evaluation (e.g. a
+   * content script's isolated world), from the 'contexts' action. Distinct
+   * from `contextId` below, which identifies a browser profile/context.
+   */
+  execContextId?: number;
   /** Browser profile/context REQUIRED for this command (--profile / OPENCLI_PROFILE). Fails loud when offline. */
   contextId?: string;
   /**

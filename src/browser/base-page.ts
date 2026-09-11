@@ -1273,22 +1273,54 @@ export abstract class CDPBasePage extends BasePage {
 
   async nativeKeyPress(key: string, modifiers: string[] = []): Promise<void> {
     let modifierFlags = 0;
+    const modKeyInfo: Array<{ key: string; code: string; vk: number; flag: number }> = [];
     for (const mod of modifiers) {
-      if (mod === 'Alt') modifierFlags |= 1;
-      if (mod === 'Ctrl' || mod === 'Control') modifierFlags |= 2;
-      if (mod === 'Meta') modifierFlags |= 4;
-      if (mod === 'Shift') modifierFlags |= 8;
+      if (mod === 'Alt') { modifierFlags |= 1; modKeyInfo.push({ key: 'Alt', code: 'AltLeft', vk: 18, flag: 1 }); }
+      if (mod === 'Ctrl' || mod === 'Control') { modifierFlags |= 2; modKeyInfo.push({ key: 'Control', code: 'ControlLeft', vk: 17, flag: 2 }); }
+      if (mod === 'Meta') { modifierFlags |= 4; modKeyInfo.push({ key: 'Meta', code: 'MetaLeft', vk: 91, flag: 4 }); }
+      if (mod === 'Shift') { modifierFlags |= 8; modKeyInfo.push({ key: 'Shift', code: 'ShiftLeft', vk: 16, flag: 8 }); }
+    }
+    const vkCode = key.length === 1 ? key.toUpperCase().charCodeAt(0) : 0;
+    const code = key.length === 1 ? `Key${key.toUpperCase()}` : key;
+    let activeFlags = 0;
+    for (const mk of modKeyInfo) {
+      await this.cdp('Input.dispatchKeyEvent', {
+        type: 'keyDown',
+        key: mk.key,
+        code: mk.code,
+        modifiers: activeFlags,
+        windowsVirtualKeyCode: mk.vk,
+        nativeVirtualKeyCode: mk.vk,
+      });
+      activeFlags |= mk.flag;
     }
     await this.cdp('Input.dispatchKeyEvent', {
       type: 'keyDown',
       key,
+      code,
       modifiers: modifierFlags,
+      windowsVirtualKeyCode: vkCode,
+      nativeVirtualKeyCode: vkCode,
     });
     await this.cdp('Input.dispatchKeyEvent', {
       type: 'keyUp',
       key,
+      code,
       modifiers: modifierFlags,
+      windowsVirtualKeyCode: vkCode,
+      nativeVirtualKeyCode: vkCode,
     });
+    for (const mk of modKeyInfo.reverse()) {
+      activeFlags &= ~mk.flag;
+      await this.cdp('Input.dispatchKeyEvent', {
+        type: 'keyUp',
+        key: mk.key,
+        code: mk.code,
+        modifiers: activeFlags,
+        windowsVirtualKeyCode: mk.vk,
+        nativeVirtualKeyCode: mk.vk,
+      });
+    }
   }
 }
 
