@@ -32779,6 +32779,168 @@
     "sourceFile": "semanticscholar/search.js"
   },
   {
+    "site": "semrush",
+    "name": "analytics-overview",
+    "description": "Semrush Domain Overview：organic/paid traffic、keywords、Authority Score、referring domains、backlinks",
+    "access": "read",
+    "domain": "www.semrush.com",
+    "strategy": "ui",
+    "browser": true,
+    "args": [
+      {
+        "name": "domain",
+        "type": "str",
+        "required": true,
+        "positional": true,
+        "help": "Root domain to analyze (e.g. example.com)"
+      }
+    ],
+    "columns": [
+      "domain",
+      "authority_score",
+      "authority_rating",
+      "organic_traffic",
+      "organic_traffic_change_pct",
+      "paid_traffic",
+      "paid_traffic_change_pct",
+      "referring_domains",
+      "organic_keywords",
+      "organic_keywords_change_pct",
+      "paid_keywords",
+      "paid_keywords_change_pct",
+      "backlinks"
+    ],
+    "type": "js",
+    "modulePath": "semrush/analytics-overview.js",
+    "sourceFile": "semrush/analytics-overview.js",
+    "navigateBefore": true
+  },
+  {
+    "site": "semrush",
+    "name": "keyword-magic",
+    "description": "Semrush Keyword Magic Tool：相关词列表（keyword/volume/KD/CPC/intent）",
+    "access": "read",
+    "domain": "www.semrush.com",
+    "strategy": "ui",
+    "browser": true,
+    "args": [
+      {
+        "name": "seed",
+        "type": "str",
+        "required": true,
+        "positional": true,
+        "help": "Seed keyword"
+      },
+      {
+        "name": "country",
+        "type": "str",
+        "default": "us",
+        "required": false,
+        "help": "Semrush database / country code (e.g. us, uk, de)"
+      },
+      {
+        "name": "limit",
+        "type": "int",
+        "default": 20,
+        "required": false,
+        "help": "Maximum number of rows to return"
+      }
+    ],
+    "columns": [
+      "keyword",
+      "intent",
+      "volume",
+      "kd",
+      "cpc",
+      "competition",
+      "serp_features",
+      "results",
+      "updated"
+    ],
+    "type": "js",
+    "modulePath": "semrush/keyword-magic.js",
+    "sourceFile": "semrush/keyword-magic.js",
+    "navigateBefore": true
+  },
+  {
+    "site": "semrush",
+    "name": "keyword-overview",
+    "description": "Semrush Keyword Overview：search volume、KD、CPC、intent、trend（相对趋势）",
+    "access": "read",
+    "domain": "www.semrush.com",
+    "strategy": "ui",
+    "browser": true,
+    "args": [
+      {
+        "name": "keyword",
+        "type": "str",
+        "required": true,
+        "positional": true,
+        "help": "Keyword phrase"
+      },
+      {
+        "name": "country",
+        "type": "str",
+        "default": "us",
+        "required": false,
+        "help": "Semrush database / country code (e.g. us, uk, de)"
+      }
+    ],
+    "columns": [
+      "keyword",
+      "country",
+      "volume",
+      "global_volume",
+      "kd",
+      "kd_label",
+      "intent",
+      "cpc",
+      "competition",
+      "trend_relative"
+    ],
+    "type": "js",
+    "modulePath": "semrush/keyword-overview.js",
+    "sourceFile": "semrush/keyword-overview.js",
+    "navigateBefore": true
+  },
+  {
+    "site": "similarweb",
+    "name": "overview",
+    "description": "Similarweb 网站概览：月访问量、跳出率、平均时长、流量来源占比、Top 国家",
+    "access": "read",
+    "domain": "www.similarweb.com",
+    "strategy": "ui",
+    "browser": true,
+    "args": [
+      {
+        "name": "domain",
+        "type": "str",
+        "required": true,
+        "positional": true,
+        "help": "Root domain to analyze (e.g. example.com)"
+      }
+    ],
+    "columns": [
+      "domain",
+      "global_rank",
+      "country",
+      "country_rank",
+      "category",
+      "category_rank",
+      "monthly_visits",
+      "visits_change_pct",
+      "bounce_rate_pct",
+      "pages_per_visit",
+      "avg_visit_duration_sec",
+      "top_countries",
+      "top_traffic_sources"
+    ],
+    "type": "js",
+    "modulePath": "similarweb/overview.js",
+    "sourceFile": "similarweb/overview.js",
+    "navigateBefore": true
+  },
+  {
     "site": "sinablog",
     "name": "article",
     "description": "获取新浪博客单篇文章详情",
