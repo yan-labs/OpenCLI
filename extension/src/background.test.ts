@@ -801,6 +801,12 @@ describe('background tab isolation', () => {
       expect(result.ok).toBe(true);
       expect((result as { data?: { timedOut?: boolean } }).data?.timedOut).toBe(true);
     } finally {
+      // handleNavigate's success path arms a real idle timer (30s default for
+      // adapter sessions) on the lease. Release it here — while `chrome` is
+      // still stubbed — so it doesn't fire after this test (and its stub)
+      // have torn down, which would surface as an unhandled rejection later
+      // in the run instead of a clean pass/fail here.
+      await mod.__test__.releaseLease(adapterKey('twitter'), 'test cleanup');
       setTimeoutSpy.mockRestore();
     }
   });
@@ -842,6 +848,10 @@ describe('background tab isolation', () => {
       expect(result.ok).toBe(true);
       expect((result as { data?: { timedOut?: boolean } }).data?.timedOut).toBe(true);
     } finally {
+      // See the identical comment in the previous test: release the lease
+      // while `chrome` is still stubbed so its real idle timer doesn't fire
+      // later in the run against an already-torn-down stub.
+      await mod.__test__.releaseLease(adapterKey('twitter'), 'test cleanup');
       setTimeoutSpy.mockRestore();
     }
   });
