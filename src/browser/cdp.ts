@@ -206,12 +206,12 @@ class CDPPage extends CDPBasePage {
     super();
   }
 
-  async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: number; allowBoundNavigation?: boolean }): Promise<void> {
+  async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: number; allowBoundNavigation?: boolean; timeoutMs?: number }): Promise<void> {
     if (!this._pageEnabled) {
       await this.bridge.send('Page.enable');
       this._pageEnabled = true;
     }
-    const loadPromise = this.bridge.waitForEvent('Page.loadEventFired', 30_000).catch(() => {});
+    const loadPromise = this.bridge.waitForEvent('Page.loadEventFired', options?.timeoutMs ?? 30_000).catch(() => {});
     await this.bridge.send('Page.navigate', { url });
     await loadPromise;
     this._lastUrl = url;

@@ -164,7 +164,7 @@ export abstract class BasePage implements IPage {
 
   // ── Transport-specific methods (must be implemented by subclasses) ──
 
-  abstract goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: number; allowBoundNavigation?: boolean }): Promise<void>;
+  abstract goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: number; allowBoundNavigation?: boolean; timeoutMs?: number }): Promise<void>;
   abstract evaluate<T = unknown>(js: string): Promise<T>;
   abstract evaluate<Args extends unknown[], T>(fn: BrowserEvaluateFunction<Args, T>, ...args: Args): Promise<Awaited<T>>;
 

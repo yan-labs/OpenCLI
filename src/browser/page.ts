@@ -101,11 +101,16 @@ export class Page extends CDPBasePage {
     };
   }
 
-  async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: number }): Promise<void> {
+  async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: number; timeoutMs?: number }): Promise<void> {
+    // Omitted (undefined) so an older extension build — which does not read this
+    // field yet — falls back to its own hardcoded 15s default rather than seeing
+    // an unexpected `timeoutMs: undefined` key.
+    const navOpts = options?.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {};
     let result: { data: unknown; page?: string };
     try {
       result = await sendCommandFull('navigate', {
         url,
+        ...navOpts,
         ...this._cmdOpts(),
       });
     } catch (err) {
@@ -118,6 +123,7 @@ export class Page extends CDPBasePage {
       this._page = undefined;
       result = await sendCommandFull('navigate', {
         url,
+        ...navOpts,
         ...this._cmdOpts(),
       });
     }

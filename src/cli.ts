@@ -753,6 +753,25 @@ function parsePositiveIntOption(val: string | undefined, label: string, fallback
   return parsed;
 }
 
+/** Default navigation timeout (ms) when neither --timeout nor OPENCLI_NAV_TIMEOUT_MS is set. */
+const DEFAULT_NAV_TIMEOUT_MS = 15000;
+
+/**
+ * Resolve the navigation timeout for `browser open`: --timeout flag wins over
+ * the OPENCLI_NAV_TIMEOUT_MS env var, which wins over the built-in default.
+ * Both sources are validated the same way as other --timeout options.
+ */
+function resolveNavTimeoutMs(flagValue: string | undefined): number {
+  if (flagValue !== undefined) {
+    return parsePositiveIntOption(flagValue, '--timeout', DEFAULT_NAV_TIMEOUT_MS);
+  }
+  const envValue = process.env.OPENCLI_NAV_TIMEOUT_MS;
+  if (envValue !== undefined) {
+    return parsePositiveIntOption(envValue, 'OPENCLI_NAV_TIMEOUT_MS', DEFAULT_NAV_TIMEOUT_MS);
+  }
+  return DEFAULT_NAV_TIMEOUT_MS;
+}
+
 function parseScreenshotDim(val: string, label: string): number {
   if (!/^\d+$/.test(val)) {
     throw new InvalidArgumentError(`--${label} must be a positive integer (got "${val}")`);
@@ -996,10 +1015,16 @@ export function createProgram(BUILTIN_CLIS: string, USER_CLIS: string): Command 
 Examples:
   $ opencli browser work open https://x.com
   $ opencli browser work open https://x.com --window background
+  $ opencli browser work open https://semrush.com/report --timeout 45000
   $ opencli browser work click 12
   $ opencli browser work state
   $ opencli browser work bind
   $ opencli browser work unbind
+
+"open" navigation timeout: --timeout <ms> on "open" overrides the OPENCLI_NAV_TIMEOUT_MS
+env var, which overrides the built-in default of 15000ms. Use this for pages that
+legitimately take longer to finish loading (e.g. heavy report dashboards) — the tab is
+still usable even when navigation is reported as timed out.
 `);
   const originalBrowserDescription = browser.description();
 
@@ -1292,11 +1317,13 @@ Examples:
 
   // ── Navigation ──
 
-  addBrowserTabOption(browser.command('open').argument('<url>').description('Open URL in the browser session'))
-    .action(browserAction(async (page, url) => {
+  addBrowserTabOption(browser.command('open').argument('<url>').description('Open URL in the browser session')
+    .option('--timeout <ms>', 'Navigation timeout in milliseconds (env: OPENCLI_NAV_TIMEOUT_MS; default: 15000)'))
+    .action(browserAction(async (page, url, opts?: { timeout?: string }) => {
+      const navTimeoutMs = resolveNavTimeoutMs(opts?.timeout);
       // Start session-level capture before navigation (catches initial requests)
       const hasSessionCapture = await page.startNetworkCapture?.() ?? false;
-      await page.goto(url);
+      await page.goto(url, { timeoutMs: navTimeoutMs });
       await page.wait(2);
       // Fallback: inject JS interceptor when session capture is unavailable
       if (!hasSessionCapture) {
