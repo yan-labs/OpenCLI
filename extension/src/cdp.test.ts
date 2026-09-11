@@ -122,6 +122,48 @@ describe('cdp attach recovery', () => {
     );
   });
 
+  it('commands an OOPIF via its flatten-mode sessionId when Target.getTargets is Not allowed', async () => {
+    const { chrome, debuggerApi, debuggerEventListeners } = createChromeMock();
+    debuggerApi.sendCommand = vi.fn(async (target: any, method: string, _params?: any) => {
+      if (method === 'Target.setDiscoverTargets') return {};
+      if (method === 'Target.setAutoAttach') return {};
+      // A tab-level chrome.debugger session is not allowed to enumerate targets.
+      if (method === 'Target.getTargets') throw new Error('{"code":-32000,"message":"Not allowed"}');
+      if (target?.tabId === 1 && target?.sessionId === 'session-abc') {
+        if (method === 'Runtime.enable') return {};
+        if (method === 'Runtime.evaluate') return { result: { value: 'session-ok' } };
+      }
+      if (method === 'Runtime.evaluate') return { result: { value: 'root-ok' } };
+      return {};
+    }) as typeof debuggerApi.sendCommand;
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./cdp');
+    mod.registerFrameTracking();
+
+    for (const listener of debuggerEventListeners) {
+      listener(
+        { tabId: 1 },
+        'Target.attachedToTarget',
+        {
+          sessionId: 'session-abc',
+          targetInfo: { targetId: 'oopif-session', type: 'iframe', url: 'https://frame.test', title: 'frame' },
+        },
+      );
+    }
+
+    const result = await mod.evaluateInFrame(1, 'document.title', 'oopif-session');
+
+    expect(result).toBe('session-ok');
+    // The sessionId route must not attach a second debugger to the OOPIF.
+    expect(debuggerApi.attach).not.toHaveBeenCalledWith({ targetId: 'oopif-session' }, '1.3');
+    expect(debuggerApi.sendCommand).toHaveBeenCalledWith(
+      { tabId: 1, sessionId: 'session-abc' },
+      'Runtime.evaluate',
+      expect.objectContaining({ expression: 'document.title', returnByValue: true, awaitPromise: true }),
+    );
+  });
+
 });
 
 function chromeMockForScreenshot(content: { width: number; height: number } = { width: 1024, height: 2048 }) {

@@ -1391,9 +1391,10 @@ still usable even when navigation is reported as timed out.
       console.log(typeof snapshot === 'string' ? snapshot : JSON.stringify(snapshot, null, 2));
     }));
 
-  addBrowserTabOption(browser.command('frames').description('List cross-origin iframe targets in snapshot order'))
-    .action(browserAction(async (page) => {
-      const frames = await page.frames?.() ?? [];
+  addBrowserTabOption(browser.command('frames').description('List cross-origin iframe targets in snapshot order')
+    .option('--debug', 'Include iframe discovery diagnostics', false))
+    .action(browserAction(async (page, opts) => {
+      const frames = await page.frames?.({ debug: opts.debug === true }) ?? [];
       console.log(JSON.stringify(frames, null, 2));
     }));
 

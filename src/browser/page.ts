@@ -353,8 +353,11 @@ export class Page extends CDPBasePage {
     return result?.text ?? '';
   }
 
-  async frames(): Promise<Array<{ index: number; frameId: string; url: string; name: string }>> {
-    const result = await sendCommand('frames', { ...this._cmdOpts() });
+  async frames(opts?: { debug?: boolean }): Promise<Array<{ index: number; frameId: string; url: string; name: string }> | { frames: Array<{ index: number; frameId: string; url: string; name: string }>; debug: Record<string, unknown> }> {
+    const result = await sendCommand('frames', { ...(opts?.debug ? { debug: true } : {}), ...this._cmdOpts() });
+    if (opts?.debug) {
+      return result as { frames: Array<{ index: number; frameId: string; url: string; name: string }>; debug: Record<string, unknown> };
+    }
     return Array.isArray(result) ? result : [];
   }
 

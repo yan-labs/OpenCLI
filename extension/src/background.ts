@@ -1869,16 +1869,21 @@ function enumerateCrossOriginFrames(tree: any): Array<{ index: number; frameId: 
  * Shared by handleFrames and handleExec's frameIndex branch so both use the
  * same index ordering.
  */
-async function enumerateFramesForTab(tabId: number): Promise<Array<{ index: number; frameId: string; url: string; name: string }>> {
+async function enumerateFramesForTab(tabId: number): Promise<{ frames: Array<{ index: number; frameId: string; url: string; name: string }>; debug: Record<string, unknown> }> {
   const tree = await executor.getFrameTree(tabId);
   const frames = enumerateCrossOriginFrames(tree);
   const knownFrameIds = new Set(frames.map((f) => f.frameId));
+  const treeChildCount = frames.length;
 
   let iframeTargets: Array<{ targetId: string; url: string; title: string }> = [];
+  let debug: Record<string, unknown> = {};
   try {
-    iframeTargets = (await executor.listIframeTargets(tabId)).targets;
-  } catch {
+    const result = await executor.listIframeTargets(tabId);
+    iframeTargets = result.targets;
+    debug = result.debug;
+  } catch (err) {
     // OOPIF discovery is best-effort — fall back to the frame-tree-only list.
+    debug = { listError: String(err) };
   }
   for (const target of iframeTargets) {
     if (!target.targetId || knownFrameIds.has(target.targetId)) continue;
@@ -1890,7 +1895,7 @@ async function enumerateFramesForTab(tabId: number): Promise<Array<{ index: numb
       name: target.title || '',
     });
   }
-  return frames;
+  return { frames, debug: { treeChildCount, ...debug } };
 }
 
 function setLeaseSession(
@@ -2162,7 +2167,7 @@ async function handleExec(cmd: Command, leaseKey: string): Promise<Result> {
   try {
     const aggressive = getSurfaceFromKey(leaseKey) === 'browser';
     if (cmd.frameIndex != null) {
-      const frames = await enumerateFramesForTab(tabId);
+      const { frames } = await enumerateFramesForTab(tabId);
       if (cmd.frameIndex < 0 || cmd.frameIndex >= frames.length) {
         return { id: cmd.id, ok: false, error: `Frame index ${cmd.frameIndex} out of range (${frames.length} cross-origin frames available)` };
       }
@@ -2199,8 +2204,11 @@ async function handleFrames(cmd: Command, leaseKey: string): Promise<Result> {
   const cmdTabId = await resolveCommandTabId(cmd);
   const tabId = await resolveTabId(cmdTabId, leaseKey);
   try {
-    const frames = await enumerateFramesForTab(tabId);
-    return { id: cmd.id, ok: true, data: frames };
+    const result = await enumerateFramesForTab(tabId);
+    if (cmd.debug) {
+      return { id: cmd.id, ok: true, data: result };
+    }
+    return { id: cmd.id, ok: true, data: result.frames };
   } catch (err) {
     return errorResult(cmd.id, err);
   }
@@ -2494,6 +2502,9 @@ const CDP_ALLOWLIST = new Set([
   // evaluation, e.g. content script isolated worlds discovered via the 'contexts' action)
   'Runtime.enable',
   'Runtime.evaluate',
+  // Iframe discovery diagnostics (read-only)
+  'Target.getTargets',
+  'Target.getTargetInfo',
   // Emulation (used by screenshot full-page)
   'Emulation.setDeviceMetricsOverride',
   'Emulation.clearDeviceMetricsOverride',

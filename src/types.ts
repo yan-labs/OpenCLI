@@ -147,7 +147,7 @@ export interface IPage {
   /** Accept or dismiss the currently open JavaScript alert/confirm/prompt dialog. */
   handleJavaScriptDialog?(accept: boolean, promptText?: string): Promise<void>;
   /** List cross-origin iframe targets in snapshot order. */
-  frames?(): Promise<Array<{ index: number; frameId: string; url: string; name: string }>>;
+  frames?(opts?: { debug?: boolean }): Promise<Array<{ index: number; frameId: string; url: string; name: string }> | { frames: Array<{ index: number; frameId: string; url: string; name: string }>; debug: Record<string, unknown> }>;
   /** List all JS execution contexts including content script isolated worlds. */
   contexts?(): Promise<Array<{ id: number; origin: string; name: string; auxData: any }>>;
   /** Evaluate JavaScript inside a cross-origin iframe identified by its frame index. */

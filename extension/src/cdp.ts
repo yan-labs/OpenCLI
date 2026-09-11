@@ -15,10 +15,35 @@ const frameTargetKeys = new Map<string, string>();
 let frameTargetCleanupRegistered = false;
 
 /**
+ * Chrome 125+ widened `chrome.debugger`'s debuggee to `DebuggerSession`, which
+ * adds an optional `sessionId` alongside `tabId` — that is how an extension
+ * addresses a flatten-mode child session (an OOPIF auto-attached under a
+ * tab-level attach) without attaching to its targetId separately. The
+ * @types/chrome pinned in this repo still types `Debuggee` as
+ * `{ tabId | extensionId | targetId }` only, so the field is declared here and
+ * cast at the call site. Drop the cast once the types catch up.
+ */
+type DebuggerSessionTarget = chrome.debugger.Debuggee & { sessionId?: string };
+
+/**
+ * How to reach a given child frame. 'session' is the preferred flatten-mode
+ * route ({tabId, sessionId}, no extra attach); 'target' is the legacy
+ * `chrome.debugger.attach({targetId})` fallback for Chromes that reject the
+ * sessionId debuggee. Cached per `frameTargetKey` so each command does not
+ * re-probe both paths.
+ */
+type FrameRoute =
+  | { kind: 'session'; targetId: string; sessionId: string; debuggee: chrome.debugger.Debuggee }
+  | { kind: 'target'; targetId: string; debuggee: chrome.debugger.Debuggee };
+const frameRoutes = new Map<string, FrameRoute>();
+/** frameTargetKeys for which the sessionId route was tried and rejected — never retried. */
+const frameSessionUnsupported = new Set<string>();
+
+/**
  * OOPIF (out-of-process iframe) targets discovered via CDP `Target.attachedToTarget`
  * events, keyed by tabId then targetId. Populated by registerFrameTracking's
  * onEvent listener once `Target.setAutoAttach` is armed for a tab (see
- * listIframeTargets / ensureFrameTarget). This is the primary discovery path —
+ * listIframeTargets / ensureFrameRoute). This is the primary discovery path —
  * Chrome pushes an event as each matching sub-target attaches, which is more
  * reliable than a one-shot `Target.getTargets` snapshot that can race target
  * creation or (per anecdotal real-world testing, see listIframeTargets) simply
@@ -28,14 +53,18 @@ let frameTargetCleanupRegistered = false;
  * `chrome.debugger.attach({tabId})` session arrive through chrome.debugger's
  * onEvent with `source.tabId` set to that SAME parent tab (this mirrors the
  * pre-existing Runtime.executionContextCreated handling below, which has
- * relied on the identical fact for child-frame execution contexts). The CDP
- * wire-level `sessionId` that flatten mode multiplexes onto these events is
- * not exposed by the chrome.debugger extension API at all (confirmed against
- * the installed @types/chrome: `chrome.debugger.Debuggee` has only
- * `tabId | extensionId | targetId`, no `sessionId` field) — so tabId is the
- * only attribution signal available here, and it is the correct one.
+ * relied on the identical fact for child-frame execution contexts). So tabId
+ * is the attribution signal used here, and it is the correct one.
+ *
+ * `sessionId` is the flatten-mode CDP session the `Target.attachedToTarget`
+ * event carried in its own params. It is recorded because Chrome 125+ accepts
+ * `{ tabId, sessionId }` as a chrome.debugger debuggee (see
+ * DebuggerSessionTarget below), which is the ONLY way to talk to an OOPIF from
+ * a tab-level session: the older `chrome.debugger.attach({targetId})` route
+ * first needs `Target.getTargets`, and Chrome answers that with
+ * `{"code":-32000,"message":"Not allowed"}` for a tab-level session.
  */
-const tabIframeTargets = new Map<number, Map<string, { url: string; title: string }>>();
+const tabIframeTargets = new Map<number, Map<string, { url: string; title: string; sessionId?: string }>>();
 /** Diagnostic counters: total Target.attachedToTarget (iframe) events seen per tab, for the 'debug' frames output. Not reset between calls — it is a lifetime counter surfaced as a coarse "did events fire at all" signal. */
 const tabAttachedEventCounts = new Map<number, number>();
 
@@ -556,21 +585,34 @@ function registerFrameTargetCleanup(): void {
 function clearFrameTarget(targetId: string): void {
   if (!targetId) return;
   const key = frameTargetKeys.get(targetId);
-  if (key) frameTargets.delete(key);
+  if (key) {
+    frameTargets.delete(key);
+    frameRoutes.delete(key);
+  }
   frameTargetKeys.delete(targetId);
 }
 
-async function ensureFrameTarget(
+/**
+ * Resolve a frame to a usable CDP route, preferring the flatten-mode
+ * `{tabId, sessionId}` session recorded from `Target.attachedToTarget` over
+ * the legacy attach-by-targetId path (which depends on `Target.getTargets`,
+ * a command Chrome answers with "Not allowed" for a tab-level session).
+ *
+ * `forceAttach` skips the session route — used by the one-shot fallback in
+ * sendCommandInFrameTarget when a sessionId debuggee is rejected.
+ */
+async function ensureFrameRoute(
   tabId: number,
   frameId: string,
   aggressiveRetry: boolean = false,
   targetUrl?: string,
-): Promise<string> {
+  forceAttach: boolean = false,
+): Promise<FrameRoute> {
   registerFrameTargetCleanup();
   await ensureAttached(tabId, aggressiveRetry);
   const key = frameTargetKey(tabId, frameId);
-  const existing = frameTargets.get(key);
-  if (existing) return existing;
+  const cached = frameRoutes.get(key);
+  if (cached) return cached;
 
   await sendDebuggerCommand({ tabId }, 'Target.setDiscoverTargets', { discover: true }).catch(() => {});
   await sendDebuggerCommand({ tabId }, 'Target.setAutoAttach', {
@@ -579,18 +621,83 @@ async function ensureFrameTarget(
     flatten: true,
     filter: [{ type: 'iframe', exclude: false }],
   }).catch(() => {});
-  const targetId = await resolveFrameTargetId(tabId, frameId, targetUrl);
-  try {
-    await chrome.debugger.attach({ targetId } as chrome.debugger.Debuggee, '1.3');
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    if (!message.includes('Another debugger is already attached')) throw err;
+
+  let known = resolveFrameFromAttachEvents(tabId, frameId, targetUrl);
+  if (!known && !(tabIframeTargets.get(tabId)?.size)) {
+    // Nothing recorded yet for this tab — autoAttach was likely just armed, so
+    // give the asynchronous attachedToTarget events a brief chance to land.
+    await waitForIframeAttachEvents(tabId, 300);
+    known = resolveFrameFromAttachEvents(tabId, frameId, targetUrl);
   }
-  frameTargets.set(key, targetId);
-  frameTargetKeys.set(targetId, key);
-  return targetId;
+
+  const useSession = !forceAttach && !frameSessionUnsupported.has(key) && !!known?.sessionId;
+  let route: FrameRoute;
+  if (useSession && known?.sessionId) {
+    route = {
+      kind: 'session',
+      targetId: known.targetId,
+      sessionId: known.sessionId,
+      // Cast: sessionId is a Chrome 125+ debuggee field the pinned
+      // @types/chrome does not know about. See DebuggerSessionTarget.
+      debuggee: { tabId, sessionId: known.sessionId } as DebuggerSessionTarget as chrome.debugger.Debuggee,
+    };
+  } else {
+    const targetId = known?.targetId ?? await resolveFrameTargetId(tabId, frameId, targetUrl);
+    try {
+      await chrome.debugger.attach({ targetId } as chrome.debugger.Debuggee, '1.3');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (!message.includes('Another debugger is already attached')) throw err;
+    }
+    frameTargets.set(key, targetId);
+    route = { kind: 'target', targetId, debuggee: { targetId } as chrome.debugger.Debuggee };
+  }
+  frameTargetKeys.set(route.targetId, key);
+  frameRoutes.set(key, route);
+  // Runtime domain must be enabled once per session before Runtime.evaluate.
+  await sendDebuggerCommand(route.debuggee, 'Runtime.enable').catch(() => {});
+  return route;
 }
 
+/** Forget a route that turned out to be unusable, so the next call re-resolves. */
+function demoteFrameRoute(tabId: number, frameId: string): void {
+  const key = frameTargetKey(tabId, frameId);
+  const route = frameRoutes.get(key);
+  frameRoutes.delete(key);
+  if (route) {
+    frameSessionUnsupported.add(key);
+    frameTargetKeys.delete(route.targetId);
+  }
+}
+
+/**
+ * Look the frame up in the targets collected from `Target.attachedToTarget`.
+ * The CLI passes the OOPIF's targetId as the frameId (that is what the
+ * `frames` command reports), so a direct key hit is the normal case; URL
+ * matching covers callers that only know the frame's URL.
+ */
+function resolveFrameFromAttachEvents(
+  tabId: number,
+  frameId: string,
+  targetUrl?: string,
+): { targetId: string; sessionId?: string } | undefined {
+  const known = tabIframeTargets.get(tabId);
+  if (!known) return undefined;
+  const direct = known.get(frameId);
+  if (direct) return { targetId: frameId, sessionId: direct.sessionId };
+  if (targetUrl) {
+    for (const [targetId, info] of known) {
+      if (info.url === targetUrl) return { targetId, sessionId: info.sessionId };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Last-resort resolution via `Target.getTargets`. Kept for the environments where
+ * the command is permitted; a tab-level chrome.debugger session normally gets
+ * `{"code":-32000,"message":"Not allowed"}` back, hence the catch.
+ */
 async function resolveFrameTargetId(tabId: number, frameId: string, targetUrl?: string): Promise<string> {
   const result = await sendDebuggerCommand({ tabId }, 'Target.getTargets').catch(() => null) as
     | { targetInfos?: Array<{ targetId?: string; id?: string; type?: string; url?: string }> }
@@ -759,9 +866,18 @@ export async function sendCommandInFrameTarget(
   timeoutMs: number = CDP_COMMAND_TIMEOUT_MS,
   targetUrl?: string,
 ): Promise<unknown> {
-  const targetId = await ensureFrameTarget(tabId, frameId, aggressiveRetry, targetUrl);
-  const target = { targetId } as chrome.debugger.Debuggee;
-  return sendDebuggerCommand(target, method, params, timeoutMs);
+  const route = await ensureFrameRoute(tabId, frameId, aggressiveRetry, targetUrl);
+  try {
+    return await sendDebuggerCommand(route.debuggee, method, params, timeoutMs);
+  } catch (err) {
+    if (route.kind !== 'session') throw err;
+    // The {tabId, sessionId} debuggee is Chrome 125+; on an older build it is
+    // rejected outright, and a session can also disappear under us. Fall back
+    // once to attach-by-targetId and remember not to try the session again.
+    demoteFrameRoute(tabId, frameId);
+    const fallback = await ensureFrameRoute(tabId, frameId, aggressiveRetry, targetUrl, true);
+    return sendDebuggerCommand(fallback.debuggee, method, params, timeoutMs);
+  }
 }
 
 export async function insertText(
@@ -823,6 +939,9 @@ export function registerFrameTracking(): void {
         tabIframeTargets.get(tabId)!.set(targetInfo.targetId, {
           url: targetInfo.url || '',
           title: targetInfo.title || '',
+          // Flatten-mode child session id — the preferred way to command this
+          // OOPIF (see ensureFrameRoute).
+          sessionId: typeof params?.sessionId === 'string' ? params.sessionId : undefined,
         });
         tabAttachedEventCounts.set(tabId, (tabAttachedEventCounts.get(tabId) || 0) + 1);
       }
@@ -831,6 +950,8 @@ export function registerFrameTracking(): void {
     if (method === 'Target.detachedFromTarget') {
       const targetId = String(params?.targetId || '');
       if (targetId) tabIframeTargets.get(tabId)?.delete(targetId);
+      const sessionId = String(params?.sessionId || '');
+      if (sessionId) clearFrameRoutesForSession(tabId, sessionId);
     }
   });
 
@@ -900,8 +1021,9 @@ export async function evaluateInFrame(
     }
   }
 
-  // No cached context, or the cached one went stale: resolve via the frame target.
-  await sendCommandInFrameTarget(tabId, frameId, 'Runtime.enable', {}, aggressiveRetry, timeoutMs).catch(() => undefined);
+  // No cached context, or the cached one went stale: resolve via the frame
+  // target/session. ensureFrameRoute issues Runtime.enable once per route, so
+  // no per-command enable is needed here.
   const result = await sendCommandInFrameTarget(tabId, frameId, 'Runtime.evaluate', {
     expression,
     returnByValue: true,
@@ -994,9 +1116,28 @@ export function hasActiveNetworkCapture(tabId: number): boolean {
   return networkCaptures.has(tabId);
 }
 
-function clearFrameTargetsForTab(tabId: number): void {
-  for (const [key, targetId] of [...frameTargets.entries()]) {
+/** Drop any cached session route whose flatten-mode session just went away. */
+function clearFrameRoutesForSession(tabId: number, sessionId: string): void {
+  for (const [key, route] of [...frameRoutes.entries()]) {
+    if (route.kind !== 'session' || route.sessionId !== sessionId) continue;
     if (!key.startsWith(`${tabId}:`)) continue;
+    frameRoutes.delete(key);
+    frameTargetKeys.delete(route.targetId);
+  }
+}
+
+function clearFrameTargetsForTab(tabId: number): void {
+  const prefix = `${tabId}:`;
+  for (const [key, route] of [...frameRoutes.entries()]) {
+    if (!key.startsWith(prefix)) continue;
+    frameRoutes.delete(key);
+    frameSessionUnsupported.delete(key);
+    // Session routes own no separate chrome.debugger attachment — the tab-level
+    // one covers them — so only the legacy targetId routes are detached below.
+    if (route.kind === 'session') frameTargetKeys.delete(route.targetId);
+  }
+  for (const [key, targetId] of [...frameTargets.entries()]) {
+    if (!key.startsWith(prefix)) continue;
     frameTargets.delete(key);
     frameTargetKeys.delete(targetId);
     chrome.debugger.detach({ targetId } as chrome.debugger.Debuggee).catch(() => {});

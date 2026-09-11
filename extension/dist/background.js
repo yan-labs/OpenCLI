@@ -9,6 +9,8 @@ const tabAllContexts = /* @__PURE__ */ new Map();
 const frameTargets = /* @__PURE__ */ new Map();
 const frameTargetKeys = /* @__PURE__ */ new Map();
 let frameTargetCleanupRegistered = false;
+const frameRoutes = /* @__PURE__ */ new Map();
+const frameSessionUnsupported = /* @__PURE__ */ new Set();
 const tabIframeTargets = /* @__PURE__ */ new Map();
 const tabAttachedEventCounts = /* @__PURE__ */ new Map();
 const CDP_RESPONSE_BODY_CAPTURE_LIMIT = 8 * 1024 * 1024;
@@ -345,15 +347,18 @@ function registerFrameTargetCleanup() {
 function clearFrameTarget(targetId) {
   if (!targetId) return;
   const key = frameTargetKeys.get(targetId);
-  if (key) frameTargets.delete(key);
+  if (key) {
+    frameTargets.delete(key);
+    frameRoutes.delete(key);
+  }
   frameTargetKeys.delete(targetId);
 }
-async function ensureFrameTarget(tabId, frameId, aggressiveRetry = false, targetUrl) {
+async function ensureFrameRoute(tabId, frameId, aggressiveRetry = false, targetUrl, forceAttach = false) {
   registerFrameTargetCleanup();
   await ensureAttached(tabId, aggressiveRetry);
   const key = frameTargetKey(tabId, frameId);
-  const existing = frameTargets.get(key);
-  if (existing) return existing;
+  const cached = frameRoutes.get(key);
+  if (cached) return cached;
   await sendDebuggerCommand({ tabId }, "Target.setDiscoverTargets", { discover: true }).catch(() => {
   });
   await sendDebuggerCommand({ tabId }, "Target.setAutoAttach", {
@@ -363,16 +368,59 @@ async function ensureFrameTarget(tabId, frameId, aggressiveRetry = false, target
     filter: [{ type: "iframe", exclude: false }]
   }).catch(() => {
   });
-  const targetId = await resolveFrameTargetId(tabId, frameId, targetUrl);
-  try {
-    await chrome.debugger.attach({ targetId }, "1.3");
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    if (!message.includes("Another debugger is already attached")) throw err;
+  let known = resolveFrameFromAttachEvents(tabId, frameId, targetUrl);
+  if (!known && !tabIframeTargets.get(tabId)?.size) {
+    await waitForIframeAttachEvents(tabId, 300);
+    known = resolveFrameFromAttachEvents(tabId, frameId, targetUrl);
   }
-  frameTargets.set(key, targetId);
-  frameTargetKeys.set(targetId, key);
-  return targetId;
+  const useSession = !forceAttach && !frameSessionUnsupported.has(key) && !!known?.sessionId;
+  let route;
+  if (useSession && known?.sessionId) {
+    route = {
+      kind: "session",
+      targetId: known.targetId,
+      sessionId: known.sessionId,
+      // Cast: sessionId is a Chrome 125+ debuggee field the pinned
+      // @types/chrome does not know about. See DebuggerSessionTarget.
+      debuggee: { tabId, sessionId: known.sessionId }
+    };
+  } else {
+    const targetId = known?.targetId ?? await resolveFrameTargetId(tabId, frameId, targetUrl);
+    try {
+      await chrome.debugger.attach({ targetId }, "1.3");
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (!message.includes("Another debugger is already attached")) throw err;
+    }
+    frameTargets.set(key, targetId);
+    route = { kind: "target", targetId, debuggee: { targetId } };
+  }
+  frameTargetKeys.set(route.targetId, key);
+  frameRoutes.set(key, route);
+  await sendDebuggerCommand(route.debuggee, "Runtime.enable").catch(() => {
+  });
+  return route;
+}
+function demoteFrameRoute(tabId, frameId) {
+  const key = frameTargetKey(tabId, frameId);
+  const route = frameRoutes.get(key);
+  frameRoutes.delete(key);
+  if (route) {
+    frameSessionUnsupported.add(key);
+    frameTargetKeys.delete(route.targetId);
+  }
+}
+function resolveFrameFromAttachEvents(tabId, frameId, targetUrl) {
+  const known = tabIframeTargets.get(tabId);
+  if (!known) return void 0;
+  const direct = known.get(frameId);
+  if (direct) return { targetId: frameId, sessionId: direct.sessionId };
+  if (targetUrl) {
+    for (const [targetId, info] of known) {
+      if (info.url === targetUrl) return { targetId, sessionId: info.sessionId };
+    }
+  }
+  return void 0;
 }
 async function resolveFrameTargetId(tabId, frameId, targetUrl) {
   const result = await sendDebuggerCommand({ tabId }, "Target.getTargets").catch(() => null);
@@ -470,9 +518,15 @@ async function listIframeTargets(tabId) {
   };
 }
 async function sendCommandInFrameTarget(tabId, frameId, method, params = {}, aggressiveRetry = false, timeoutMs = CDP_COMMAND_TIMEOUT_MS, targetUrl) {
-  const targetId = await ensureFrameTarget(tabId, frameId, aggressiveRetry, targetUrl);
-  const target = { targetId };
-  return sendDebuggerCommand(target, method, params, timeoutMs);
+  const route = await ensureFrameRoute(tabId, frameId, aggressiveRetry, targetUrl);
+  try {
+    return await sendDebuggerCommand(route.debuggee, method, params, timeoutMs);
+  } catch (err) {
+    if (route.kind !== "session") throw err;
+    demoteFrameRoute(tabId, frameId);
+    const fallback = await ensureFrameRoute(tabId, frameId, aggressiveRetry, targetUrl, true);
+    return sendDebuggerCommand(fallback.debuggee, method, params, timeoutMs);
+  }
 }
 async function insertText(tabId, text) {
   await ensureAttached(tabId);
@@ -526,7 +580,10 @@ function registerFrameTracking() {
         if (!tabIframeTargets.has(tabId)) tabIframeTargets.set(tabId, /* @__PURE__ */ new Map());
         tabIframeTargets.get(tabId).set(targetInfo.targetId, {
           url: targetInfo.url || "",
-          title: targetInfo.title || ""
+          title: targetInfo.title || "",
+          // Flatten-mode child session id — the preferred way to command this
+          // OOPIF (see ensureFrameRoute).
+          sessionId: typeof params?.sessionId === "string" ? params.sessionId : void 0
         });
         tabAttachedEventCounts.set(tabId, (tabAttachedEventCounts.get(tabId) || 0) + 1);
       }
@@ -534,6 +591,8 @@ function registerFrameTracking() {
     if (method === "Target.detachedFromTarget") {
       const targetId = String(params?.targetId || "");
       if (targetId) tabIframeTargets.get(tabId)?.delete(targetId);
+      const sessionId = String(params?.sessionId || "");
+      if (sessionId) clearFrameRoutesForSession(tabId, sessionId);
     }
   });
   chrome.tabs.onRemoved.addListener((tabId) => {
@@ -579,7 +638,6 @@ async function evaluateInFrame(tabId, expression, frameId, aggressiveRetry = fal
       contexts?.delete(frameId);
     }
   }
-  await sendCommandInFrameTarget(tabId, frameId, "Runtime.enable", {}, aggressiveRetry, timeoutMs).catch(() => void 0);
   const result = await sendCommandInFrameTarget(tabId, frameId, "Runtime.evaluate", {
     expression,
     returnByValue: true,
@@ -647,9 +705,24 @@ async function readNetworkCapture(tabId) {
 function hasActiveNetworkCapture(tabId) {
   return networkCaptures.has(tabId);
 }
-function clearFrameTargetsForTab(tabId) {
-  for (const [key, targetId] of [...frameTargets.entries()]) {
+function clearFrameRoutesForSession(tabId, sessionId) {
+  for (const [key, route] of [...frameRoutes.entries()]) {
+    if (route.kind !== "session" || route.sessionId !== sessionId) continue;
     if (!key.startsWith(`${tabId}:`)) continue;
+    frameRoutes.delete(key);
+    frameTargetKeys.delete(route.targetId);
+  }
+}
+function clearFrameTargetsForTab(tabId) {
+  const prefix = `${tabId}:`;
+  for (const [key, route] of [...frameRoutes.entries()]) {
+    if (!key.startsWith(prefix)) continue;
+    frameRoutes.delete(key);
+    frameSessionUnsupported.delete(key);
+    if (route.kind === "session") frameTargetKeys.delete(route.targetId);
+  }
+  for (const [key, targetId] of [...frameTargets.entries()]) {
+    if (!key.startsWith(prefix)) continue;
     frameTargets.delete(key);
     frameTargetKeys.delete(targetId);
     chrome.debugger.detach({ targetId }).catch(() => {
@@ -2109,10 +2182,15 @@ async function enumerateFramesForTab(tabId) {
   const tree = await getFrameTree(tabId);
   const frames = enumerateCrossOriginFrames(tree);
   const knownFrameIds = new Set(frames.map((f) => f.frameId));
+  const treeChildCount = frames.length;
   let iframeTargets = [];
+  let debug = {};
   try {
-    iframeTargets = (await listIframeTargets(tabId)).targets;
-  } catch {
+    const result = await listIframeTargets(tabId);
+    iframeTargets = result.targets;
+    debug = result.debug;
+  } catch (err) {
+    debug = { listError: String(err) };
   }
   for (const target of iframeTargets) {
     if (!target.targetId || knownFrameIds.has(target.targetId)) continue;
@@ -2124,7 +2202,7 @@ async function enumerateFramesForTab(tabId) {
       name: target.title || ""
     });
   }
-  return frames;
+  return { frames, debug: { treeChildCount, ...debug } };
 }
 function setLeaseSession(leaseKey, session) {
   const existing = automationSessions.get(leaseKey);
@@ -2320,7 +2398,7 @@ async function handleExec(cmd, leaseKey) {
   try {
     const aggressive = getSurfaceFromKey(leaseKey) === "browser";
     if (cmd.frameIndex != null) {
-      const frames = await enumerateFramesForTab(tabId);
+      const { frames } = await enumerateFramesForTab(tabId);
       if (cmd.frameIndex < 0 || cmd.frameIndex >= frames.length) {
         return { id: cmd.id, ok: false, error: `Frame index ${cmd.frameIndex} out of range (${frames.length} cross-origin frames available)` };
       }
@@ -2351,8 +2429,11 @@ async function handleFrames(cmd, leaseKey) {
   const cmdTabId = await resolveCommandTabId(cmd);
   const tabId = await resolveTabId(cmdTabId, leaseKey);
   try {
-    const frames = await enumerateFramesForTab(tabId);
-    return { id: cmd.id, ok: true, data: frames };
+    const result = await enumerateFramesForTab(tabId);
+    if (cmd.debug) {
+      return { id: cmd.id, ok: true, data: result };
+    }
+    return { id: cmd.id, ok: true, data: result.frames };
   } catch (err) {
     return errorResult(cmd.id, err);
   }
@@ -2610,6 +2691,9 @@ const CDP_ALLOWLIST = /* @__PURE__ */ new Set([
   // evaluation, e.g. content script isolated worlds discovered via the 'contexts' action)
   "Runtime.enable",
   "Runtime.evaluate",
+  // Iframe discovery diagnostics (read-only)
+  "Target.getTargets",
+  "Target.getTargetInfo",
   // Emulation (used by screenshot full-page)
   "Emulation.setDeviceMetricsOverride",
   "Emulation.clearDeviceMetricsOverride"
