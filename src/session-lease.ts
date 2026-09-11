@@ -105,6 +105,14 @@ export function isSessionLeaseCommand<T extends SessionLeaseCommand>(
 export interface LeaseTouchResult {
   granted: boolean;
   holder: SessionLeaseHolder;
+  /**
+   * Set only when `granted` is true and a DIFFERENT runId's lease was taken
+   * over (never set on first acquire of a free key, or on a same-runId
+   * heartbeat). Lets the caller log what happened to the previous holder.
+   */
+  reclaimedFrom?: SessionLeaseHolder;
+  /** Why `reclaimedFrom` was reclaimable — only set alongside it. */
+  reclaimReason?: 'ttl_expired' | 'client_dead';
 }
 
 export class SessionLeaseRegistry {
@@ -153,6 +161,10 @@ export class SessionLeaseRegistry {
     if (current !== undefined && alive && current.runId !== input.runId) {
       return { granted: false, holder: current };
     }
+    const reclaimedFrom = current !== undefined && current.runId !== input.runId ? current : undefined;
+    const reclaimReason: LeaseTouchResult['reclaimReason'] = reclaimedFrom === undefined
+      ? undefined
+      : (clientGone ? 'client_dead' : 'ttl_expired');
     const holder: SessionLeaseHolder = current !== undefined && current.runId === input.runId
       ? { ...current, command: input.command, lastSeenAt: input.now }
       : {
@@ -163,7 +175,7 @@ export class SessionLeaseRegistry {
         lastSeenAt: input.now,
       };
     this.leases.set(key, holder);
-    return { granted: true, holder };
+    return { granted: true, holder, reclaimedFrom, reclaimReason };
   }
 
   /**
