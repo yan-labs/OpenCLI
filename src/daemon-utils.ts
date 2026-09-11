@@ -1,3 +1,19 @@
+/**
+ * Liveness probe for a session-lease holder's CLI process. Signal 0 probes
+ * existence without delivering anything: ESRCH means the pid is gone (the
+ * process died or was killed and its lock is stale), EPERM still means alive
+ * (a foreign uid we cannot signal, but present), and any other outcome is
+ * treated as alive so a probe failure never wrongly frees a live lock.
+ */
+export function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException)?.code === 'EPERM';
+  }
+}
+
 export const COMMAND_RESULT_UNKNOWN_CODE = 'command_result_unknown';
 
 export const COMMAND_RESULT_UNKNOWN_HINT =

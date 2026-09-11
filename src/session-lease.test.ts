@@ -276,10 +276,34 @@ describe('buildSessionBusyFailure', () => {
     }).granted).toBe(false);
 
     // Client dead: pending work no longer protects it.
-    expect(leases.touch('k', {
+    const reclaimed = leases.touch('k', {
       runId: 'run_222_2_b', command: 'browser dialog', now: wayPastTtl,
       hasPendingWork: stillPending, isClientAlive: () => false,
-    }).granted).toBe(true);
+    });
+    expect(reclaimed.granted).toBe(true);
+    // The queued command can log who it took the lock from and why, without
+    // re-deriving it from the registry's internal state.
+    expect(reclaimed.reclaimedFrom).toMatchObject({ runId: 'run_49191_1_a', command: 'browser eval', pid: 49191 });
+    expect(reclaimed.reclaimReason).toBe('client_dead');
+  });
+
+  it('labels a reclaim from a merely TTL-expired (but not confirmed-dead) holder differently', () => {
+    const leases = new SessionLeaseRegistry();
+    leases.touch('k', { runId: 'run_1_1_a', command: 'browser eval', now: 0 });
+    const reclaimed = leases.touch('k', {
+      runId: 'run_2_2_b', command: 'browser click', now: SESSION_LEASE_TTL_MS + 1,
+    });
+    expect(reclaimed.granted).toBe(true);
+    expect(reclaimed.reclaimedFrom?.runId).toBe('run_1_1_a');
+    expect(reclaimed.reclaimReason).toBe('ttl_expired');
+  });
+
+  it('does not set reclaimedFrom on a first acquire or a same-runId heartbeat', () => {
+    const leases = new SessionLeaseRegistry();
+    const first = leases.touch('k', { runId: 'run_1_1_a', command: 'browser eval', now: 0 });
+    expect(first.reclaimedFrom).toBeUndefined();
+    const heartbeat = leases.touch('k', { runId: 'run_1_1_a', command: 'browser eval', now: 1_000 });
+    expect(heartbeat.reclaimedFrom).toBeUndefined();
   });
 
   it('a dead client still keeps its lease inside the TTL', () => {
