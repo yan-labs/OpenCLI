@@ -2460,7 +2460,14 @@ Examples:
       const timeout = parseInt(opts.timeout, 10);
       if (type === 'time') {
         const seconds = parseFloat(value ?? '2');
-        await page.wait(seconds);
+        // Explicit "wait time N" must sleep the FULL duration in the CLI
+        // process — it's used as a fixed throttle between actions (e.g.
+        // spacing out requests to a quota-limited site). page.wait(n) is a
+        // DOM-stability heuristic that can resolve after as little as a
+        // ~500ms quiet window if the page isn't mutating, which silently
+        // breaks that throttling. page.sleep() is a bare setTimeout with no
+        // page evaluation involved, so it can't return early.
+        await page.sleep(seconds);
         console.log(`Waited ${seconds}s`);
       } else if (type === 'selector') {
         if (!value) { console.error('Missing CSS selector'); process.exitCode = EXIT_CODES.USAGE_ERROR; return; }
@@ -3223,7 +3230,10 @@ cli({
                 result = { waited: 'text', text: a.text };
               } else {
                 const seconds = typeof a.seconds === 'number' ? a.seconds : parseFloat(String(a.seconds ?? '2'));
-                await page.wait(seconds);
+                // Same fix as the `wait time` CLI command: sleep the full
+                // duration in-process rather than the DOM-stability
+                // heuristic in page.wait(), which can return early.
+                await page.sleep(seconds);
                 result = { waited: 'time', seconds };
               }
               break;
