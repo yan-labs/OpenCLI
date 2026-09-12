@@ -15,7 +15,7 @@ export function getBrowserFactory(site?: string): new () => IBrowserFactory {
   return BrowserBridge;
 }
 
-export type BrowserWindowMode = 'foreground' | 'background' | 'isolated';
+export type BrowserWindowMode = 'foreground' | 'active' | 'background' | 'isolated';
 export type BrowserSurface = 'browser' | 'adapter';
 
 /**

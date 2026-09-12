@@ -310,7 +310,15 @@ type LeaseOwnership = 'owned' | 'borrowed';
 type LeaseLifecycle = 'ephemeral' | 'persistent' | 'pinned';
 type WindowRole = 'interactive' | 'automation' | 'borrowed-user';
 type OwnedWindowRole = Exclude<WindowRole, 'borrowed-user'>;
-// foreground — raise the window and select the tab (opt-in, interrupts the person)
+// foreground — raise the window AND select the tab (opt-in, interrupts the person by
+//              stealing macOS-level focus; use only when a human needs to see it, e.g.
+//              a CAPTCHA or an OS-level dialog)
+// active     — select the tab within its window ONLY; never touches OS-level window
+//              focus. Chromium's rAF/timer throttling keys off whether a tab is the
+//              active tab of a visible (non-minimized) window, not off which app has
+//              macOS focus — so this is enough to keep a tab's own render loop
+//              (e.g. a page polling `requestAnimationFrame`) from being throttled,
+//              without ever yanking the person's attention to another app.
 // background — do not raise, do not select; reuse the window they are already in
 // isolated   — background, but keep automation in its own separate window
 //
@@ -318,7 +326,7 @@ type OwnedWindowRole = Exclude<WindowRole, 'borrowed-user'>;
 // runtime check fell behind the union: `isolated` type-checked everywhere, parsed on
 // the CLI, reached the extension, and was then dropped by a hardcoded two-value guard.
 // Nothing errored — the flag just did nothing, which is the hardest kind of broken.
-const WINDOW_MODES = ['foreground', 'background', 'isolated'] as const;
+const WINDOW_MODES = ['foreground', 'active', 'background', 'isolated'] as const;
 type WindowMode = typeof WINDOW_MODES[number];
 
 function isWindowMode(value: unknown): value is WindowMode {
@@ -766,6 +774,12 @@ type OwnedContainerGroupCandidate = OwnedContainerGroup & {
   focused: boolean;
   hasReusableTab: boolean;
 };
+
+// `active` deliberately does NOT reach this function's `focused: true` call — that is
+// the one that steals macOS-level window focus. Only `foreground` does that.
+function wantsActiveTab(mode: WindowMode): boolean {
+  return mode === 'foreground' || mode === 'active';
+}
 
 async function focusOwnedWindowIfRequested(windowId: number, mode: WindowMode): Promise<void> {
   if (mode !== 'foreground') return;
@@ -1284,7 +1298,7 @@ async function ensureOwnedContainerWindowUnlocked(
     const hostTab = await chrome.tabs.create({
       windowId: hostWindowId,
       url: startUrl,
-      active: mode === 'foreground',
+      active: wantsActiveTab(mode),
     });
     container.windowId = hostWindowId;
     container.borrowed = true;
@@ -1493,10 +1507,12 @@ async function createOwnedTabLeaseUnlocked(leaseKey: string, initialUrl?: string
       tab = await chrome.tabs.get(initialTabId);
     }
   } else {
-    // `active` selects the tab inside its window. When the container shares the
-    // user's window that yanks the view away from whatever they were reading, so
-    // only do it when foreground was explicitly asked for.
-    tab = await chrome.tabs.create({ windowId, url: targetUrl, active: mode === 'foreground' });
+    // Selecting the tab inside its window yanks the view away from whatever tab the
+    // user was reading in that same window, so only do it when `foreground` or the
+    // lighter `active` mode was explicitly asked for. Neither of those two touches
+    // OS-level window focus here — that only happens via focusOwnedWindowIfRequested,
+    // which is gated to `foreground` alone.
+    tab = await chrome.tabs.create({ windowId, url: targetUrl, active: wantsActiveTab(mode) });
   }
   const tabId = tab.id;
   if (!tabId) throw new Error('Failed to create tab lease in automation container');
@@ -2066,12 +2082,12 @@ async function resolveTab(tabId: number | undefined, leaseKey: string, initialUr
     }
   }
 
-  // Fallback: create a new tab. Not active unless foreground was asked for —
+  // Fallback: create a new tab. Not active unless foreground/active was asked for —
   // see createOwnedTabLeaseUnlocked.
   const newTab = await chrome.tabs.create({
     windowId: scopedWindowId,
     url: BLANK_PAGE,
-    active: getWindowMode(leaseKey) === 'foreground',
+    active: wantsActiveTab(getWindowMode(leaseKey)),
   });
   if (!newTab.id) throw new Error('Failed to create tab in automation container');
   await ensureOwnedContainerGroup(role, leaseKey, scopedWindowId, [newTab.id]);
@@ -2392,7 +2408,7 @@ async function handleTabs(cmd: Command, leaseKey: string): Promise<Result> {
       let tab = await chrome.tabs.create({
         windowId,
         url: cmd.url ?? BLANK_PAGE,
-        active: getWindowMode(leaseKey) === 'foreground',
+        active: wantsActiveTab(getWindowMode(leaseKey)),
       });
       const tabId = tab.id;
       if (!tabId) return { id: cmd.id, ok: false, error: 'Failed to create tab' };

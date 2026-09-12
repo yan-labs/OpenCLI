@@ -28,7 +28,7 @@ Until `doctor` is green, nothing else will work. Typical failures: Chrome not ru
 - Use a stable session name for any multi-command or human-paced browser workflow. Example: `opencli browser fb-yaya-warmup open https://example.com`, then reuse `opencli browser fb-yaya-warmup state`, `extract`, `click`, etc.
 - Owned browser sessions keep a tab lease alive between calls. Release it with `opencli browser <session> close` or let the idle timeout expire.
 - `opencli browser <session> bind` binds the Chrome tab you already have open to that session. Use this for logged-in pages, SSO flows, or pages you manually positioned before handing control to the agent.
-- `--window foreground|background` (or `OPENCLI_WINDOW=foreground|background`) chooses whether OpenCLI creates/focuses a foreground browser window or uses a background browser window for owned sessions.
+- `--window foreground|active|background|isolated` (or `OPENCLI_WINDOW=...`) chooses the window/tab policy for owned sessions: `background` (default) never raises or selects; `active` selects the tab within its own window only, without stealing macOS-level window focus (use this to keep a tab's own render loop, e.g. `requestAnimationFrame`, from being throttled while staying invisible to the user); `foreground` also raises the window to the OS foreground (interrupts the user; use only when a human needs to see it); `isolated` is background in its own separate window.
 
 ### Bind Tab
 

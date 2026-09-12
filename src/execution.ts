@@ -610,8 +610,8 @@ function normalizeWindowMode(name: string, raw: unknown): BrowserWindowMode | nu
   // cli.ts, and with the --window choices in help.ts. It used to omit 'isolated'
   // while the help text right next to it advertised the mode, so adapter commands
   // rejected a value the help told people to pass.
-  if (raw === 'foreground' || raw === 'background' || raw === 'isolated') return raw;
-  throw new ArgumentError(`${name} must be one of: foreground, background, isolated. Received: "${String(raw)}"`);
+  if (raw === 'foreground' || raw === 'active' || raw === 'background' || raw === 'isolated') return raw;
+  throw new ArgumentError(`${name} must be one of: foreground, active, background, isolated. Received: "${String(raw)}"`);
 }
 
 function resolveBrowserWindowMode(defaultMode: BrowserWindowMode = 'background', rawOption?: unknown): BrowserWindowMode {

@@ -58,8 +58,8 @@ const BROWSER_COMMON_OPTIONS = [
   {
     flags: '--window <mode>',
     name: 'window',
-    help: 'Window mode: background (default, reuses your current window, never steals focus), foreground (raise + select), isolated (background in its own window)',
-    choices: ['foreground', 'background', 'isolated'],
+    help: 'Window mode: background (default, reuses your current window, never steals focus), active (selects the tab within its window only -- keeps it un-throttled without raising the window or stealing OS focus), foreground (raise + select), isolated (background in its own window)',
+    choices: ['foreground', 'active', 'background', 'isolated'],
   },
   {
     flags: '--site-session <mode>',

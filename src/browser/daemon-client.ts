@@ -238,7 +238,7 @@ export interface DaemonCommand {
   cdpMethod?: string;
   cdpParams?: Record<string, unknown>;
   /** Window foreground/background policy for owned Browser Bridge containers. */
-  windowMode?: 'foreground' | 'background' | 'isolated';
+  windowMode?: 'foreground' | 'active' | 'background' | 'isolated';
   /** Custom idle timeout in seconds for this session. Overrides the default. */
   idleTimeout?: number;
   /** Frame index for cross-frame operations (0-based, from 'frames' action) */
@@ -343,7 +343,7 @@ async function sendCommandRaw(
   const timeoutSeconds = effectiveCommandTimeoutSeconds(params);
   let deadlineAt = Date.now() + timeoutSeconds * 1000;
   const rawWindowMode = process.env.OPENCLI_WINDOW;
-  const envWindowMode = rawWindowMode === 'foreground' || rawWindowMode === 'background'
+  const envWindowMode = rawWindowMode === 'foreground' || rawWindowMode === 'active' || rawWindowMode === 'background'
     ? rawWindowMode
     : undefined;
   // Requirement vs preference: an explicit contextId routes strictly; a

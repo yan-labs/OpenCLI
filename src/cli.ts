@@ -631,7 +631,7 @@ async function getBrowserPage(
 }
 
 function getBrowserWindowMode(command: Command | undefined, defaultMode: BrowserWindowMode): BrowserWindowMode {
-  const modes: BrowserWindowMode[] = ['foreground', 'background', 'isolated'];
+  const modes: BrowserWindowMode[] = ['foreground', 'active', 'background', 'isolated'];
   const optionRaw = getCommandOption(command, 'window');
   if (optionRaw !== undefined && optionRaw !== '') {
     if (modes.includes(optionRaw as BrowserWindowMode)) return optionRaw as BrowserWindowMode;
