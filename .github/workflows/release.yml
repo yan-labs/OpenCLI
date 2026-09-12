@@ -39,7 +39,8 @@ jobs:
         run: |
           npm pack
           CLI_VERSION=$(node -p "require('./package.json').version")
-          mv "jackwener-opencli-${CLI_VERSION}.tgz" "opencli-cli-${CLI_VERSION}.tgz"
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          mv "jackwener-opencli-${CLI_VERSION}.tgz" "opencli-cli-${TAG_VERSION}.tgz"
 
       - name: Install extension dependencies
         run: npm ci
@@ -56,8 +57,14 @@ jobs:
       - name: Create extension ZIP
         run: |
           EXT_VERSION=$(jq -r .version extension/package.json)
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if [[ "$TAG_VERSION" == *-* ]]; then
+            TAG_SUFFIX="-${TAG_VERSION#*-}"
+          else
+            TAG_SUFFIX=""
+          fi
           cd extension-package
-          zip -r ../opencli-extension-v${EXT_VERSION}.zip .
+          zip -r "../opencli-extension-v${EXT_VERSION}${TAG_SUFFIX}.zip" .
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3.0.0
