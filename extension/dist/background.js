@@ -1238,7 +1238,7 @@ function scheduleReconnect() {
     void connect();
   }, delay);
 }
-const WINDOW_MODES = ["foreground", "background", "isolated"];
+const WINDOW_MODES = ["foreground", "active", "background", "isolated", "dedicated"];
 function isWindowMode(value) {
   return typeof value === "string" && WINDOW_MODES.includes(value);
 }
@@ -1255,6 +1255,15 @@ const ownedContainers = {
   interactive: { windowId: null, groups: /* @__PURE__ */ new Map(), borrowed: false, windowFallbackReason: null, promise: null, groupPromise: null },
   automation: { windowId: null, groups: /* @__PURE__ */ new Map(), borrowed: false, windowFallbackReason: null, promise: null, groupPromise: null }
 };
+const DEFAULT_DEDICATED_SLOT = "default";
+const DEDICATED_REGISTRY_KEY = "opencli_dedicated_windows_v1";
+const dedicatedSlots = /* @__PURE__ */ new Map();
+const selfMovingTabIds = /* @__PURE__ */ new Map();
+let dedicatedEnsureQueue = Promise.resolve();
+let dedicatedReleaseQueue = Promise.resolve();
+const selfCreatedTabIds = /* @__PURE__ */ new Set();
+let dedicatedTabCreatesInFlight = 0;
+let foreignTabSettleMs = 1500;
 const ownedGroupLedger = /* @__PURE__ */ new Map();
 class CommandFailure extends Error {
   constructor(code, message, hint) {
@@ -1506,6 +1515,9 @@ function otherOwnedPreferredTabIds(leaseKey) {
   }
   return ids;
 }
+function wantsActiveTab(mode) {
+  return mode === "foreground" || mode === "active";
+}
 async function focusOwnedWindowIfRequested(windowId, mode) {
   if (mode !== "foreground") return;
   const updateWindow = chrome.windows.update;
@@ -1615,7 +1627,7 @@ async function ensureTabsInWindow(tabIds, windowId) {
     try {
       const tab = await chrome.tabs.get(tabId);
       if (tab.windowId !== windowId) {
-        await chrome.tabs.move(tabId, { windowId, index: -1 });
+        await moveTabSelf(tabId, windowId);
         movedIds.push(tabId);
       }
     } catch {
@@ -1659,7 +1671,7 @@ async function createOwnedGroup(role, leaseKey, windowId, ids) {
   await ensureTabsInWindow(ids, windowId);
   const groupId = await chrome.tabs.group({ tabIds: ids, createProperties: { windowId } });
   ownedContainers[role].groups.set(leaseKey, groupId);
-  ownedContainers[role].windowId = windowId;
+  if (!isDedicatedWindow(windowId)) ownedContainers[role].windowId = windowId;
   ownedGroupLedger.set(groupId, leaseKey);
   await persistRuntimeState();
   const group = await chrome.tabGroups.update(groupId, {
@@ -1702,11 +1714,13 @@ async function ensureOwnedContainerGroupUnlocked(role, leaseKey, fallbackWindowI
     }
     const container = ownedContainers[role];
     if (canonical) {
-      if (container.windowId !== canonical.windowId) {
-        container.borrowed = true;
-        container.windowFallbackReason = null;
+      if (!isDedicatedWindow(canonical.windowId)) {
+        if (container.windowId !== canonical.windowId) {
+          container.borrowed = true;
+          container.windowFallbackReason = null;
+        }
+        container.windowId = canonical.windowId;
       }
-      container.windowId = canonical.windowId;
       container.groups.set(leaseKey, canonical.id);
       if (ownedGroupLedger.get(canonical.id) !== leaseKey) {
         ownedGroupLedger.set(canonical.id, leaseKey);
@@ -1733,6 +1747,7 @@ async function containerWindowIsDedicated(role) {
   const container = ownedContainers[role];
   if (container.windowId === null) return false;
   if (container.borrowed) return false;
+  if (isDedicatedWindow(container.windowId)) return false;
   const ours = /* @__PURE__ */ new Set();
   for (const [groupId, owner] of ownedGroupLedger.entries()) {
     if (owner !== null && getOwnedWindowRole(owner) === role) ours.add(groupId);
@@ -1825,7 +1840,7 @@ async function ensureOwnedContainerWindowUnlocked(role, leaseKey, initialUrl, mo
     const hostTab = await chrome.tabs.create({
       windowId: hostWindowId,
       url: startUrl,
-      active: mode === "foreground"
+      active: wantsActiveTab(mode)
     });
     container.windowId = hostWindowId;
     container.borrowed = true;
@@ -1884,6 +1899,7 @@ async function findHostWindowForContainer(excludeWindowId) {
   const owned = new Set(
     Object.values(ownedContainers).filter((container) => !container.borrowed).map((container) => container.windowId).filter((id) => id !== null && id !== excludeWindowId)
   );
+  for (const id of dedicatedWindowIds()) owned.add(id);
   const eligible = (win) => usable(win) && !owned.has(win.id);
   try {
     const lastFocused = await chrome.windows.getLastFocused({ windowTypes: ["normal"] });
@@ -1906,6 +1922,7 @@ async function findHostWindowForContainer(excludeWindowId) {
   for (const container of Object.values(ownedContainers)) {
     if (container.windowId === null || container.windowId === excludeWindowId) continue;
     if (container.borrowed || container.windowFallbackReason === null) continue;
+    if (isDedicatedWindow(container.windowId)) continue;
     try {
       const win = await chrome.windows.get(container.windowId);
       if (win && !win.incognito) return { windowId: container.windowId };
@@ -1935,6 +1952,728 @@ function initialTabIsAvailable(tabId) {
   }
   return true;
 }
+const DEDICATED_SLOT_PATTERN = /^[A-Za-z0-9_.-]{1,40}$/;
+const DEDICATED_PLACEHOLDER_PREFIX = "about:blank#opencli-dedicated=";
+function dedicatedPlaceholderUrl(slot) {
+  return `${DEDICATED_PLACEHOLDER_PREFIX}${slot}`;
+}
+const DEDICATED_CELL = { width: 1280, height: 900, offsetX: 80, offsetY: 60 };
+const DEDICATED_CAPABILITIES = ["dedicated-window", "window-slots", "window-bounds", "window-display", "auto-select", "foreign-tab-policy"];
+function emptyDedicatedPlacement() {
+  return { source: "none", requestedBounds: null, displayPattern: null, displayName: null, displayFound: null, cell: null };
+}
+function normalizeDedicatedSlot(raw) {
+  return typeof raw === "string" && DEDICATED_SLOT_PATTERN.test(raw) ? raw : DEFAULT_DEDICATED_SLOT;
+}
+function isRect(value) {
+  if (!value || typeof value !== "object") return false;
+  const r = value;
+  const finite = (k) => typeof r[k] === "number" && Number.isFinite(r[k]);
+  return finite("left") && finite("top") && finite("width") && finite("height") && r.width > 0 && r.height > 0;
+}
+function normalizeRect(r) {
+  return { left: Math.round(r.left), top: Math.round(r.top), width: Math.round(r.width), height: Math.round(r.height) };
+}
+function rectFromUnknown(value) {
+  const r = value && typeof value === "object" ? value : {};
+  const n = (k) => typeof r[k] === "number" && Number.isFinite(r[k]) ? r[k] : 0;
+  return { left: n("left"), top: n("top"), width: n("width"), height: n("height") };
+}
+function rectFromWindow(win) {
+  if (!win) return null;
+  const { left, top, width, height } = win;
+  if ([left, top, width, height].some((v) => typeof v !== "number")) return null;
+  return { left, top, width, height };
+}
+function rectCenterInside(rect, area) {
+  const cx = rect.left + rect.width / 2;
+  const cy = rect.top + rect.height / 2;
+  return cx >= area.left && cx < area.left + area.width && cy >= area.top && cy < area.top + area.height;
+}
+function compileDisplayMatcher(pattern) {
+  const raw = typeof pattern === "string" ? pattern.trim() : "";
+  if (!raw) return null;
+  const re = /^\/(.+)\/([a-z]*)$/i.exec(raw);
+  if (re) {
+    try {
+      return new RegExp(re[1], re[2].replace(/[gy]/g, ""));
+    } catch {
+    }
+  }
+  return new RegExp(raw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+}
+function pickDisplay(displays, pattern) {
+  const matcher = compileDisplayMatcher(pattern);
+  if (!matcher || !displays) return null;
+  const usable = (d) => d.bounds.width > 0 && d.bounds.height > 0 && matcher.test(d.name);
+  const secondary = displays.find((d) => !d.primary && usable(d));
+  if (secondary) return secondary;
+  return displays.length === 1 && usable(displays[0]) ? displays[0] : null;
+}
+function dedicatedCellGrid(display) {
+  const width = Math.max(1, Math.min(DEDICATED_CELL.width, display.width));
+  const height = Math.max(1, Math.min(DEDICATED_CELL.height, display.height));
+  const cols = Math.max(1, Math.floor(display.width / width));
+  const rows = Math.max(1, Math.floor(display.height / height));
+  const offsetX = Math.max(0, Math.min(DEDICATED_CELL.offsetX, Math.floor((display.width - cols * width) / cols)));
+  const offsetY = Math.max(0, Math.min(DEDICATED_CELL.offsetY, Math.floor((display.height - rows * height) / rows)));
+  return { width, height, cols, rows, offsetX, offsetY };
+}
+function computeDisplayCell(display, cell) {
+  const g = dedicatedCellGrid(display);
+  const capacity = g.cols * g.rows;
+  const index = (Math.trunc(cell) % capacity + capacity) % capacity;
+  const col = index % g.cols;
+  const row = Math.floor(index / g.cols);
+  return {
+    left: display.left + g.offsetX + col * (g.width + g.offsetX),
+    top: display.top + g.offsetY + row * (g.height + g.offsetY),
+    width: g.width,
+    height: g.height
+  };
+}
+async function listDisplays() {
+  const api = chrome.system?.display;
+  if (typeof api?.getInfo !== "function") {
+    return { displays: null, error: 'chrome.system.display is unavailable (extension lacks the "system.display" permission; reload it)' };
+  }
+  try {
+    const raw = await new Promise((resolve, reject) => {
+      try {
+        const maybe = api.getInfo((info) => {
+          const lastError = chrome.runtime?.lastError;
+          if (lastError) reject(new Error(lastError.message ?? "system.display.getInfo failed"));
+          else resolve(info);
+        });
+        if (maybe && typeof maybe.then === "function") maybe.then(resolve, reject);
+      } catch (err) {
+        reject(err);
+      }
+    });
+    const displays = (Array.isArray(raw) ? raw : []).map((entry) => {
+      const d = entry && typeof entry === "object" ? entry : {};
+      return {
+        id: String(d.id ?? ""),
+        name: String(d.name ?? ""),
+        primary: d.isPrimary === true,
+        internal: d.isInternal === true,
+        bounds: rectFromUnknown(d.bounds),
+        workArea: d.workArea ? rectFromUnknown(d.workArea) : null
+      };
+    });
+    return { displays };
+  } catch (err) {
+    return { displays: null, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+function getDedicatedSlot(slot) {
+  let state = dedicatedSlots.get(slot);
+  if (!state) {
+    state = {
+      slot,
+      windowId: null,
+      placeholderTabIds: /* @__PURE__ */ new Set(),
+      placement: emptyDedicatedPlacement(),
+      autoSelect: true,
+      foreignTabPolicy: "evict",
+      evictedTabs: 0,
+      promise: null
+    };
+    dedicatedSlots.set(slot, state);
+  }
+  return state;
+}
+function dedicatedSlotForWindow(windowId) {
+  if (windowId === null || windowId === void 0) return void 0;
+  for (const state of dedicatedSlots.values()) {
+    if (state.windowId === windowId) return state;
+  }
+  return void 0;
+}
+function isDedicatedWindow(windowId) {
+  return dedicatedSlotForWindow(windowId) !== void 0;
+}
+function dedicatedWindowIds() {
+  return [...dedicatedSlots.values()].map((s) => s.windowId).filter((id) => id !== null);
+}
+function forgetDedicatedWindow(state) {
+  state.windowId = null;
+  state.placeholderTabIds.clear();
+}
+async function persistDedicatedState() {
+  const slots = {};
+  for (const state of dedicatedSlots.values()) {
+    slots[state.slot] = {
+      windowId: state.windowId,
+      placeholderTabIds: [...state.placeholderTabIds],
+      placement: state.placement,
+      autoSelect: state.autoSelect,
+      foreignTabPolicy: state.foreignTabPolicy,
+      evictedTabs: state.evictedTabs
+    };
+  }
+  try {
+    await chrome.storage?.session?.set({ [DEDICATED_REGISTRY_KEY]: { version: 1, slots } });
+  } catch {
+  }
+}
+function coerceDedicatedPlacement(raw) {
+  const p = raw && typeof raw === "object" ? raw : {};
+  const source = p.source === "bounds" || p.source === "display" ? p.source : "none";
+  return {
+    source,
+    requestedBounds: isRect(p.requestedBounds) ? normalizeRect(p.requestedBounds) : null,
+    displayPattern: typeof p.displayPattern === "string" ? p.displayPattern : null,
+    displayName: typeof p.displayName === "string" ? p.displayName : null,
+    displayFound: typeof p.displayFound === "boolean" ? p.displayFound : null,
+    cell: typeof p.cell === "number" && Number.isInteger(p.cell) ? p.cell : null
+  };
+}
+async function restoreDedicatedState() {
+  dedicatedSlots.clear();
+  let stored;
+  try {
+    const session = chrome.storage?.session;
+    if (!session) return;
+    const raw = await session.get(DEDICATED_REGISTRY_KEY);
+    stored = raw?.[DEDICATED_REGISTRY_KEY];
+  } catch {
+    return;
+  }
+  if (!stored || stored.version !== 1 || !stored.slots || typeof stored.slots !== "object") return;
+  for (const [slot, value] of Object.entries(stored.slots)) {
+    if (!DEDICATED_SLOT_PATTERN.test(slot) || !value || typeof value !== "object") continue;
+    const raw = value;
+    const state = getDedicatedSlot(slot);
+    state.autoSelect = raw.autoSelect !== false;
+    state.foreignTabPolicy = raw.foreignTabPolicy === "tolerate" ? "tolerate" : "evict";
+    state.evictedTabs = typeof raw.evictedTabs === "number" ? raw.evictedTabs : 0;
+    state.placement = coerceDedicatedPlacement(raw.placement);
+    if (typeof raw.windowId !== "number") continue;
+    try {
+      await chrome.windows.get(raw.windowId);
+    } catch {
+      continue;
+    }
+    state.windowId = raw.windowId;
+    for (const tabId of Array.isArray(raw.placeholderTabIds) ? raw.placeholderTabIds : []) {
+      if (typeof tabId !== "number") continue;
+      try {
+        const tab = await chrome.tabs.get(tabId);
+        if (tab.windowId === raw.windowId) state.placeholderTabIds.add(tabId);
+      } catch {
+      }
+    }
+  }
+}
+function dedicatedPlacementRequest(leaseKey) {
+  const overrides = sessionOverrides.get(leaseKey);
+  return {
+    ...overrides?.windowBounds ? { bounds: overrides.windowBounds } : {},
+    ...overrides?.windowDisplay ? { display: overrides.windowDisplay } : {}
+  };
+}
+function dedicatedSlotNameFor(leaseKey) {
+  return normalizeDedicatedSlot(sessionOverrides.get(leaseKey)?.windowSlot);
+}
+function applyDedicatedCommandFields(leaseKey, cmd) {
+  const slot = normalizeDedicatedSlot(cmd.windowSlot);
+  const patch = { windowSlot: slot, autoSelect: cmd.autoSelect !== false };
+  if (isRect(cmd.windowBounds)) {
+    patch.windowBounds = normalizeRect(cmd.windowBounds);
+    patch.windowDisplay = typeof cmd.windowDisplay === "string" && cmd.windowDisplay.trim() ? cmd.windowDisplay.trim() : void 0;
+  } else if (typeof cmd.windowDisplay === "string" && cmd.windowDisplay.trim()) {
+    patch.windowDisplay = cmd.windowDisplay.trim();
+    patch.windowBounds = void 0;
+  }
+  setSessionOverride(leaseKey, patch);
+  const state = getDedicatedSlot(slot);
+  state.autoSelect = patch.autoSelect !== false;
+  if (cmd.foreignTabPolicy === "evict" || cmd.foreignTabPolicy === "tolerate") state.foreignTabPolicy = cmd.foreignTabPolicy;
+}
+function tabActivationFor(leaseKey) {
+  const mode = getWindowMode(leaseKey);
+  if (mode === "dedicated") return sessionOverrides.get(leaseKey)?.autoSelect !== false;
+  return wantsActiveTab(mode);
+}
+async function resolveDedicatedTarget(state, request) {
+  const previous = state.placement;
+  if (request.bounds) {
+    state.placement = { ...emptyDedicatedPlacement(), source: "bounds", requestedBounds: normalizeRect(request.bounds), displayPattern: request.display ?? null };
+  } else if (request.display) {
+    state.placement = { ...emptyDedicatedPlacement(), source: "display", displayPattern: request.display };
+  }
+  const placement = state.placement;
+  if (placement.source === "bounds" && placement.requestedBounds) {
+    return { target: placement.requestedBounds, area: placement.requestedBounds };
+  }
+  if (placement.source !== "display" || !placement.displayPattern) return { target: null, area: null };
+  const { displays } = await listDisplays();
+  const display = pickDisplay(displays, placement.displayPattern);
+  if (!display) {
+    placement.displayFound = false;
+    placement.displayName = null;
+    placement.cell = null;
+    return { target: null, area: null };
+  }
+  const grid = dedicatedCellGrid(display.bounds);
+  const capacity = grid.cols * grid.rows;
+  const used = /* @__PURE__ */ new Set();
+  for (const other of dedicatedSlots.values()) {
+    if (other === state || other.windowId === null && other.promise === null) continue;
+    if (other.placement.source !== "display" || other.placement.displayName !== display.name || other.placement.cell === null) continue;
+    used.add(other.placement.cell % capacity);
+  }
+  const previousCell = previous.displayName === display.name ? previous.cell : null;
+  let cell = previousCell !== null && !used.has(previousCell % capacity) ? previousCell : -1;
+  for (let i = 0; cell < 0 && i < capacity; i += 1) if (!used.has(i)) cell = i;
+  if (cell < 0) cell = used.size;
+  placement.displayFound = true;
+  placement.displayName = display.name;
+  placement.cell = cell;
+  return { target: computeDisplayCell(display.bounds, cell), area: display.bounds };
+}
+async function ensureDedicatedWindow(slot, request = {}) {
+  const state = getDedicatedSlot(slot);
+  const next = dedicatedEnsureQueue.catch(() => null).then(() => ensureDedicatedWindowUnlocked(state, request));
+  const tracked = next.finally(() => {
+    if (state.promise === tracked) state.promise = null;
+  });
+  state.promise = tracked;
+  dedicatedEnsureQueue = tracked.catch(() => null);
+  return tracked;
+}
+async function ensureDedicatedWindowUnlocked(state, request) {
+  let win = null;
+  if (state.windowId !== null) {
+    try {
+      win = await chrome.windows.get(state.windowId);
+    } catch {
+      forgetDedicatedWindow(state);
+    }
+  }
+  if (!win) {
+    const adopted = await adoptOrphanDedicatedWindow(state);
+    if (adopted) win = adopted;
+  }
+  const { target, area } = await resolveDedicatedTarget(state, request);
+  let created = false;
+  let moved = false;
+  let createdTabId;
+  if (!win || state.windowId === null) {
+    const startUrl = request.initialUrl && isSafeNavigationUrl(request.initialUrl) ? request.initialUrl : dedicatedPlaceholderUrl(state.slot);
+    dedicatedTabCreatesInFlight += 1;
+    try {
+      const newWindow = await chrome.windows.create({
+        url: startUrl,
+        focused: false,
+        type: "normal",
+        ...target ?? { width: DEDICATED_CELL.width, height: DEDICATED_CELL.height }
+      });
+      state.windowId = newWindow.id;
+      state.placeholderTabIds.clear();
+      const initialTabs = await chrome.tabs.query({ windowId: state.windowId }).catch(() => []);
+      for (const tab of initialTabs) if (tab.id !== void 0) state.placeholderTabIds.add(tab.id);
+      createdTabId = initialTabs.find((tab) => tab.id !== void 0)?.id;
+      created = true;
+    } finally {
+      dedicatedTabCreatesInFlight -= 1;
+    }
+    console.log(`[opencli] Created dedicated window ${state.windowId} (slot=${state.slot}, placement=${state.placement.source}${state.placement.displayName ? `:${state.placement.displayName}#${state.placement.cell}` : ""})`);
+  } else if (request.reposition && target && area && (win.state === void 0 || win.state === "normal")) {
+    const current = rectFromWindow(win);
+    if (!current || !rectCenterInside(current, area)) {
+      const updateWindow = chrome.windows.update;
+      if (typeof updateWindow === "function") {
+        try {
+          await updateWindow(state.windowId, target);
+          moved = true;
+        } catch (err) {
+          console.warn(`[opencli] Failed to move dedicated window ${state.windowId}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+    }
+  }
+  await persistDedicatedState();
+  const initialTabId = createdTabId !== void 0 && initialTabIsAvailable(createdTabId) ? createdTabId : await findDedicatedPlaceholder(state);
+  return { windowId: state.windowId, initialTabId, created, moved };
+}
+async function adoptOrphanDedicatedWindow(state) {
+  let marked = [];
+  try {
+    marked = (await chrome.tabs.query({})).filter((tab) => tab.url === dedicatedPlaceholderUrl(state.slot) && tab.id !== void 0);
+  } catch {
+    return null;
+  }
+  for (const tab of marked) {
+    if (isDedicatedWindow(tab.windowId)) continue;
+    try {
+      const win = await chrome.windows.get(tab.windowId);
+      if (win.type !== void 0 && win.type !== "normal") continue;
+      if (win.incognito) continue;
+      state.windowId = tab.windowId;
+      state.placeholderTabIds.add(tab.id);
+      console.log(`[opencli] Adopted dedicated window ${tab.windowId} for slot ${state.slot} from its placeholder tab`);
+      return win;
+    } catch {
+    }
+  }
+  return null;
+}
+function isPlaceholderUrl(url) {
+  return !url || url === BLANK_PAGE || url.startsWith(DEDICATED_PLACEHOLDER_PREFIX);
+}
+async function findDedicatedPlaceholder(state) {
+  for (const tabId of [...state.placeholderTabIds]) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (!isPlaceholderUrl(tab.url)) {
+        state.placeholderTabIds.delete(tabId);
+        continue;
+      }
+      if (tab.windowId === state.windowId && initialTabIsAvailable(tabId)) return tabId;
+      if (tab.windowId !== state.windowId) state.placeholderTabIds.delete(tabId);
+    } catch {
+      state.placeholderTabIds.delete(tabId);
+    }
+  }
+  return void 0;
+}
+function ownedLeaseForTab(tabId) {
+  for (const entry of automationSessions.entries()) {
+    if (entry[1].owned && entry[1].preferredTabId === tabId) return entry;
+  }
+  return void 0;
+}
+function isOpenCliTabId(tabId) {
+  if (ownedLeaseForTab(tabId)) return true;
+  if (selfCreatedTabIds.has(tabId)) return true;
+  for (const state of dedicatedSlots.values()) if (state.placeholderTabIds.has(tabId)) return true;
+  return false;
+}
+function classifyDedicatedTab(state, tab) {
+  if (tab.id === void 0) return "foreign";
+  if (ownedLeaseForTab(tab.id)) return "lease";
+  if (state.placeholderTabIds.has(tab.id)) return isPlaceholderUrl(tab.url) ? "placeholder" : "foreign";
+  if (selfCreatedTabIds.has(tab.id)) return "automation";
+  const inOurGroup = typeof tab.groupId === "number" && tab.groupId !== chrome.tabGroups.TAB_GROUP_ID_NONE && ownedGroupLedger.has(tab.groupId);
+  if (inOurGroup || typeof tab.openerTabId === "number" && isOpenCliTabId(tab.openerTabId)) {
+    selfCreatedTabIds.add(tab.id);
+    return "automation";
+  }
+  return "foreign";
+}
+async function moveTabSelf(tabId, windowId) {
+  selfMovingTabIds.set(tabId, (selfMovingTabIds.get(tabId) ?? 0) + 1);
+  try {
+    await chrome.tabs.move(tabId, { windowId, index: -1 });
+  } finally {
+    setTimeout(() => {
+      const left = (selfMovingTabIds.get(tabId) ?? 1) - 1;
+      if (left <= 0) selfMovingTabIds.delete(tabId);
+      else selfMovingTabIds.set(tabId, left);
+    }, 2e3);
+  }
+}
+async function findEvictionWindow(tab) {
+  const created = new Set(
+    Object.values(ownedContainers).filter((container) => !container.borrowed).map((container) => container.windowId).filter((id) => id !== null)
+  );
+  const eligible = (win) => !!win && win.id !== void 0 && win.type === "normal" && !!win.incognito === !!tab.incognito && win.id !== tab.windowId && !isDedicatedWindow(win.id) && !created.has(win.id);
+  try {
+    const lastFocused = await chrome.windows.getLastFocused({ windowTypes: ["normal"] });
+    if (eligible(lastFocused)) return lastFocused.id;
+  } catch {
+  }
+  try {
+    const candidates = (await chrome.windows.getAll({ windowTypes: ["normal"] })).filter(eligible);
+    if (candidates.length > 0) return (candidates.find((win) => win.focused) ?? candidates[candidates.length - 1]).id;
+  } catch {
+  }
+  return void 0;
+}
+async function checkDedicatedForeignTab(tabId, attempt = 0) {
+  await workerReady;
+  if (dedicatedTabCreatesInFlight > 0 && attempt < 10) {
+    setTimeout(() => {
+      void checkDedicatedForeignTab(tabId, attempt + 1);
+    }, Math.max(200, foreignTabSettleMs));
+    return "deferred";
+  }
+  let tab;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch {
+    return "gone";
+  }
+  const state = dedicatedSlotForWindow(tab.windowId);
+  if (!state) return "not-dedicated";
+  if (classifyDedicatedTab(state, tab) !== "foreign") return "ours";
+  if (state.foreignTabPolicy === "tolerate") return "tolerated";
+  const target = await findEvictionWindow(tab);
+  if (target === void 0) {
+    console.warn(`[opencli] Foreign tab ${tabId} in dedicated window ${state.windowId} (slot=${state.slot}) has no window of yours to go back to; leaving it`);
+    return "stranded";
+  }
+  try {
+    await chrome.tabs.move(tabId, { windowId: target, index: -1 });
+    await chrome.tabs.update(tabId, { active: true }).catch(() => {
+    });
+    state.evictedTabs += 1;
+    await persistDedicatedState();
+    console.log(`[opencli] Moved foreign tab ${tabId} out of dedicated window ${state.windowId} into window ${target}`);
+    return "evicted";
+  } catch {
+    return "stranded";
+  }
+}
+function scheduleForeignTabCheck(tabId) {
+  setTimeout(() => {
+    void checkDedicatedForeignTab(tabId);
+  }, foreignTabSettleMs);
+}
+async function handleTabAttached(tabId, info) {
+  await workerReady;
+  if (selfMovingTabIds.has(tabId)) return;
+  let changed = false;
+  for (const state of dedicatedSlots.values()) {
+    if (state.windowId !== info.newWindowId && state.placeholderTabIds.delete(tabId)) changed = true;
+  }
+  if (isDedicatedWindow(info.newWindowId)) {
+    if (changed) await persistDedicatedState();
+    scheduleForeignTabCheck(tabId);
+    return;
+  }
+  const owned = ownedLeaseForTab(tabId);
+  if (owned && isDedicatedWindow(owned[1].windowId)) {
+    const [leaseKey, lease] = owned;
+    if (lease.idleTimer) clearTimeout(lease.idleTimer);
+    automationSessions.delete(leaseKey);
+    sessionOverrides.delete(leaseKey);
+    scheduleIdleAlarm(leaseKey, IDLE_TIMEOUT_NONE);
+    await safeDetach(tabId);
+    try {
+      await chrome.tabs.ungroup(tabId);
+    } catch {
+    }
+    console.log(`[opencli] Session ${lease.session} gave up tab ${tabId}: it was dragged out of its dedicated window`);
+    await persistRuntimeState();
+  }
+  if (changed) await persistDedicatedState();
+}
+async function closeRedundantPlaceholders(state) {
+  if (state.windowId === null || state.placeholderTabIds.size === 0) return;
+  const hasLease = [...automationSessions.values()].some((s) => s.owned && s.windowId === state.windowId && s.preferredTabId !== null);
+  if (!hasLease) return;
+  for (const tabId of [...state.placeholderTabIds]) {
+    if (!initialTabIsAvailable(tabId)) continue;
+    state.placeholderTabIds.delete(tabId);
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (tab && isPlaceholderUrl(tab.url)) await chrome.tabs.remove(tabId).catch(() => {
+    });
+  }
+  await persistDedicatedState();
+}
+async function createDedicatedTabLease(leaseKey, targetUrl) {
+  const slot = dedicatedSlotNameFor(leaseKey);
+  const state = getDedicatedSlot(slot);
+  const role = getOwnedWindowRole(leaseKey);
+  const active = tabActivationFor(leaseKey);
+  dedicatedTabCreatesInFlight += 1;
+  try {
+    const { windowId, initialTabId } = await ensureDedicatedWindow(slot, {
+      ...dedicatedPlacementRequest(leaseKey),
+      reposition: true,
+      initialUrl: targetUrl
+    });
+    let tab;
+    if (initialTabId !== void 0) {
+      state.placeholderTabIds.delete(initialTabId);
+      tab = await chrome.tabs.get(initialTabId);
+      if (!isTargetUrl(tab.url, targetUrl)) {
+        tab = await chrome.tabs.update(initialTabId, { url: targetUrl });
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        tab = await chrome.tabs.get(initialTabId);
+      }
+    } else {
+      tab = await chrome.tabs.create({ windowId, url: targetUrl, active });
+    }
+    const tabId = tab.id;
+    if (!tabId) throw new Error("Failed to create tab lease in dedicated window");
+    selfCreatedTabIds.add(tabId);
+    const group = await ensureOwnedContainerGroup(role, leaseKey, windowId, [tabId], windowId);
+    if (active && !tab.active) tab = await chrome.tabs.update(tabId, { active: true }) ?? tab;
+    if (tab.windowId !== windowId) tab = await chrome.tabs.get(tabId);
+    setLeaseSession(leaseKey, {
+      session: getSessionFromKey(leaseKey),
+      surface: getSurfaceFromKey(leaseKey),
+      kind: "owned",
+      windowId: group?.windowId ?? windowId,
+      owned: true,
+      preferredTabId: tabId
+    });
+    resetWindowIdleTimer(leaseKey);
+    await persistDedicatedState();
+    return { tabId, tab };
+  } finally {
+    dedicatedTabCreatesInFlight -= 1;
+  }
+}
+async function applyDedicatedSessionPolicy(leaseKey, resolved) {
+  const lease = automationSessions.get(leaseKey);
+  if (!lease?.owned || lease.preferredTabId !== resolved.tabId) return resolved;
+  const slot = dedicatedSlotNameFor(leaseKey);
+  const state = getDedicatedSlot(slot);
+  let tab = resolved.tab ?? await chrome.tabs.get(resolved.tabId);
+  if (state.windowId === null || tab.windowId !== state.windowId) {
+    dedicatedTabCreatesInFlight += 1;
+    try {
+      const { windowId } = await ensureDedicatedWindow(slot, { ...dedicatedPlacementRequest(leaseKey), reposition: true });
+      if (tab.windowId !== windowId) {
+        lease.windowId = windowId;
+        await moveTabSelf(resolved.tabId, windowId);
+        const group = await ensureOwnedContainerGroup(getOwnedWindowRole(leaseKey), leaseKey, windowId, [resolved.tabId], windowId);
+        lease.windowId = group?.windowId ?? windowId;
+        console.log(`[opencli] Moved session ${lease.session} tab ${resolved.tabId} into dedicated window ${windowId} (slot=${slot})`);
+        await closeRedundantPlaceholders(state);
+        await persistRuntimeState();
+      }
+      tab = await chrome.tabs.get(resolved.tabId);
+    } finally {
+      dedicatedTabCreatesInFlight -= 1;
+    }
+  }
+  if (sessionOverrides.get(leaseKey)?.autoSelect !== false && !tab.active) {
+    tab = await chrome.tabs.update(resolved.tabId, { active: true }) ?? tab;
+  }
+  return { tabId: resolved.tabId, tab };
+}
+async function releaseDedicatedLeaseTab(state, tabId) {
+  const run = dedicatedReleaseQueue.catch(() => null).then(() => releaseDedicatedLeaseTabUnlocked(state, tabId));
+  dedicatedReleaseQueue = run.catch(() => null);
+  return run;
+}
+async function releaseDedicatedLeaseTabUnlocked(state, tabId) {
+  let tab = null;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch {
+    return "removed";
+  }
+  let keepsWindow = tab.windowId !== state.windowId;
+  if (!keepsWindow && state.windowId !== null) {
+    const others = (await chrome.tabs.query({ windowId: state.windowId }).catch(() => [])).filter((other) => other.id !== void 0 && other.id !== tabId);
+    keepsWindow = others.some((other) => classifyDedicatedTab(state, other) !== "foreign");
+  }
+  if (keepsWindow) {
+    await chrome.tabs.remove(tabId).catch(() => {
+    });
+    return "removed";
+  }
+  try {
+    await chrome.tabs.update(tabId, { url: dedicatedPlaceholderUrl(state.slot) });
+    await chrome.tabs.ungroup(tabId).catch(() => {
+    });
+    state.placeholderTabIds.add(tabId);
+    await persistDedicatedState();
+    return "placeholder";
+  } catch {
+    await chrome.tabs.remove(tabId).catch(() => {
+    });
+    return "removed";
+  }
+}
+async function describeDedicatedSlot(state, displays) {
+  let win = null;
+  if (state.windowId !== null) {
+    try {
+      win = await chrome.windows.get(state.windowId);
+    } catch {
+      forgetDedicatedWindow(state);
+    }
+  }
+  const bounds = rectFromWindow(win);
+  let onDisplay = null;
+  if (state.placement.displayPattern && displays) {
+    const display = pickDisplay(displays, state.placement.displayPattern);
+    onDisplay = display && bounds ? rectCenterInside(bounds, display.bounds) : false;
+  }
+  const counts = { total: 0, leases: 0, placeholders: 0, automation: 0, foreign: 0 };
+  let activeTab = null;
+  const sessions = [];
+  if (win && state.windowId !== null) {
+    const tabs = await chrome.tabs.query({ windowId: state.windowId }).catch(() => []);
+    for (const tab of tabs) {
+      if (tab.id === void 0) continue;
+      const owner = classifyDedicatedTab(state, tab);
+      counts.total += 1;
+      if (owner === "lease") counts.leases += 1;
+      else if (owner === "placeholder") counts.placeholders += 1;
+      else if (owner === "automation") counts.automation += 1;
+      else counts.foreign += 1;
+      const lease = ownedLeaseForTab(tab.id);
+      if (lease && !sessions.includes(lease[1].session)) sessions.push(lease[1].session);
+      if (tab.active) {
+        activeTab = {
+          tabId: tab.id,
+          owner,
+          session: lease ? lease[1].session : null,
+          // Foreign tabs are the person's: never echo their URL or title.
+          ...owner === "foreign" ? {} : { url: tab.url, title: tab.title }
+        };
+      }
+    }
+  }
+  return {
+    slot: state.slot,
+    windowId: win ? state.windowId : null,
+    exists: !!win,
+    state: win?.state ?? null,
+    bounds,
+    placement: { ...state.placement },
+    onDisplay: win ? onDisplay : null,
+    activeTab,
+    tabs: counts,
+    sessions,
+    autoSelect: state.autoSelect,
+    foreignTabPolicy: state.foreignTabPolicy,
+    evictedTabs: state.evictedTabs
+  };
+}
+async function handleDedicatedWindowOp(cmd) {
+  if (cmd.op === "window-ensure") {
+    const slot = normalizeDedicatedSlot(cmd.windowSlot);
+    const state = getDedicatedSlot(slot);
+    if (cmd.foreignTabPolicy === "evict" || cmd.foreignTabPolicy === "tolerate") state.foreignTabPolicy = cmd.foreignTabPolicy;
+    if (typeof cmd.autoSelect === "boolean") state.autoSelect = cmd.autoSelect;
+    const result = await ensureDedicatedWindow(slot, {
+      ...isRect(cmd.windowBounds) ? { bounds: normalizeRect(cmd.windowBounds) } : {},
+      ...typeof cmd.windowDisplay === "string" && cmd.windowDisplay.trim() ? { display: cmd.windowDisplay.trim() } : {},
+      reposition: true
+    });
+    const { displays: displays2 } = await listDisplays();
+    return { id: cmd.id, ok: true, data: { ...await describeDedicatedSlot(state, displays2), created: result.created, moved: result.moved } };
+  }
+  const { displays, error } = await listDisplays();
+  const filter = typeof cmd.windowSlot === "string" && cmd.windowSlot ? cmd.windowSlot : null;
+  const windows = [];
+  for (const state of [...dedicatedSlots.values()].sort((a, b) => a.slot.localeCompare(b.slot))) {
+    if (filter && state.slot !== filter) continue;
+    windows.push(await describeDedicatedSlot(state, displays));
+  }
+  return {
+    id: cmd.id,
+    ok: true,
+    data: {
+      supported: true,
+      protocol: 1,
+      capabilities: [...DEDICATED_CAPABILITIES],
+      displays,
+      ...displays === null ? { displaysError: error } : {},
+      windows
+    }
+  };
+}
 async function createOwnedTabLease(leaseKey, initialUrl) {
   return withLeaseMutation(() => createOwnedTabLeaseUnlocked(leaseKey, initialUrl));
 }
@@ -1942,6 +2681,7 @@ async function createOwnedTabLeaseUnlocked(leaseKey, initialUrl) {
   const targetUrl = initialUrl && isSafeNavigationUrl(initialUrl) ? initialUrl : BLANK_PAGE;
   const role = getOwnedWindowRole(leaseKey);
   const mode = getWindowMode(leaseKey);
+  if (mode === "dedicated") return createDedicatedTabLease(leaseKey, targetUrl);
   const { windowId, initialTabId } = await ensureOwnedContainerWindow(role, leaseKey, targetUrl, mode);
   let tab;
   if (initialTabIsAvailable(initialTabId)) {
@@ -1952,7 +2692,7 @@ async function createOwnedTabLeaseUnlocked(leaseKey, initialUrl) {
       tab = await chrome.tabs.get(initialTabId);
     }
   } else {
-    tab = await chrome.tabs.create({ windowId, url: targetUrl, active: mode === "foreground" });
+    tab = await chrome.tabs.create({ windowId, url: targetUrl, active: wantsActiveTab(mode) });
   }
   const tabId = tab.id;
   if (!tabId) throw new Error("Failed to create tab lease in automation container");
@@ -1998,6 +2738,13 @@ async function getAutomationWindow(leaseKey, initialUrl) {
       await removeLeaseSession(leaseKey);
     }
   }
+  if (getWindowMode(leaseKey) === "dedicated") {
+    return (await ensureDedicatedWindow(dedicatedSlotNameFor(leaseKey), {
+      ...dedicatedPlacementRequest(leaseKey),
+      reposition: true,
+      initialUrl
+    })).windowId;
+  }
   const role = getOwnedWindowRole(leaseKey);
   return (await ensureOwnedContainerWindow(role, leaseKey, initialUrl, getWindowMode(leaseKey))).windowId;
 }
@@ -2005,6 +2752,12 @@ chrome.windows.onRemoved.addListener(async (windowId) => {
   await workerReady;
   for (const role of Object.keys(ownedContainers)) {
     if (ownedContainers[role].windowId === windowId) forgetContainerWindow(role);
+  }
+  const dedicated = dedicatedSlotForWindow(windowId);
+  if (dedicated) {
+    console.log(`[opencli] Dedicated window ${windowId} closed (slot=${dedicated.slot})`);
+    forgetDedicatedWindow(dedicated);
+    await persistDedicatedState();
   }
   for (const [leaseKey, session] of automationSessions.entries()) {
     if (session.windowId === windowId) {
@@ -2020,6 +2773,12 @@ chrome.windows.onRemoved.addListener(async (windowId) => {
 chrome.tabs.onRemoved.addListener(async (tabId) => {
   await workerReady;
   evictTab(tabId);
+  selfCreatedTabIds.delete(tabId);
+  let placeholderGone = false;
+  for (const state of dedicatedSlots.values()) {
+    if (state.placeholderTabIds.delete(tabId)) placeholderGone = true;
+  }
+  if (placeholderGone) await persistDedicatedState();
   for (const [leaseKey, session] of automationSessions.entries()) {
     if (session.preferredTabId === tabId) {
       if (session.idleTimer) clearTimeout(session.idleTimer);
@@ -2030,6 +2789,17 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
     }
   }
   await persistRuntimeState();
+});
+chrome.tabs.onCreated?.addListener?.((tab) => {
+  void (async () => {
+    await workerReady;
+    if (tab.id === void 0) return;
+    if (typeof tab.openerTabId === "number" && isOpenCliTabId(tab.openerTabId)) selfCreatedTabIds.add(tab.id);
+    if (isDedicatedWindow(tab.windowId)) scheduleForeignTabCheck(tab.id);
+  })();
+});
+chrome.tabs.onAttached?.addListener?.((tabId, info) => {
+  void handleTabAttached(tabId, info);
 });
 let initialized = false;
 function initialize() {
@@ -2117,6 +2887,7 @@ async function handleCommand(cmd) {
   const leaseKey = getLeaseKey(session, surface);
   if (isWindowMode(cmd.windowMode)) {
     setSessionOverride(leaseKey, { windowMode: cmd.windowMode });
+    if (cmd.windowMode === "dedicated") applyDedicatedCommandFields(leaseKey, cmd);
   }
   if (surface === "adapter" && (cmd.siteSession === "persistent" || cmd.siteSession === "ephemeral")) {
     setSessionOverride(leaseKey, { lifecycle: cmd.siteSession });
@@ -2271,6 +3042,11 @@ async function resolveCommandTabId(cmd) {
   return void 0;
 }
 async function resolveTab(tabId, leaseKey, initialUrl) {
+  const resolved = await resolveTabForLease(tabId, leaseKey, initialUrl);
+  if (getWindowMode(leaseKey) !== "dedicated") return resolved;
+  return applyDedicatedSessionPolicy(leaseKey, resolved);
+}
+async function resolveTabForLease(tabId, leaseKey, initialUrl) {
   const existingSession = automationSessions.get(leaseKey);
   if (tabId !== void 0) {
     try {
@@ -2381,7 +3157,7 @@ ${activeSessions.join("\n")}` : "\nNo active sessions.";
   const newTab = await chrome.tabs.create({
     windowId: scopedWindowId,
     url: BLANK_PAGE,
-    active: getWindowMode(leaseKey) === "foreground"
+    active: tabActivationFor(leaseKey)
   });
   if (!newTab.id) throw new Error("Failed to create tab in automation container");
   await ensureOwnedContainerGroup(role, leaseKey, scopedWindowId, [newTab.id]);
@@ -2626,8 +3402,9 @@ async function handleTabs(cmd, leaseKey) {
       let tab = await chrome.tabs.create({
         windowId,
         url: cmd.url ?? BLANK_PAGE,
-        active: getWindowMode(leaseKey) === "foreground"
+        active: tabActivationFor(leaseKey)
       });
+      if (tab.id !== void 0 && isDedicatedWindow(windowId)) selfCreatedTabIds.add(tab.id);
       const tabId = tab.id;
       if (!tabId) return { id: cmd.id, ok: false, error: "Failed to create tab" };
       const group = await ensureOwnedContainerGroup(getOwnedWindowRole(leaseKey), leaseKey, windowId, [tabId]);
@@ -2798,6 +3575,7 @@ function stripOpenCliFrameRoutingParams(params, stripFrameId) {
   return rest;
 }
 async function handleSessions(cmd) {
+  if (cmd.op === "window-status" || cmd.op === "window-ensure") return handleDedicatedWindowOp(cmd);
   if (cmd.op === "cleanup") {
     const keys = [...automationSessions.keys()];
     for (const key of keys) await releaseLease(key, "cleanup");
@@ -2810,9 +3588,11 @@ async function handleSessions(cmd) {
     let windowId = lease.windowId ?? null;
     let groupId = null;
     let groupTitle = null;
+    let tabActive = null;
     if (lease.preferredTabId !== null) {
       try {
         const tab = await chrome.tabs.get(lease.preferredTabId);
+        tabActive = typeof tab.active === "boolean" ? tab.active : null;
         url = tab.url;
         title = tab.title;
         windowId = tab.windowId ?? windowId;
@@ -2841,6 +3621,8 @@ async function handleSessions(cmd) {
       groupId,
       groupTitle,
       windowFallbackReason,
+      dedicatedSlot: dedicatedSlotForWindow(windowId)?.slot ?? null,
+      tabActive,
       url,
       title
     });
@@ -2966,7 +3748,11 @@ async function releaseLease(leaseKey, reason = "released") {
       );
       await safeDetach(tabId);
       evictTab(tabId);
-      if (hasOtherOwnedLease) {
+      const dedicatedSlot = dedicatedSlotForWindow(session.windowId);
+      if (dedicatedSlot) {
+        const outcome = await releaseDedicatedLeaseTab(dedicatedSlot, tabId);
+        console.log(`[opencli] Released dedicated tab lease ${tabId} (${outcome}, slot=${dedicatedSlot.slot}, session=${session.session}, surface=${session.surface}, ${reason})`);
+      } else if (hasOtherOwnedLease) {
         await chrome.tabs.remove(tabId).catch(() => {
         });
         console.log(`[opencli] Released owned tab lease ${tabId} (session=${session.session}, surface=${session.surface}, ${reason})`);
@@ -2998,6 +3784,7 @@ async function releaseLease(leaseKey, reason = "released") {
   await persistRuntimeState();
 }
 async function reconcileTargetLeaseRegistry() {
+  await restoreDedicatedState();
   const registry = await readRegistry();
   ownedGroupLedger.clear();
   for (const role of Object.keys(ownedContainers)) {
@@ -3050,7 +3837,7 @@ async function reconcileTargetLeaseRegistry() {
       });
       if (session.owned) {
         const role = getOwnedWindowRole(leaseKey);
-        if (ownedContainers[role].windowId === null) ownedContainers[role].windowId = tab.windowId;
+        if (ownedContainers[role].windowId === null && !isDedicatedWindow(tab.windowId)) ownedContainers[role].windowId = tab.windowId;
         const group = await ensureOwnedContainerGroup(role, leaseKey, tab.windowId, [tabId]);
         if (group) {
           const current = automationSessions.get(leaseKey);

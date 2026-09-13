@@ -3000,3 +3000,552 @@ describe('background tab isolation', () => {
     expect(leftover).toBeUndefined();
   });
 });
+
+// ─── Dedicated automation windows (`--window dedicated`) ────────────────────
+function dedicatedHarness(opts: { withDisplayApi?: boolean } = {}) {
+  const mock = createChromeMock();
+  const chrome = mock.chrome as any;
+  const tabs = mock.tabs;
+  type MockWindow = { id: number; type: string; incognito: boolean; focused: boolean; state: string; left: number; top: number; width: number; height: number };
+  const windows = new Map<number, MockWindow>([
+    [1, { id: 1, type: 'normal', incognito: false, focused: false, state: 'normal', left: 0, top: 25, width: 1400, height: 880 }],
+    [2, { id: 2, type: 'normal', incognito: false, focused: true, state: 'normal', left: 40, top: 25, width: 1400, height: 880 }],
+  ]);
+  let nextWindowId = 50;
+  let nextTabId = 500;
+  let lastFocused = 2;
+  chrome.windows.get = vi.fn(async (id: number) => {
+    const win = windows.get(id);
+    if (!win) throw new Error(`No window with id: ${id}`);
+    return { ...win };
+  });
+  chrome.windows.getAll = vi.fn(async () => [...windows.values()].map((w) => ({ ...w })));
+  chrome.windows.getLastFocused = vi.fn(async () => ({ ...windows.get(lastFocused)! }));
+  chrome.windows.create = vi.fn(async (props: any) => {
+    const id = nextWindowId++;
+    windows.set(id, {
+      id, type: 'normal', incognito: false, focused: !!props.focused, state: 'normal',
+      left: props.left ?? 300, top: props.top ?? 200, width: props.width, height: props.height,
+    });
+    tabs.push({ id: nextTabId++, windowId: id, url: props.url, title: props.url, active: true, status: 'complete', groupId: -1 });
+    return { ...windows.get(id)! };
+  });
+  chrome.windows.update = vi.fn(async (id: number, info: any) => {
+    const win = windows.get(id);
+    if (!win) throw new Error(`No window with id: ${id}`);
+    Object.assign(win, info);
+    return { ...win };
+  });
+  const displays = [
+    { id: 'main', name: 'Built-in Retina Display', isPrimary: true, isInternal: true, bounds: { left: 0, top: 0, width: 1512, height: 982 }, workArea: { left: 0, top: 25, width: 1512, height: 957 } },
+    { id: 'virt', name: '虚拟 16:9', isPrimary: false, isInternal: false, bounds: { left: -2560, top: -1440, width: 2560, height: 1440 }, workArea: { left: -2560, top: -1440, width: 2560, height: 1440 } },
+  ];
+  if (opts.withDisplayApi !== false) {
+    chrome.system = { display: { getInfo: vi.fn(async (cb?: (d: unknown[]) => void) => { cb?.(displays); return displays; }) } };
+  }
+  chrome.tabs.onCreated = { addListener: vi.fn() };
+  chrome.tabs.onAttached = { addListener: vi.fn() };
+  return {
+    ...mock,
+    chrome,
+    windows,
+    setLastFocused: (id: number) => { lastFocused = id; },
+    closeWindow: async (id: number) => {
+      windows.delete(id);
+      for (let i = tabs.length - 1; i >= 0; i -= 1) if (tabs[i].windowId === id) tabs.splice(i, 1);
+      for (const call of chrome.windows.onRemoved.addListener.mock.calls) await call[0](id);
+    },
+  };
+}
+
+describe('dedicated automation window', () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.useRealTimers();
+    MockWebSocket.instances = [];
+    vi.stubGlobal('WebSocket', MockWebSocket);
+    vi.stubGlobal('fetch', vi.fn(() => new Promise(() => {})));
+  });
+
+  afterEach(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    vi.unstubAllGlobals();
+  });
+
+  const useDedicated = (mod: any, key: string, fields: Record<string, unknown> = {}) => {
+    mod.__test__.sessionOverrides.set(key, { windowMode: 'dedicated' });
+    mod.__test__.applyDedicatedCommandFields(key, { id: 'x', action: 'exec', windowMode: 'dedicated', ...fields });
+  };
+
+  it('creates its own window unfocused at the requested bounds and never touches the person\'s window', async () => {
+    const h = dedicatedHarness();
+    vi.stubGlobal('chrome', h.chrome);
+    const mod = await import('./background');
+    const key = browserKey('semrush');
+    useDedicated(mod, key, { windowSlot: 'semrush', windowBounds: { left: -2480, top: -1380, width: 1280, height: 900 } });
+
+    const tabId = await mod.__test__.resolveTabId(undefined, key, 'https://www.semrush.com/');
+
+    expect(h.chrome.windows.create).toHaveBeenCalledTimes(1);
+    expect(h.chrome.windows.create).toHaveBeenCalledWith(expect.objectContaining({ focused: false, left: -2480, top: -1380, width: 1280, height: 900 }));
+    expect(h.tabs.find((t) => t.id === tabId)?.windowId).toBe(50);
+    for (const call of h.chrome.tabs.create.mock.calls) expect(call[0].windowId).not.toBe(2);
+    for (const call of h.chrome.windows.update.mock.calls) expect(call[1]).not.toHaveProperty('focused');
+    expect(mod.__test__.getDedicatedSlot('semrush')).toMatchObject({ windowId: 50, placement: { source: 'bounds' } });
+    // The person's window stays out of every role container.
+    expect(mod.__test__.getContainer('interactive').windowId).not.toBe(2);
+  });
+
+  it('tiles slots on the display matched by name without overlapping them', async () => {
+    const h = dedicatedHarness();
+    vi.stubGlobal('chrome', h.chrome);
+    const mod = await import('./background');
+    useDedicated(mod, browserKey('semrush'), { windowSlot: 'semrush', windowDisplay: '/虚拟|virtual/i' });
+    useDedicated(mod, browserKey('similarweb'), { windowSlot: 'similarweb', windowDisplay: '/虚拟|virtual/i' });
+
+    await mod.__test__.resolveTabId(undefined, browserKey('semrush'), 'https://www.semrush.com/');
+    await mod.__test__.resolveTabId(undefined, browserKey('similarweb'), 'https://pro.similarweb.com/');
+
+    expect(h.chrome.windows.create.mock.calls[0][0]).toMatchObject({ left: -2560, top: -1380, width: 1280, height: 900, focused: false });
+    expect(h.chrome.windows.create.mock.calls[1][0]).toMatchObject({ left: -1280, top: -1380, width: 1280, height: 900, focused: false });
+    expect(mod.__test__.getDedicatedSlot('semrush')?.placement).toMatchObject({ source: 'display', displayName: '虚拟 16:9', displayFound: true, cell: 0 });
+    expect(mod.__test__.getDedicatedSlot('similarweb')?.placement).toMatchObject({ cell: 1 });
+  });
+
+  it('computes display cells and matches display names', async () => {
+    vi.stubGlobal('chrome', dedicatedHarness().chrome);
+    const mod = await import('./background');
+    const display = { left: -2560, top: -1440, width: 2560, height: 1440 };
+    expect(mod.__test__.computeDisplayCell(display, 0)).toEqual({ left: -2560, top: -1380, width: 1280, height: 900 });
+    expect(mod.__test__.computeDisplayCell(display, 1)).toEqual({ left: -1280, top: -1380, width: 1280, height: 900 });
+    expect(mod.__test__.computeDisplayCell(display, 2)).toEqual({ left: -2560, top: -1380, width: 1280, height: 900 });
+    expect(mod.__test__.computeDisplayCell({ left: 0, top: 0, width: 1024, height: 768 }, 0)).toEqual({ left: 0, top: 0, width: 1024, height: 768 });
+    expect(mod.__test__.compileDisplayMatcher('/虚拟|virtual/i')!.test('Virtual 16:9')).toBe(true);
+    expect(mod.__test__.compileDisplayMatcher('VIRT')!.test('my virtual screen')).toBe(true);
+    expect(mod.__test__.compileDisplayMatcher('a.b')!.test('axb')).toBe(false);
+    const displays = [
+      { id: '1', name: 'Virtual main', primary: true, internal: false, bounds: { left: 0, top: 0, width: 10, height: 10 }, workArea: null },
+      { id: '2', name: 'Virtual side', primary: false, internal: false, bounds: { left: 10, top: 0, width: 10, height: 10 }, workArea: null },
+    ];
+    expect(mod.__test__.pickDisplay(displays, 'virtual')?.id).toBe('2');
+    expect(mod.__test__.pickDisplay(displays, 'nope')).toBeNull();
+    // Primary only when it is the sole display (physical screen asleep).
+    expect(mod.__test__.pickDisplay([displays[0]], 'virtual')?.id).toBe('1');
+    expect(mod.__test__.pickDisplay([displays[0], { ...displays[1], name: 'Studio Display' }], 'virtual')).toBeNull();
+  });
+
+  it('moves a lease tab that sits in the person\'s window into the dedicated window and selects it', async () => {
+    const h = dedicatedHarness();
+    h.tabs.push({ id: 40, windowId: 2, url: 'https://www.semrush.com/analytics', title: 'semrush', active: false, status: 'complete', groupId: -1 });
+    vi.stubGlobal('chrome', h.chrome);
+    const mod = await import('./background');
+    const key = browserKey('semrush');
+    mod.__test__.setSession(key, { windowId: 2, owned: true, preferredTabId: 40 });
+    useDedicated(mod, key, { windowSlot: 'semrush' });
+
+    const tabId = await mod.__test__.resolveTabId(undefined, key);
+
+    expect(tabId).toBe(40);
+    const tab = h.tabs.find((t) => t.id === 40)!;
+    expect(tab.windowId).toBe(50);
+    expect(tab.active).toBe(true);
+    expect(mod.__test__.getSession(key)?.windowId).toBe(50);
+    // The window's own blank starter tab is litter once the lease tab is in.
+    expect(h.chrome.tabs.remove).toHaveBeenCalledWith(500);
+    expect(h.chrome.windows.create).toHaveBeenCalledWith(expect.objectContaining({ focused: false }));
+  });
+
+  it('selects the session tab before each command unless autoSelect is off', async () => {
+    const h = dedicatedHarness();
+    vi.stubGlobal('chrome', h.chrome);
+    const mod = await import('./background');
+    const a = browserKey('a');
+    const b = browserKey('b');
+    useDedicated(mod, a);
+    useDedicated(mod, b, { autoSelect: false });
+    const tabA = await mod.__test__.resolveTabId(undefined, a, 'https://a.example/');
+    const tabB = await mod.__test__.resolveTabId(undefined, b, 'https://b.example/');
+    expect(h.tabs.find((t) => t.id === tabB)?.windowId).toBe(h.tabs.find((t) => t.id === tabA)?.windowId);
+    expect(h.chrome.tabs.create).toHaveBeenCalledWith(expect.objectContaining({ url: 'https://b.example/', active: false }));
+
+    h.tabs.find((t) => t.id === tabA)!.active = false;
+    h.chrome.tabs.update.mockClear();
+    await mod.__test__.resolveTabId(undefined, a);
+    expect(h.chrome.tabs.update).toHaveBeenCalledWith(tabA, { active: true });
+
+    h.chrome.tabs.update.mockClear();
+    await mod.__test__.resolveTabId(undefined, b);
+    expect(h.chrome.tabs.update).not.toHaveBeenCalledWith(tabB, { active: true });
+  });
+
+  it('sends a foreign tab back to the person\'s last window without focusing it, and keeps automation children', async () => {
+    const h = dedicatedHarness();
+    vi.stubGlobal('chrome', h.chrome);
+    const mod = await import('./background');
+    const key = browserKey('semrush');
+    useDedicated(mod, key, { windowSlot: 'semrush' });
+    const leaseTab = await mod.__test__.resolveTabId(undefined, key, 'https://www.semrush.com/');
+    h.tabs.push({ id: 77, windowId: 50, url: 'https://news.example/', title: 'news', active: true, status: 'complete', groupId: -1 });
+    h.tabs.push({ id: 78, windowId: 50, url: 'https://www.semrush.com/popup', title: 'child', active: false, status: 'complete', groupId: -1, openerTabId: leaseTab } as any);
+
+    expect(await mod.__test__.checkDedicatedForeignTab(78)).toBe('ours');
+    expect(await mod.__test__.checkDedicatedForeignTab(77)).toBe('evicted');
+
+    expect(h.tabs.find((t) => t.id === 77)?.windowId).toBe(2);
+    expect(h.chrome.tabs.update).toHaveBeenCalledWith(77, { active: true });
+    for (const call of h.chrome.windows.update.mock.calls) expect(call[1]).not.toHaveProperty('focused');
+    expect(h.tabs.find((t) => t.id === leaseTab)?.windowId).toBe(50);
+    expect(mod.__test__.getDedicatedSlot('semrush')?.evictedTabs).toBe(1);
+    // The dedicated window never becomes "borrowed" because of a foreign tab.
+    expect(mod.__test__.getDedicatedSlot('semrush')?.windowId).toBe(50);
+  });
+
+  it('never evicts into a dedicated window even when it was the last focused one', async () => {
+    const h = dedicatedHarness();
+    vi.stubGlobal('chrome', h.chrome);
+    const mod = await import('./background');
+    useDedicated(mod, browserKey('a'), { windowSlot: 'a' });
+    useDedicated(mod, browserKey('b'), { windowSlot: 'b' });
+    await mod.__test__.resolveTabId(undefined, browserKey('a'), 'https://a.example/');
+    await mod.__test__.resolveTabId(undefined, browserKey('b'), 'https://b.example/');
+    h.setLastFocused(51);
+    h.tabs.push({ id: 77, windowId: 50, url: 'https://news.example/', title: 'news', active: false, status: 'complete', groupId: -1 });
+    expect(await mod.__test__.checkDedicatedForeignTab(77)).toBe('evicted');
+    expect([1, 2]).toContain(h.tabs.find((t) => t.id === 77)?.windowId);
+  });
+
+  it('tolerates foreign tabs when asked, and never hands one to a new session', async () => {
+    const h = dedicatedHarness();
+    vi.stubGlobal('chrome', h.chrome);
+    const mod = await import('./background');
+    const key = browserKey('one');
+    useDedicated(mod, key, { foreignTabPolicy: 'tolerate' });
+    const first = await mod.__test__.resolveTabId(undefined, key, 'https://one.example/');
+    h.tabs.push({ id: 77, windowId: 50, url: 'about:blank', title: 'blank', active: false, status: 'complete', groupId: -1 });
+    expect(await mod.__test__.checkDedicatedForeignTab(77)).toBe('tolerated');
+    expect(h.tabs.find((t) => t.id === 77)?.windowId).toBe(50);
+
+    await mod.__test__.releaseLease(key, 'test');
+    // The last lease leaves a placeholder instead of closing the window.
+    expect(h.chrome.tabs.update).toHaveBeenCalledWith(first, { url: 'about:blank#opencli-dedicated=default' });
+    expect(h.chrome.tabs.remove).not.toHaveBeenCalledWith(first);
+    expect(h.chrome.windows.remove).not.toHaveBeenCalled();
+    expect(mod.__test__.getDedicatedSlot()?.placeholderTabIds).toEqual([first]);
+
+    const two = browserKey('two');
+    useDedicated(mod, two);
+    const second = await mod.__test__.resolveTabId(undefined, two, 'https://two.example/');
+    expect(second).toBe(first);
+    expect(second).not.toBe(77);
+    expect(h.chrome.windows.create).toHaveBeenCalledTimes(1);
+  });
+
+  it('lets a lease tab dragged out of the dedicated window become the person\'s', async () => {
+    const h = dedicatedHarness();
+    vi.stubGlobal('chrome', h.chrome);
+    const mod = await import('./background');
+    const key = browserKey('semrush');
+    useDedicated(mod, key);
+    const tabId = await mod.__test__.resolveTabId(undefined, key, 'https://www.semrush.com/');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    // Wait out our own grouping moves so this reads as the person's drag.
+    await new Promise((resolve) => setTimeout(resolve, 2100));
+    h.tabs.find((t) => t.id === tabId)!.windowId = 2;
+
+    await mod.__test__.handleTabAttached(tabId, { newWindowId: 2 });
+
+    expect(mod.__test__.getSession(key)).toBeNull();
+    expect(h.chrome.tabs.remove).not.toHaveBeenCalledWith(tabId);
+  }, 10_000);
+
+  it('recreates a closed dedicated window on the next command with the same placement', async () => {
+    const h = dedicatedHarness();
+    vi.stubGlobal('chrome', h.chrome);
+    const mod = await import('./background');
+    const key = browserKey('semrush');
+    useDedicated(mod, key, { windowSlot: 'semrush', windowDisplay: '虚拟' });
+    await mod.__test__.resolveTabId(undefined, key, 'https://www.semrush.com/');
+    await h.closeWindow(50);
+    expect(mod.__test__.getDedicatedSlot('semrush')?.windowId).toBeNull();
+    expect(mod.__test__.getSession(key)).toBeNull();
+
+    mod.__test__.sessionOverrides.set(key, { windowMode: 'dedicated', windowSlot: 'semrush' });
+    const tabId = await mod.__test__.resolveTabId(undefined, key, 'https://www.semrush.com/');
+    expect(h.chrome.windows.create).toHaveBeenCalledTimes(2);
+    expect(h.chrome.windows.create.mock.calls[1][0]).toMatchObject({ left: -2560, top: -1380, focused: false });
+    expect(h.tabs.find((t) => t.id === tabId)?.windowId).toBe(51);
+  });
+
+  it('keeps default-mode and isolated sessions out of the dedicated window', async () => {
+    const h = dedicatedHarness();
+    vi.stubGlobal('chrome', h.chrome);
+    const mod = await import('./background');
+    useDedicated(mod, browserKey('semrush'));
+    await mod.__test__.resolveTabId(undefined, browserKey('semrush'), 'https://www.semrush.com/');
+    // The person clicked the dedicated window once; it is now "last focused".
+    h.setLastFocused(50);
+
+    const bg = await mod.__test__.resolveTabId(undefined, browserKey('recon'), 'https://recon.example/');
+    expect(h.tabs.find((t) => t.id === bg)?.windowId).not.toBe(50);
+
+    mod.__test__.sessionOverrides.set(browserKey('iso'), { windowMode: 'isolated' });
+    const iso = await mod.__test__.resolveTabId(undefined, browserKey('iso'), 'https://iso.example/');
+    expect(h.tabs.find((t) => t.id === iso)?.windowId).not.toBe(50);
+    expect(mod.__test__.getDedicatedSlot()?.windowId).toBe(50);
+  });
+
+  it('reports dedicated windows through sessions window-status and the session list', async () => {
+    const h = dedicatedHarness();
+    vi.stubGlobal('chrome', h.chrome);
+    const mod = await import('./background');
+    const key = browserKey('semrush');
+    useDedicated(mod, key, { windowSlot: 'semrush', windowDisplay: '虚拟' });
+    const tabId = await mod.__test__.resolveTabId(undefined, key, 'https://www.semrush.com/');
+    h.tabs.push({ id: 77, windowId: 50, url: 'https://secret.example/?token=1', title: 'secret', active: false, status: 'complete', groupId: -1 });
+
+    const status = await mod.__test__.handleSessions({ id: 's', action: 'sessions', op: 'window-status' } as never);
+    expect(status.ok).toBe(true);
+    const data = status.data as any;
+    expect(data).toMatchObject({ supported: true, protocol: 1 });
+    expect(data.capabilities).toContain('dedicated-window');
+    expect(data.displays).toHaveLength(2);
+    expect(data.windows).toEqual([expect.objectContaining({
+      slot: 'semrush', windowId: 50, exists: true, onDisplay: true,
+      bounds: { left: -2560, top: -1380, width: 1280, height: 900 },
+      activeTab: expect.objectContaining({ tabId, owner: 'lease', session: 'semrush' }),
+      tabs: expect.objectContaining({ leases: 1, foreign: 1 }),
+      sessions: ['semrush'], foreignTabPolicy: 'evict', autoSelect: true,
+    })]);
+    expect(JSON.stringify(data)).not.toContain('secret');
+
+    const listed = await mod.__test__.handleSessions({ id: 'l', action: 'sessions', op: 'list' } as never);
+    expect(listed.data).toEqual([expect.objectContaining({ session: 'semrush', dedicatedSlot: 'semrush', tabActive: true, windowId: 50 })]);
+  });
+
+  it('window-ensure creates or moves the window back onto its display without focusing', async () => {
+    const h = dedicatedHarness();
+    vi.stubGlobal('chrome', h.chrome);
+    const mod = await import('./background');
+    const ensure = (fields: Record<string, unknown>) => mod.__test__.handleSessions({ id: 'e', action: 'sessions', op: 'window-ensure', ...fields } as never);
+
+    const created = (await ensure({ windowSlot: 'semrush', windowDisplay: '虚拟' })).data as any;
+    expect(created).toMatchObject({ slot: 'semrush', created: true, moved: false, onDisplay: true });
+
+    // Dragged back to the main screen by hand.
+    Object.assign(h.windows.get(50)!, { left: 100, top: 100 });
+    const moved = (await ensure({ windowSlot: 'semrush' })).data as any;
+    expect(moved).toMatchObject({ created: false, moved: true, onDisplay: true });
+    expect(h.chrome.windows.update).toHaveBeenCalledWith(50, { left: -2560, top: -1380, width: 1280, height: 900 });
+
+    // Nudged within the display: left alone.
+    Object.assign(h.windows.get(50)!, { left: -2400, top: -1300 });
+    h.chrome.windows.update.mockClear();
+    expect(((await ensure({ windowSlot: 'semrush' })).data as any).moved).toBe(false);
+    expect(h.chrome.windows.update).not.toHaveBeenCalled();
+
+    const missing = (await ensure({ windowSlot: 'other', windowDisplay: 'no-such-display' })).data as any;
+    expect(missing).toMatchObject({ created: true, placement: expect.objectContaining({ displayFound: false }), onDisplay: false });
+    expect(h.chrome.windows.create.mock.calls[1][0]).not.toHaveProperty('left');
+    expect(h.chrome.windows.create.mock.calls[1][0]).toMatchObject({ focused: false });
+  });
+
+  it('reports displays as unavailable when chrome.system.display is missing', async () => {
+    const h = dedicatedHarness({ withDisplayApi: false });
+    vi.stubGlobal('chrome', h.chrome);
+    const mod = await import('./background');
+    const status = (await mod.__test__.handleSessions({ id: 's', action: 'sessions', op: 'window-status' } as never)).data as any;
+    expect(status.displays).toBeNull();
+    expect(status.displaysError).toMatch(/system\.display/);
+  });
+
+  it('restores the dedicated slot after a service-worker restart', async () => {
+    const h = dedicatedHarness();
+    vi.stubGlobal('chrome', h.chrome);
+    const mod = await import('./background');
+    const key = browserKey('semrush');
+    useDedicated(mod, key, { windowSlot: 'semrush', windowBounds: { left: -2480, top: -1380, width: 1280, height: 900 } });
+    const tabId = await mod.__test__.resolveTabId(undefined, key, 'https://www.semrush.com/');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    vi.resetModules();
+    const restarted = await import('./background');
+    await restarted.__test__.reconcileTargetLeaseRegistry();
+    expect(restarted.__test__.getDedicatedSlot('semrush')).toMatchObject({ windowId: 50, placement: { source: 'bounds' } });
+    expect(restarted.__test__.getSession(key)).toMatchObject({ preferredTabId: tabId, windowId: 50 });
+    // The restored lease is not re-adopted into a role container.
+    expect(restarted.__test__.getContainer('interactive').windowId).not.toBe(50);
+  });
+
+  it('keeps the four existing window modes unaware of dedicated state', async () => {
+    const h = dedicatedHarness();
+    vi.stubGlobal('chrome', h.chrome);
+    const mod = await import('./background');
+    const tabId = await mod.__test__.resolveTabId(undefined, browserKey('plain'), 'https://plain.example/');
+    expect(h.tabs.find((t) => t.id === tabId)?.windowId).toBe(2);
+    expect(mod.__test__.getDedicatedSlot()).toBeNull();
+    expect(h.chrome.system.display.getInfo).not.toHaveBeenCalled();
+  });
+});
+
+describe('dedicated automation window — review regressions', () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.useRealTimers();
+    MockWebSocket.instances = [];
+    vi.stubGlobal('WebSocket', MockWebSocket);
+    vi.stubGlobal('fetch', vi.fn(() => new Promise(() => {})));
+  });
+  afterEach(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    vi.unstubAllGlobals();
+  });
+  const useDedicated = (mod: any, key: string, fields: Record<string, unknown> = {}) => {
+    mod.__test__.sessionOverrides.set(key, { windowMode: 'dedicated' });
+    mod.__test__.applyDedicatedCommandFields(key, { id: 'x', action: 'exec', windowMode: 'dedicated', ...fields });
+  };
+  // tabs.remove that behaves like Chrome: the tab goes away, an emptied window closes.
+  const realRemove = (h: any) => {
+    h.chrome.tabs.remove = vi.fn(async (tabId: number) => {
+      const i = h.tabs.findIndex((t: any) => t.id === tabId);
+      if (i < 0) throw new Error(`No tab with id: ${tabId}`);
+      const [tab] = h.tabs.splice(i, 1);
+      for (const c of h.chrome.tabs.onRemoved.addListener.mock.calls) await c[0](tabId);
+      if (!h.tabs.some((t: any) => t.windowId === tab.windowId)) await h.closeWindow(tab.windowId);
+    });
+  };
+
+  it('treats a tab opened by an automation child as automation too (opener chain)', async () => {
+    const h = dedicatedHarness();
+    vi.stubGlobal('chrome', h.chrome);
+    const mod: any = await import('./background');
+    const key = browserKey('s');
+    useDedicated(mod, key);
+    const lease = await mod.__test__.resolveTabId(undefined, key, 'https://app.example/');
+    h.tabs.push({ id: 78, windowId: 50, url: 'https://app.example/child', active: false, status: 'complete', groupId: -1, openerTabId: lease } as any);
+    h.tabs.push({ id: 79, windowId: 50, url: 'https://sso.example/login', active: false, status: 'complete', groupId: -1, openerTabId: 78 } as any);
+    expect(await mod.__test__.checkDedicatedForeignTab(78)).toBe('ours');
+    expect(await mod.__test__.checkDedicatedForeignTab(79)).toBe('ours');
+    expect(h.tabs.find((t) => t.id === 79)?.windowId).toBe(50);
+  });
+
+  it('keeps the window when two leases of one slot are released at the same time', async () => {
+    const h = dedicatedHarness();
+    vi.stubGlobal('chrome', h.chrome);
+    const mod: any = await import('./background');
+    const a = browserKey('a'); const b = browserKey('b');
+    useDedicated(mod, a); useDedicated(mod, b);
+    await mod.__test__.resolveTabId(undefined, a, 'https://a.example/');
+    await mod.__test__.resolveTabId(undefined, b, 'https://b.example/');
+    realRemove(h);
+    await Promise.all([mod.__test__.releaseLease(a, 'idle timeout'), mod.__test__.releaseLease(b, 'idle timeout')]);
+    expect(h.windows.has(50)).toBe(true);
+    expect(h.tabs.filter((t) => t.windowId === 50)).toHaveLength(1);
+    expect(mod.__test__.getDedicatedSlot()?.placeholderTabIds).toHaveLength(1);
+  });
+
+  it('never hands out a placeholder the person has navigated to their own page', async () => {
+    const h = dedicatedHarness();
+    vi.stubGlobal('chrome', h.chrome);
+    const mod: any = await import('./background');
+    const one = browserKey('one');
+    useDedicated(mod, one);
+    const first = await mod.__test__.resolveTabId(undefined, one, 'https://one.example/');
+    await mod.__test__.releaseLease(one, 'test');
+    h.tabs.find((t) => t.id === first)!.url = 'https://mail.example/inbox/draft';
+    const two = browserKey('two');
+    useDedicated(mod, two);
+    const second = await mod.__test__.resolveTabId(undefined, two, 'https://two.example/');
+    expect(second).not.toBe(first);
+    expect(h.tabs.find((t) => t.id === first)?.url).toBe('https://mail.example/inbox/draft');
+  });
+
+  it('keeps the lease when moving its tab empties (and closes) the source window', async () => {
+    const h = dedicatedHarness();
+    for (let i = h.tabs.length - 1; i >= 0; i -= 1) if (h.tabs[i].windowId === 1) h.tabs.splice(i, 1);
+    h.tabs.push({ id: 40, windowId: 1, url: 'https://app.example/x', active: true, status: 'complete', groupId: -1 });
+    const origMove = h.chrome.tabs.move;
+    h.chrome.tabs.move = vi.fn(async (tabId: number, props: any) => {
+      const from = h.tabs.find((t) => t.id === tabId)!.windowId;
+      const res = await origMove(tabId, props);
+      if (!h.tabs.some((t) => t.windowId === from)) {
+        h.windows.delete(from);
+        Promise.resolve().then(() => { for (const c of h.chrome.windows.onRemoved.addListener.mock.calls) void c[0](from); });
+      }
+      return res;
+    });
+    vi.stubGlobal('chrome', h.chrome);
+    const mod: any = await import('./background');
+    const key = browserKey('s');
+    mod.__test__.setSession(key, { windowId: 1, owned: true, preferredTabId: 40 });
+    useDedicated(mod, key);
+    await mod.__test__.resolveTabId(undefined, key);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(mod.__test__.getSession(key)).toMatchObject({ preferredTabId: 40, windowId: 50 });
+  });
+
+  it('gives concurrently ensured slots on one display different tiles', async () => {
+    const h = dedicatedHarness();
+    vi.stubGlobal('chrome', h.chrome);
+    const mod: any = await import('./background');
+    const ensure = (slot: string) => mod.__test__.handleSessions({ id: slot, action: 'sessions', op: 'window-ensure', windowSlot: slot, windowDisplay: '虚拟' });
+    await Promise.all([ensure('semrush'), ensure('similarweb')]);
+    const rects = h.chrome.windows.create.mock.calls.map((x: any) => [x[0].left, x[0].top]);
+    expect(rects[0]).not.toEqual(rects[1]);
+  });
+
+  it('replaces earlier bounds when a later command asks for a display', async () => {
+    const h = dedicatedHarness();
+    vi.stubGlobal('chrome', h.chrome);
+    const mod: any = await import('./background');
+    const key = browserKey('s');
+    useDedicated(mod, key, { windowBounds: { left: 10, top: 10, width: 800, height: 600 } });
+    mod.__test__.applyDedicatedCommandFields(key, { id: 'y', action: 'exec', windowMode: 'dedicated', windowDisplay: '虚拟' });
+    await mod.__test__.resolveTabId(undefined, key, 'https://a.example/');
+    expect(h.chrome.windows.create.mock.calls[0][0]).toMatchObject({ left: -2560, top: -1380 });
+  });
+
+  it('forgets a placeholder of slot A once it is dragged into slot B\'s window', async () => {
+    const h = dedicatedHarness();
+    vi.stubGlobal('chrome', h.chrome);
+    const mod: any = await import('./background');
+    await mod.__test__.handleSessions({ id: 'e', action: 'sessions', op: 'window-ensure', windowSlot: 'A' });
+    await mod.__test__.handleSessions({ id: 'e', action: 'sessions', op: 'window-ensure', windowSlot: 'B' });
+    const pA = mod.__test__.getDedicatedSlot('A').placeholderTabIds[0];
+    h.tabs.find((t) => t.id === pA)!.windowId = 51;
+    mod.__test__.setForeignTabSettleMs(0);
+    await mod.__test__.handleTabAttached(pA, { newWindowId: 51 });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(mod.__test__.getDedicatedSlot('A').placeholderTabIds).not.toContain(pA);
+    expect([1, 2]).toContain(h.tabs.find((t) => t.id === pA)?.windowId);
+  });
+
+  it('adopts its marked window after an extension reload wiped session storage', async () => {
+    const h = dedicatedHarness();
+    vi.stubGlobal('chrome', h.chrome);
+    const mod: any = await import('./background');
+    await mod.__test__.handleSessions({ id: 'e', action: 'sessions', op: 'window-ensure', windowSlot: 'semrush' });
+    expect(h.tabs.find((t) => t.windowId === 50)?.url).toBe('about:blank#opencli-dedicated=semrush');
+    for (const key of Object.keys((await h.chrome.storage.session.get(null as any)) ?? {})) void key;
+    vi.resetModules();
+    // Reload: storage.session is cleared.
+    h.chrome.storage.session.get = vi.fn(async (key: string) => ({ [key]: undefined }));
+    h.chrome.tabs.query = vi.fn(async (q: any = {}) => h.tabs.filter((t) => q.windowId === undefined || t.windowId === q.windowId));
+    const reloaded: any = await import('./background');
+    await reloaded.__test__.reconcileTargetLeaseRegistry();
+    const res = (await reloaded.__test__.handleSessions({ id: 'e2', action: 'sessions', op: 'window-ensure', windowSlot: 'semrush' })).data;
+    expect(res).toMatchObject({ windowId: 50, created: false });
+    expect(h.chrome.windows.create).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not move a fullscreen or minimized dedicated window', async () => {
+    const h = dedicatedHarness();
+    vi.stubGlobal('chrome', h.chrome);
+    const mod: any = await import('./background');
+    await mod.__test__.handleSessions({ id: 'e', action: 'sessions', op: 'window-ensure', windowSlot: 's', windowDisplay: '虚拟' });
+    Object.assign(h.windows.get(50)!, { left: 0, top: 0, state: 'fullscreen' });
+    const res = (await mod.__test__.handleSessions({ id: 'e', action: 'sessions', op: 'window-ensure', windowSlot: 's' })).data;
+    expect(res).toMatchObject({ moved: false, state: 'fullscreen', onDisplay: false });
+    expect(h.chrome.windows.update).not.toHaveBeenCalled();
+  });
+});

@@ -41,8 +41,11 @@ export interface Command {
   siteSession?: 'ephemeral' | 'persistent';
   /** URL to navigate to (navigate action) */
   url?: string;
-  /** Sub-operation for tabs: list, new, close, select */
-  op?: 'list' | 'new' | 'close' | 'select';
+  /**
+   * Sub-operation. tabs: list, new, close, select. sessions: list (default),
+   * cleanup, window-status, window-ensure (dedicated automation windows).
+   */
+  op?: 'list' | 'new' | 'close' | 'select' | 'cleanup' | 'window-status' | 'window-ensure';
   /** Tab index for tabs select/close */
   index?: number;
   /** Cookie domain filter */
@@ -79,7 +82,20 @@ export interface Command {
   /** CDP method params for 'cdp' action */
   cdpParams?: Record<string, unknown>;
   /** Window foreground/background policy for owned Browser Bridge containers. */
-  windowMode?: 'foreground' | 'active' | 'background' | 'isolated';
+  windowMode?: 'foreground' | 'active' | 'background' | 'isolated' | 'dedicated';
+  /**
+   * `dedicated` only: which OpenCLI-dedicated window (slot) the session lives in.
+   * One window per slot; default 'default'. Also read by sessions window-status/window-ensure.
+   */
+  windowSlot?: string;
+  /** `dedicated` only: screen rectangle for the dedicated window (screen DIPs, same space as chrome.windows). */
+  windowBounds?: { left: number; top: number; width: number; height: number };
+  /** `dedicated` only: display-name pattern ('/re/flags' or case-insensitive substring) to place the window on. */
+  windowDisplay?: string;
+  /** `dedicated` only: make the session tab the active tab of its dedicated window before each command (default true). */
+  autoSelect?: boolean;
+  /** `dedicated` only: what to do with tabs OpenCLI did not open that appear in a dedicated window (default 'evict'). */
+  foreignTabPolicy?: 'evict' | 'tolerate';
   /** Custom idle timeout in seconds for this session. Overrides the default. */
   idleTimeout?: number;
   /** Frame index for cross-frame operations (0-based, from 'frames' action) */
