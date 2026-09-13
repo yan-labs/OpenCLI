@@ -70,7 +70,7 @@ These appear on any adapter that talks to Chrome, plus all `opencli browser` sub
 
 | flag | effect |
 |------|--------|
-| `--window <mode>` | `foreground` or `background`. **Use `background` for agent work** — it runs the real logged-in Chrome without raising the window or stealing focus. Not headless: `navigator.webdriver` is `false`, plugins are present, `visibilityState` is `visible`. Override globally with `OPENCLI_WINDOW=background`. |
+| `--window <mode>` | `background` (default), `active`, `foreground`, `isolated`, or `dedicated`. **Use `background` for most agent work** — it never raises the window or selects the tab, so `visibilityState` stays `hidden`. `active` makes the tab the active tab of its own window without raising that window (`visibilityState` is `visible` only while the window isn't fully covered by another app). `foreground` raises the window to the OS foreground — interrupts the user, use only when they need to watch. `isolated` is `background` in its own separate window. `dedicated` keeps the session in a named automation window, in this same Chrome and profile, that is never focused; auto-select still makes its tab that window's active tab before each command, so it renders `visible` without stealing focus — see "Avoiding focus stealing" below. None of these are headless: `navigator.webdriver` is `false` and plugins are present regardless of mode. Override globally with `OPENCLI_WINDOW=<mode>`. |
 | `--site-session <mode>` | `ephemeral` (default) or `persistent`. Persistent keeps the browser session tab alive after the command finishes; ephemeral releases it. |
 | `--keep-tab <bool>` | `true` or `false`. Keep the browser tab lease after the command finishes. |
 
@@ -99,7 +99,20 @@ opencli google search "test" --window background
 export OPENCLI_WINDOW=background
 ```
 
-Background mode is **not** headless — it uses the real logged-in Chrome with all cookies, plugins, and a `visible` visibility state. Sites cannot distinguish it from foreground use. There is no reason to use foreground mode for automated work; request foreground only when the user explicitly wants to watch.
+Background mode is **not** headless — it uses the real logged-in Chrome with all cookies and plugins, and `navigator.webdriver` is `false`. That's a separate axis from visibility, though: a `background` tab's `visibilityState` is always `hidden` — it is never the active tab of its window and its window is never raised. There is no reason to use foreground mode for automated work; request foreground only when the user explicitly wants to watch.
+
+### Getting a visible tab without stealing focus
+
+`active` and `foreground` do give you `visibilityState: visible`, but only while their window isn't fully covered by another app — once something else fully occludes it, Chrome marks even the active tab `hidden` after a few seconds (a non-active tab is always `hidden`), which can stall lazy-loaded content or a `requestAnimationFrame` loop that depends on staying visible.
+
+When you need a tab that renders visibly and must never interrupt the user, reach for `dedicated` mode instead:
+
+```bash
+export OPENCLI_WINDOW=dedicated
+export OPENCLI_WINDOW_DISPLAY="<virtual-display-name-pattern>"
+```
+
+This places the session's window on a display (or tiled cell on one) that nobody is looking at — still the same Chrome, same profile as the user, just a separate window that is created unfocused and never raised. Auto-select (on by default) makes the session's tab that window's active tab before every page-scoped command, so `visibilityState` reads `visible` on a window that never reaches the OS foreground. See the `opencli-browser` skill and `opencli browser window status` for the full dedicated-window interface (slots, bounds, display matching, foreign-tab handling).
 
 The `--window` flag sits **between the session name and the subcommand** for `opencli browser`:
 ```bash
@@ -115,7 +128,12 @@ opencli browser <session> <command> --window background   # also works
 | `OPENCLI_BROWSER_COMMAND_TIMEOUT` | `60` | Per-command timeout. |
 | `OPENCLI_CDP_ENDPOINT` | — | Manual CDP endpoint override (dev / remote Chrome / Electron). |
 | `OPENCLI_CACHE_DIR` | `~/.opencli/cache` | Network capture + browser-state cache. |
-| `OPENCLI_WINDOW` | command-specific | `foreground` or `background` browser window mode. |
+| `OPENCLI_WINDOW` | command-specific | `foreground`, `active`, `background`, `isolated`, or `dedicated` browser window mode. |
+| `OPENCLI_WINDOW_SLOT` | `default` | Named dedicated-window slot (`dedicated` mode only); use a different slot per session that needs concurrent visibility. |
+| `OPENCLI_WINDOW_BOUNDS` | — | `x,y,w,h` integers; explicit placement for the dedicated window. |
+| `OPENCLI_WINDOW_DISPLAY` | — | Display-name pattern (`/re/flags` or substring); tiles the dedicated window onto the matching display. |
+| `OPENCLI_WINDOW_AUTOSELECT` | `on` | `1/0/true/false/on/off`; `dedicated` mode only — whether the session's tab is made the window's active tab before every page-scoped command. |
+| `OPENCLI_DEDICATED_FOREIGN_TABS` | `evict` | `evict` or `tolerate`; how a dedicated window handles a tab that wasn't opened by OpenCLI. |
 | `OPENCLI_VERBOSE` | `false` | Verbose logging (also triggered by `-v`). |
 
 ## Browser batch — multiple operations in one call
