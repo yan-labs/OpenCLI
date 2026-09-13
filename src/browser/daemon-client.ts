@@ -22,6 +22,10 @@ import {
   type DaemonHealth,
   type DaemonStatus,
 } from './daemon-transport.js';
+import {
+  resolveDedicatedPlacement,
+  type DedicatedWindowPlacementOverride,
+} from './window-placement.js';
 
 let _idCounter = 0;
 
@@ -63,6 +67,21 @@ export function setDaemonRunContext(ctx: DaemonRunContext | null): void {
  */
 export function clearDaemonRunContext(runId: string): void {
   if (_runContext?.runId === runId) _runContext = null;
+}
+
+/**
+ * In-process override for dedicated-window placement, set once per CLI
+ * invocation from the `opencli browser` group options (--window-slot /
+ * --window-bounds / --window-display) in browserAction(). Sits between the
+ * per-call `params` passed to sendCommandRaw (highest precedence) and the
+ * OPENCLI_WINDOW_* environment variables (lowest). Null when unset — callers
+ * must clear it in a `finally` (mirroring setDaemonRunContext) so it never
+ * leaks into a later command in the same process (notably across test cases).
+ */
+let _windowPlacementOverride: DedicatedWindowPlacementOverride | null = null;
+
+export function setDaemonWindowPlacement(override: DedicatedWindowPlacementOverride | null): void {
+  _windowPlacementOverride = override;
 }
 
 /**
@@ -238,7 +257,17 @@ export interface DaemonCommand {
   cdpMethod?: string;
   cdpParams?: Record<string, unknown>;
   /** Window foreground/background policy for owned Browser Bridge containers. */
-  windowMode?: 'foreground' | 'active' | 'background' | 'isolated';
+  windowMode?: 'foreground' | 'active' | 'background' | 'isolated' | 'dedicated';
+  /** Dedicated-window slot name (default 'default'). Only meaningful when windowMode is 'dedicated', or for the sessions op window-status/window-ensure. */
+  windowSlot?: string;
+  /** Explicit dedicated-window placement. Takes precedence over windowDisplay. */
+  windowBounds?: { left: number; top: number; width: number; height: number };
+  /** Dedicated-window display-name pattern ('/re/flags' or case-insensitive substring). Used when windowBounds is absent. */
+  windowDisplay?: string;
+  /** Auto-select the session's tab in its dedicated window before every page-scoped command. Default true when dedicated (applied by the extension when omitted). */
+  autoSelect?: boolean;
+  /** Policy for tabs that appear in a dedicated window without being opened by OpenCLI. Default 'evict' (applied by the extension when omitted). */
+  foreignTabPolicy?: 'evict' | 'tolerate';
   /** Custom idle timeout in seconds for this session. Overrides the default. */
   idleTimeout?: number;
   /** Frame index for cross-frame operations (0-based, from 'frames' action) */
@@ -314,6 +343,21 @@ export {
   type DaemonStatus,
 };
 
+const VALID_ENV_WINDOW_MODES = new Set(['foreground', 'active', 'background', 'isolated', 'dedicated']);
+
+/**
+ * Parse the OPENCLI_WINDOW env fallback used when a caller of sendCommand/
+ * browserSession does not pass an explicit `windowMode` (e.g. a direct
+ * library consumer, bypassing the CLI's own OPENCLI_WINDOW validation in
+ * cli.ts/execution.ts). Recognizes all five modes and throws naming the
+ * variable on an invalid non-empty value, matching those two layers.
+ */
+function parseEnvWindowMode(raw: string | undefined): DaemonCommand['windowMode'] {
+  if (raw === undefined || raw === '') return undefined;
+  if (VALID_ENV_WINDOW_MODES.has(raw)) return raw as DaemonCommand['windowMode'];
+  throw new Error(`OPENCLI_WINDOW must be one of: foreground, active, background, isolated, dedicated. Received: "${raw}"`);
+}
+
 /**
  * Internal: send a command to the daemon and return the raw `DaemonResult`.
  *
@@ -343,9 +387,7 @@ async function sendCommandRaw(
   const timeoutSeconds = effectiveCommandTimeoutSeconds(params);
   let deadlineAt = Date.now() + timeoutSeconds * 1000;
   const rawWindowMode = process.env.OPENCLI_WINDOW;
-  const envWindowMode = rawWindowMode === 'foreground' || rawWindowMode === 'active' || rawWindowMode === 'background'
-    ? rawWindowMode
-    : undefined;
+  const envWindowMode = parseEnvWindowMode(rawWindowMode);
   // Requirement vs preference: an explicit contextId routes strictly; a
   // preferred one is arbitrated by the daemon against live connections.
   const routing = params.contextId || params.preferredContextId
@@ -354,6 +396,21 @@ async function sendCommandRaw(
   const contextId = routing.contextId;
   const preferredContextId = routing.preferredContextId;
   const windowMode = params.windowMode ?? envWindowMode;
+
+  // The two session-independent window ops always carry placement (that IS
+  // their payload); every other command carries it only in dedicated mode.
+  // Env parsing (and its "invalid value" errors) only runs when the fields
+  // are actually going to be used, so an unrelated command never fails
+  // because of a stale/malformed OPENCLI_WINDOW_BOUNDS left in the shell.
+  const isWindowOp = action === 'sessions' && (params.op === 'window-status' || params.op === 'window-ensure');
+  const placement = windowMode === 'dedicated' || isWindowOp
+    ? resolveDedicatedPlacement(process.env, _windowPlacementOverride)
+    : {};
+  const windowSlot = params.windowSlot ?? placement.windowSlot;
+  const windowBounds = params.windowBounds ?? placement.windowBounds;
+  const windowDisplay = params.windowDisplay ?? placement.windowDisplay;
+  const autoSelect = params.autoSelect ?? placement.autoSelect;
+  const foreignTabPolicy = params.foreignTabPolicy ?? placement.foreignTabPolicy;
 
   let id = generateId();
   let ensureUsed = false;
@@ -397,6 +454,11 @@ async function sendCommandRaw(
       ...(contextId && { contextId }),
       ...(preferredContextId && { preferredContextId }),
       ...(windowMode && { windowMode }),
+      ...(windowSlot !== undefined && { windowSlot }),
+      ...(windowBounds !== undefined && { windowBounds }),
+      ...(windowDisplay !== undefined && { windowDisplay }),
+      ...(autoSelect !== undefined && { autoSelect }),
+      ...(foreignTabPolicy !== undefined && { foreignTabPolicy }),
       // Carry the run identity so the daemon can acquire/refresh a write lease.
       // The same runId across every daemon command in one CLI invocation is the
       // heartbeat that keeps a long-running holder alive.

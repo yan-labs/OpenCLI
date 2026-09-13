@@ -235,11 +235,75 @@ describe('rewriteBrowserArgv', () => {
       'dialog', 'drag', 'eval', 'extract', 'fill', 'find', 'focus', 'frames',
       'get', 'hover', 'init', 'keys', 'network', 'open', 'screenshot', 'scroll',
       'select', 'state', 'tab', 'type', 'unbind', 'uncheck', 'upload', 'verify',
-      'wait',
+      'wait', 'window',
     ];
     for (const name of required) {
       expect(names.has(name)).toBe(true);
     }
+  });
+
+  describe('`window` — session-independent dedicated-window command', () => {
+    it('routes `browser window status -f json` without inserting --session (window is reserved, like sessions/cleanup)', () => {
+      expect(rewriteBrowserArgv(['browser', 'window', 'status', '-f', 'json'])).toEqual([
+        'browser', 'window', 'status', '-f', 'json',
+      ]);
+    });
+
+    it('routes `browser window ensure --slot semrush --display 虚拟 -f json`', () => {
+      expect(rewriteBrowserArgv(['browser', 'window', 'ensure', '--slot', 'semrush', '--display', '虚拟', '-f', 'json'])).toEqual([
+        'browser', 'window', 'ensure', '--slot', 'semrush', '--display', '虚拟', '-f', 'json',
+      ]);
+    });
+
+    it('routes bare `browser window` (defaults to status)', () => {
+      expect(rewriteBrowserArgv(['browser', 'window'])).toEqual(['browser', 'window']);
+    });
+
+    it('does not affect a real session named anything other than "window"', () => {
+      expect(rewriteBrowserArgv(['browser', 'mywindowish', 'open', 'https://x.com'])).toEqual([
+        'browser', '--session', 'mywindowish', 'open', 'https://x.com',
+      ]);
+      expect(rewriteBrowserArgv(['browser', 'semrush', 'window', 'ensure'])).toEqual([
+        'browser', '--session', 'semrush', 'window', 'ensure',
+      ]);
+    });
+  });
+
+  describe('hoisting --window-slot / --window-bounds / --window-display', () => {
+    it('hoists a trailing --window-slot to the namespace slot', () => {
+      expect(rewriteBrowserArgv(['browser', 'work', 'open', 'https://x.com', '--window-slot', 'semrush'])).toEqual([
+        'browser', '--session', 'work', '--window-slot', 'semrush', 'open', 'https://x.com',
+      ]);
+    });
+
+    it('hoists trailing --window, --window-slot, --window-bounds and --window-display together, in encounter order', () => {
+      expect(rewriteBrowserArgv([
+        'browser', 'work', 'open', 'https://x.com',
+        '--window', 'dedicated', '--window-slot', 'semrush', '--window-bounds', '0,0,1280,900', '--window-display', 'virtual',
+      ])).toEqual([
+        'browser', '--session', 'work',
+        '--window', 'dedicated', '--window-slot', 'semrush', '--window-bounds', '0,0,1280,900', '--window-display', 'virtual',
+        'open', 'https://x.com',
+      ]);
+    });
+
+    it('hoists the --window-bounds=<value> form', () => {
+      expect(rewriteBrowserArgv(['browser', 'work', 'open', 'https://x.com', '--window-bounds=0,0,1280,900'])).toEqual([
+        'browser', '--session', 'work', '--window-bounds=0,0,1280,900', 'open', 'https://x.com',
+      ]);
+    });
+
+    it('does not hoist a bare trailing --window-display without a value', () => {
+      expect(rewriteBrowserArgv(['browser', 'work', 'open', 'https://x.com', '--window-display'])).toEqual([
+        'browser', '--session', 'work', 'open', 'https://x.com', '--window-display',
+      ]);
+    });
+
+    it('does not hoist past a literal -- separator', () => {
+      expect(rewriteBrowserArgv(['browser', 'work', 'eval', 'console.log(1)', '--', '--window-slot', 'semrush'])).toEqual([
+        'browser', '--session', 'work', 'eval', 'console.log(1)', '--', '--window-slot', 'semrush',
+      ]);
+    });
   });
 });
 

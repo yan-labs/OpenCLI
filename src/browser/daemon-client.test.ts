@@ -11,6 +11,7 @@ import {
   sendCommandFull,
   setDaemonCommandTimeoutSeconds,
   setDaemonRunContext,
+  setDaemonWindowPlacement,
 } from './daemon-client.js';
 import * as daemonLifecycle from './daemon-lifecycle.js';
 
@@ -23,6 +24,7 @@ describe('daemon-client', () => {
     vi.restoreAllMocks();
     vi.unstubAllEnvs();
     setDaemonRunContext(null);
+    setDaemonWindowPlacement(null);
   });
 
   it('fetchDaemonStatus sends the shared status request and returns parsed data', async () => {
@@ -367,6 +369,151 @@ describe('daemon-client', () => {
 
     const body = JSON.parse(String(vi.mocked(fetch).mock.calls[0][1]?.body)) as { windowMode?: string };
     expect(body.windowMode).toBe('background');
+  });
+
+  function mockOkResponse(): void {
+    vi.mocked(fetch).mockResolvedValue({
+      status: 200,
+      json: () => Promise.resolve({ id: 'server', ok: true, data: 'ok' }),
+    } as Response);
+  }
+
+  function lastRequestBody(): Record<string, unknown> {
+    const calls = vi.mocked(fetch).mock.calls;
+    return JSON.parse(String(calls[calls.length - 1][1]?.body)) as Record<string, unknown>;
+  }
+
+  describe('OPENCLI_WINDOW env fallback — all five modes', () => {
+    it.each(['foreground', 'active', 'background', 'isolated', 'dedicated'])('recognizes %s', async (mode) => {
+      vi.stubEnv('OPENCLI_WINDOW', mode);
+      mockOkResponse();
+
+      await sendCommand('exec', { code: '1' });
+
+      expect(lastRequestBody().windowMode).toBe(mode);
+    });
+
+    it('throws naming OPENCLI_WINDOW on an invalid value', async () => {
+      vi.stubEnv('OPENCLI_WINDOW', 'sideways');
+      mockOkResponse();
+
+      await expect(sendCommand('exec', { code: '1' })).rejects.toThrow(/OPENCLI_WINDOW must be one of.*Received: "sideways"/);
+    });
+
+    it('does not throw when OPENCLI_WINDOW is unset and an explicit windowMode is given', async () => {
+      vi.stubEnv('OPENCLI_WINDOW', '');
+      mockOkResponse();
+
+      await expect(sendCommand('exec', { code: '1', windowMode: 'background' })).resolves.toBe('ok');
+    });
+  });
+
+  describe('dedicated-window placement attachment', () => {
+    it('attaches windowSlot/windowBounds/windowDisplay/autoSelect/foreignTabPolicy only when windowMode is dedicated', async () => {
+      vi.stubEnv('OPENCLI_WINDOW_SLOT', 'semrush');
+      vi.stubEnv('OPENCLI_WINDOW_BOUNDS', '0,0,1280,900');
+      vi.stubEnv('OPENCLI_WINDOW_DISPLAY', 'virtual');
+      vi.stubEnv('OPENCLI_WINDOW_AUTOSELECT', 'off');
+      vi.stubEnv('OPENCLI_DEDICATED_FOREIGN_TABS', 'tolerate');
+      mockOkResponse();
+
+      await sendCommand('exec', { code: '1', windowMode: 'dedicated' });
+
+      const body = lastRequestBody();
+      expect(body.windowSlot).toBe('semrush');
+      expect(body.windowBounds).toEqual({ left: 0, top: 0, width: 1280, height: 900 });
+      expect(body.windowDisplay).toBe('virtual');
+      expect(body.autoSelect).toBe(false);
+      expect(body.foreignTabPolicy).toBe('tolerate');
+    });
+
+    it('does NOT attach placement fields for a non-dedicated windowMode, even with every env var set', async () => {
+      vi.stubEnv('OPENCLI_WINDOW_SLOT', 'semrush');
+      vi.stubEnv('OPENCLI_WINDOW_BOUNDS', '0,0,1280,900');
+      vi.stubEnv('OPENCLI_WINDOW_DISPLAY', 'virtual');
+      vi.stubEnv('OPENCLI_WINDOW_AUTOSELECT', 'off');
+      vi.stubEnv('OPENCLI_DEDICATED_FOREIGN_TABS', 'tolerate');
+      mockOkResponse();
+
+      await sendCommand('exec', { code: '1', windowMode: 'background' });
+
+      const body = lastRequestBody();
+      expect(body.windowSlot).toBeUndefined();
+      expect(body.windowBounds).toBeUndefined();
+      expect(body.windowDisplay).toBeUndefined();
+      expect(body.autoSelect).toBeUndefined();
+      expect(body.foreignTabPolicy).toBeUndefined();
+    });
+
+    it('does NOT attach placement fields when nothing (no override, no env) resolves a value, even in dedicated mode', async () => {
+      mockOkResponse();
+
+      await sendCommand('exec', { code: '1', windowMode: 'dedicated' });
+
+      const body = lastRequestBody();
+      expect(body).not.toHaveProperty('windowSlot');
+      expect(body).not.toHaveProperty('windowBounds');
+      expect(body).not.toHaveProperty('windowDisplay');
+      expect(body).not.toHaveProperty('autoSelect');
+      expect(body).not.toHaveProperty('foreignTabPolicy');
+    });
+
+    it('a setDaemonWindowPlacement override wins over env for a dedicated command', async () => {
+      vi.stubEnv('OPENCLI_WINDOW_SLOT', 'from-env');
+      setDaemonWindowPlacement({ slot: 'from-override' });
+      mockOkResponse();
+
+      await sendCommand('exec', { code: '1', windowMode: 'dedicated' });
+
+      expect(lastRequestBody().windowSlot).toBe('from-override');
+    });
+
+    it('explicit params passed to sendCommand win over both the override and env', async () => {
+      vi.stubEnv('OPENCLI_WINDOW_SLOT', 'from-env');
+      setDaemonWindowPlacement({ slot: 'from-override' });
+      mockOkResponse();
+
+      await sendCommand('exec', { code: '1', windowMode: 'dedicated', windowSlot: 'from-params' });
+
+      expect(lastRequestBody().windowSlot).toBe('from-params');
+    });
+
+    it('always attaches placement fields for the sessions window-status op, regardless of windowMode', async () => {
+      vi.stubEnv('OPENCLI_WINDOW_SLOT', 'semrush');
+      mockOkResponse();
+
+      await sendCommand('sessions', { op: 'window-status' });
+
+      expect(lastRequestBody().windowSlot).toBe('semrush');
+    });
+
+    it('always attaches placement fields for the sessions window-ensure op, regardless of windowMode', async () => {
+      vi.stubEnv('OPENCLI_WINDOW_BOUNDS', '10,20,300,400');
+      mockOkResponse();
+
+      await sendCommand('sessions', { op: 'window-ensure' });
+
+      expect(lastRequestBody().windowBounds).toEqual({ left: 10, top: 20, width: 300, height: 400 });
+    });
+
+    it('does not attach placement fields for an unrelated sessions op (list/cleanup)', async () => {
+      vi.stubEnv('OPENCLI_WINDOW_SLOT', 'semrush');
+      mockOkResponse();
+
+      await sendCommand('sessions', { op: 'list' });
+
+      expect(lastRequestBody()).not.toHaveProperty('windowSlot');
+    });
+
+    it('throws naming OPENCLI_WINDOW_BOUNDS on a malformed value, only when placement is actually resolved', async () => {
+      vi.stubEnv('OPENCLI_WINDOW_BOUNDS', 'garbage');
+      mockOkResponse();
+
+      await expect(sendCommand('exec', { code: '1', windowMode: 'dedicated' }))
+        .rejects.toThrow(/OPENCLI_WINDOW_BOUNDS must be/);
+      // The same bad env var must not break an unrelated, non-dedicated command.
+      await expect(sendCommand('exec', { code: '1', windowMode: 'background' })).resolves.toBe('ok');
+    });
   });
 
   it('sendCommand retries executor-transient errors ONCE with a NEW id (re-execution is a new logical attempt)', async () => {

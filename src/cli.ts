@@ -43,7 +43,9 @@ import {
   releaseSiteSessionLease,
   sendCommand,
   setDaemonRunContext,
+  setDaemonWindowPlacement,
 } from './browser/daemon-client.js';
+import { parseWindowBounds, parseForeignTabPolicy } from './browser/window-placement.js';
 import { fetchDaemonStatus } from './browser/daemon-transport.js';
 import { aliasForContextId, loadProfileConfig, profileRouteParams, renameProfile, resolveProfileSelection, setDefaultProfile, type ProfileSelection } from './browser/profile.js';
 import { formatDaemonVersion, isDaemonStale } from './browser/daemon-version.js';
@@ -631,7 +633,7 @@ async function getBrowserPage(
 }
 
 function getBrowserWindowMode(command: Command | undefined, defaultMode: BrowserWindowMode): BrowserWindowMode {
-  const modes: BrowserWindowMode[] = ['foreground', 'active', 'background', 'isolated'];
+  const modes: BrowserWindowMode[] = ['foreground', 'active', 'background', 'isolated', 'dedicated'];
   const optionRaw = getCommandOption(command, 'window');
   if (optionRaw !== undefined && optionRaw !== '') {
     if (modes.includes(optionRaw as BrowserWindowMode)) return optionRaw as BrowserWindowMode;
@@ -1006,7 +1008,10 @@ export function createProgram(BUILTIN_CLIS: string, USER_CLIS: string): Command 
     // program.parseAsync callers (tests). User-facing surface is the <session>
     // positional; main.ts argv preprocessor rewrites positional -> --session.
     .addOption(new Option('--session <name>', 'Internal — set automatically from the <session> positional').hideHelp())
-    .option('--window <mode>', 'Window mode: background (default, reuses your current window, never steals focus), active (selects the tab within its window only, no OS focus steal), foreground (raise + select), isolated (background in its own window)')
+    .option('--window <mode>', 'Window mode: background (default, reuses your current window, never steals focus), active (selects the tab within its window only, no OS focus steal), foreground (raise + select), isolated (background in its own window), dedicated (OpenCLI\'s own window, optionally placed on a given display; never touches your windows)')
+    .option('--window-slot <name>', 'Dedicated window slot name (only used with --window dedicated; default "default")')
+    .option('--window-bounds <x,y,w,h>', 'Dedicated window explicit placement: left,top,width,height (only used with --window dedicated)')
+    .option('--window-display <pattern>', 'Dedicated window display pattern: name substring or /regex/flags (only used with --window dedicated; ignored when --window-bounds is set)')
     .description('Browser control — navigate, click, type, extract, wait (no LLM needed)')
     .usage('<session> <command> [options]')
     .addHelpText('after', `
@@ -1157,6 +1162,19 @@ still usable even when navigation is reported as timed out.
         session = getBrowserSession(command);
         const profileSelection = getBrowserProfileSelection(command);
         const windowMode = getBrowserWindowMode(command, 'background');
+        // --window-slot/--window-bounds/--window-display override env for this
+        // invocation only; sendCommandRaw resolves them (dedicated mode only)
+        // with this override taking precedence over OPENCLI_WINDOW_*.
+        const windowSlotRaw = getCommandOption(command, 'windowSlot');
+        const windowBoundsRaw = getCommandOption(command, 'windowBounds');
+        const windowDisplayRaw = getCommandOption(command, 'windowDisplay');
+        setDaemonWindowPlacement({
+          ...(typeof windowSlotRaw === 'string' && windowSlotRaw.trim() ? { slot: windowSlotRaw.trim() } : {}),
+          ...(typeof windowBoundsRaw === 'string' && windowBoundsRaw.trim()
+            ? { bounds: parseWindowBounds(windowBoundsRaw.trim(), '--window-bounds') }
+            : {}),
+          ...(typeof windowDisplayRaw === 'string' && windowDisplayRaw.trim() ? { display: windowDisplayRaw.trim() } : {}),
+        });
         runId = generateRunId();
         setDaemonRunContext({
           runId,
@@ -1194,6 +1212,9 @@ still usable even when navigation is reported as timed out.
         }
         process.exitCode = EXIT_CODES.GENERIC_ERROR;
       } finally {
+        // Module-level state (mirrors setDaemonRunContext): must never leak into
+        // a later command in the same process, notably across test cases.
+        setDaemonWindowPlacement(null);
         if (runId) {
           clearDaemonRunContext(runId);
           if (session) await releaseSiteSessionLease({ runId, session, surface: 'browser' });
@@ -3429,7 +3450,13 @@ cli({
               const fallback = typeof e.windowFallbackReason === 'string' && e.windowFallbackReason
                 ? `  [new window: ${e.windowFallbackReason}]`
                 : '';
-              console.log(`  ${(e.session as string).padEnd(34)} ${(e.surface as string).padEnd(9)} ${(e.kind as string).padEnd(7)} ${win.padEnd(10)} ${group.padEnd(28)} ${url}${fallback}`);
+              // Dedicated-window bookkeeping: which slot owns this session, and
+              // whether its tab is currently the active tab of that window.
+              const dedicated = typeof e.dedicatedSlot === 'string' && e.dedicatedSlot
+                ? `  [dedicated:${e.dedicatedSlot}]`
+                : '';
+              const activeMarker = e.tabActive === true ? '*' : ' ';
+              console.log(`${activeMarker} ${(e.session as string).padEnd(34)} ${(e.surface as string).padEnd(9)} ${(e.kind as string).padEnd(7)} ${win.padEnd(10)} ${group.padEnd(28)} ${url}${dedicated}${fallback}`);
             }
           }
         }
@@ -3454,6 +3481,203 @@ cli({
           const child = spawn(process.execPath, [process.argv[1], 'daemon', 'restart'], { stdio: 'inherit' });
           child.on('close', () => resolve());
         });
+      }
+    });
+
+  // ── Session-independent: window (dedicated automation window) ──
+
+  type DedicatedWindowBounds = { left: number; top: number; width: number; height: number };
+  type DedicatedWindowActiveTab = { owner?: string; session?: string | null; url?: string; title?: string } | null;
+  type DedicatedWindowTabs = { total?: number; leases?: number; placeholders?: number; automation?: number; foreign?: number };
+  interface DedicatedWindowInfo {
+    slot: string;
+    windowId: number | null;
+    exists: boolean;
+    bounds: DedicatedWindowBounds | null;
+    placement?: { source: string; displayName?: string | null; displayPattern?: string | null; displayFound?: boolean | null };
+    onDisplay: boolean | null;
+    activeTab: DedicatedWindowActiveTab;
+    tabs: DedicatedWindowTabs;
+    sessions?: string[];
+    autoSelect?: boolean;
+    foreignTabPolicy?: string;
+    evictedTabs?: number;
+    created?: boolean;
+    moved?: boolean;
+  }
+  interface WindowStatusData {
+    supported: true;
+    protocol?: number;
+    capabilities?: string[];
+    displays: Array<{ id: string; name: string; primary?: boolean; internal?: boolean; bounds?: DedicatedWindowBounds; workArea?: DedicatedWindowBounds }> | null;
+    displaysError?: string;
+    windows: DedicatedWindowInfo[];
+  }
+
+  type WindowOpOutcome =
+    | { kind: 'supported'; data: Record<string, unknown> }
+    | { kind: 'unsupported'; reason: 'extension-too-old' }
+    | { kind: 'unsupported'; reason: 'bridge-unavailable'; error: string };
+
+  /**
+   * Shared transport for the two session-independent window ops. Feature
+   * detection per the contract: a pre-dedicated-window extension answers any
+   * unknown `sessions` op with the plain session LIST (an array) rather than
+   * an error, so that shape — not an exception — is the "too old" signal. A
+   * thrown error means the daemon/bridge itself could not be reached.
+   */
+  async function sendWindowOp(op: 'window-status' | 'window-ensure', params: Record<string, unknown>): Promise<WindowOpOutcome> {
+    try {
+      const data = await sendCommand('sessions', { op, ...params } as never);
+      if (Array.isArray(data)) return { kind: 'unsupported', reason: 'extension-too-old' };
+      return { kind: 'supported', data: (data ?? {}) as Record<string, unknown> };
+    } catch (err) {
+      return { kind: 'unsupported', reason: 'bridge-unavailable', error: getErrorMessage(err) };
+    }
+  }
+
+  function formatBoundsForTable(bounds: DedicatedWindowBounds | null | undefined): string {
+    if (!bounds) return '-';
+    return `${bounds.left},${bounds.top} ${bounds.width}x${bounds.height}`;
+  }
+
+  function formatDisplayForTable(info: Pick<DedicatedWindowInfo, 'placement' | 'onDisplay'>): string {
+    const name = info.placement?.displayName;
+    if (!name) return '-';
+    if (info.onDisplay === null || info.onDisplay === undefined) return name;
+    return `${name} (${info.onDisplay ? 'on' : 'off'})`;
+  }
+
+  function formatActiveTabForTable(tab: DedicatedWindowActiveTab): string {
+    if (!tab) return '-';
+    const url = typeof tab.url === 'string' && tab.url ? tab.url : '';
+    const truncatedUrl = url.length > 40 ? `${url.slice(0, 39)}…` : url;
+    return [tab.owner ?? '?', tab.session ?? '-', truncatedUrl || '-'].join('/');
+  }
+
+  function formatTabsForTable(tabs: DedicatedWindowTabs | undefined): string {
+    if (!tabs) return '-';
+    return `${tabs.total ?? 0} (lease ${tabs.leases ?? 0}/ph ${tabs.placeholders ?? 0}/auto ${tabs.automation ?? 0}/foreign ${tabs.foreign ?? 0})`;
+  }
+
+  function dedicatedWindowRow(info: DedicatedWindowInfo): Record<string, string> {
+    const row: Record<string, string> = {
+      slot: info.slot,
+      window: info.windowId === null || info.windowId === undefined ? '-' : `win${info.windowId}`,
+      exists: info.exists ? 'yes' : 'no',
+    };
+    if (info.created !== undefined) row.created = info.created ? 'yes' : 'no';
+    if (info.moved !== undefined) row.moved = info.moved ? 'yes' : 'no';
+    row.bounds = formatBoundsForTable(info.bounds);
+    row.display = formatDisplayForTable(info);
+    row.active_tab = formatActiveTabForTable(info.activeTab);
+    row.tabs = formatTabsForTable(info.tabs);
+    row.foreign = info.foreignTabPolicy ?? '-';
+    return row;
+  }
+
+  function printDisplaysSection(data: Pick<WindowStatusData, 'displays' | 'displaysError'>): void {
+    console.log();
+    if (Array.isArray(data.displays)) {
+      console.log(`Displays (${data.displays.length}):`);
+      for (const d of data.displays) {
+        const flags = [d.primary ? 'primary' : null, d.internal ? 'internal' : null].filter(Boolean).join(', ');
+        console.log(`  ${d.name}${flags ? ` [${flags}]` : ''}  bounds=${formatBoundsForTable(d.bounds ?? null)}`);
+      }
+    } else {
+      console.log(`Displays: unavailable${data.displaysError ? ` (${data.displaysError})` : ''}`);
+    }
+  }
+
+  function printUnsupportedWindowOp(outcome: Extract<WindowOpOutcome, { kind: 'unsupported' }>): void {
+    if (outcome.reason === 'extension-too-old') {
+      console.log(JSON.stringify({ supported: false, reason: 'extension-too-old' }, null, 2));
+      return;
+    }
+    console.log(JSON.stringify({ supported: false, reason: 'bridge-unavailable', error: outcome.error }, null, 2));
+    process.exitCode = EXIT_CODES.GENERIC_ERROR;
+  }
+
+  const browserWindow = browser
+    .command('window')
+    .description('Dedicated automation window — status and placement (session-independent)');
+
+  browserWindow.command('status', { isDefault: true })
+    .description('Show dedicated automation window(s) status')
+    .option('--slot <name>', 'Filter to a single slot')
+    .option('-f, --format <fmt>', 'Output format: table (default) or json', 'table')
+    .action(async (opts: { slot?: string; format?: string }) => {
+      try {
+        const slot = typeof opts.slot === 'string' && opts.slot.trim() ? opts.slot.trim() : undefined;
+        const outcome = await sendWindowOp('window-status', slot ? { windowSlot: slot } : {});
+        if (outcome.kind === 'unsupported') {
+          printUnsupportedWindowOp(outcome);
+          return;
+        }
+        const data = outcome.data as unknown as WindowStatusData;
+        const allWindows = Array.isArray(data.windows) ? data.windows : [];
+        // Defensive: filter client-side too, regardless of whether the
+        // extension already scoped `windows` to windowSlot server-side.
+        const windows = slot ? allWindows.filter((w) => w.slot === slot) : allWindows;
+        const payload = { ...data, windows, cliVersion: PKG_VERSION };
+        if (opts.format === 'json') {
+          console.log(JSON.stringify(payload, null, 2));
+          return;
+        }
+        if (windows.length === 0) {
+          console.log('No dedicated windows tracked yet.');
+        } else {
+          renderOutput(windows.map(dedicatedWindowRow), {
+            fmt: 'table',
+            columns: ['slot', 'window', 'exists', 'bounds', 'display', 'active_tab', 'tabs', 'foreign'],
+          });
+        }
+        printDisplaysSection(data);
+      } catch (err) {
+        log.error(getErrorMessage(err));
+        process.exitCode = EXIT_CODES.USAGE_ERROR;
+      }
+    });
+
+  browserWindow.command('ensure')
+    .description('Create or move the dedicated window for a slot to match the requested placement')
+    .option('--slot <name>', 'Slot name (default "default")')
+    .option('--bounds <x,y,w,h>', 'Explicit window bounds: left,top,width,height')
+    .option('--display <pattern>', 'Display name pattern: substring or /regex/flags')
+    .option('--foreign-tabs <policy>', 'Foreign tab policy: evict (default) or tolerate')
+    .option('-f, --format <fmt>', 'Output format: table (default) or json', 'table')
+    .action(async (opts: { slot?: string; bounds?: string; display?: string; foreignTabs?: string; format?: string }) => {
+      try {
+        const params: Record<string, unknown> = {};
+        if (typeof opts.slot === 'string' && opts.slot.trim()) params.windowSlot = opts.slot.trim();
+        if (typeof opts.bounds === 'string' && opts.bounds.trim()) {
+          params.windowBounds = parseWindowBounds(opts.bounds.trim(), '--bounds');
+        }
+        if (typeof opts.display === 'string' && opts.display.trim()) params.windowDisplay = opts.display.trim();
+        if (typeof opts.foreignTabs === 'string' && opts.foreignTabs.trim()) {
+          params.foreignTabPolicy = parseForeignTabPolicy(opts.foreignTabs.trim(), '--foreign-tabs');
+        }
+        const outcome = await sendWindowOp('window-ensure', params);
+        if (outcome.kind === 'unsupported') {
+          printUnsupportedWindowOp(outcome);
+          return;
+        }
+        const info = outcome.data as unknown as DedicatedWindowInfo;
+        const payload = { ...info, cliVersion: PKG_VERSION };
+        if (opts.format === 'json') {
+          console.log(JSON.stringify(payload, null, 2));
+          return;
+        }
+        renderOutput([dedicatedWindowRow(info)], {
+          fmt: 'table',
+          columns: ['slot', 'window', 'exists', 'created', 'moved', 'bounds', 'display', 'active_tab', 'tabs', 'foreign'],
+        });
+        if (info.placement?.displayPattern && info.placement?.displayFound === false) {
+          console.log(`Note: display pattern "${info.placement.displayPattern}" matched no connected display.`);
+        }
+      } catch (err) {
+        log.error(getErrorMessage(err));
+        process.exitCode = EXIT_CODES.USAGE_ERROR;
       }
     });
 

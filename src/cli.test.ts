@@ -622,7 +622,7 @@ describe('createProgram root help descriptions', () => {
       });
       // session is now a hidden internal option (consumed from the <session> positional).
       // namespace_options should only list user-facing options.
-      expect(data.namespace_options.map((option: any) => option.name)).toEqual(['window']);
+      expect(data.namespace_options.map((option: any) => option.name)).toEqual(['window', 'windowSlot', 'windowBounds', 'windowDisplay']);
       expect(data.structured_help).toMatchObject({
         usage: 'opencli browser <session> tab --help -f yaml',
       });
@@ -653,8 +653,8 @@ describe('createProgram root help descriptions', () => {
         },
       });
       expect(data.command_options.map((option: any) => option.name)).toEqual(['role', 'name', 'label', 'text', 'testid', 'nth', 'tab']);
-      // session is hidden; only `window` surfaces as a namespace option.
-      expect(data.namespace_options.map((option: any) => option.name)).toEqual(['window']);
+      // session is hidden; `window` and its dedicated-mode placement siblings surface as namespace options.
+      expect(data.namespace_options.map((option: any) => option.name)).toEqual(['window', 'windowSlot', 'windowBounds', 'windowDisplay']);
       expect(data.global_options.map((option: any) => option.name)).toContain('profile');
     } finally {
       process.argv = argv;
@@ -1926,6 +1926,229 @@ describe('browser tab targeting commands', () => {
     expect(out.error.code).toBe('download_not_seen');
     expect(out.download.elapsedMs).toBe(900);
     expect(process.exitCode).toBeDefined();
+  });
+});
+
+describe('browser sessions command', () => {
+  const consoleLogSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+  beforeEach(() => {
+    process.exitCode = undefined;
+    consoleLogSpy.mockClear();
+    mockSendCommand.mockReset();
+  });
+
+  function allLogs(): string {
+    return consoleLogSpy.mock.calls.map((c) => String(c[0])).join('\n');
+  }
+
+  it('marks the active tab with a leading "*" and appends [dedicated:<slot>] for a dedicated-slot entry, in table format', async () => {
+    mockSendCommand.mockResolvedValueOnce([
+      { session: 'semrush', surface: 'browser', kind: 'lease', windowId: 1234, groupTitle: 'semrush', url: 'https://semrush.com/report', dedicatedSlot: 'semrush', tabActive: true },
+      { session: 'plain', surface: 'browser', kind: 'lease', windowId: 5, groupTitle: 'plain', url: 'https://example.com', dedicatedSlot: null, tabActive: false },
+    ]);
+    const program = createProgram('', '');
+
+    await program.parseAsync(['node', 'opencli', 'browser', 'sessions']);
+
+    const logs = allLogs();
+    const semrushLine = logs.split('\n').find((l) => l.includes('semrush') && l.includes('win1234'))!;
+    expect(semrushLine).toMatch(/^\*/);
+    expect(semrushLine).toContain('[dedicated:semrush]');
+    const plainLine = logs.split('\n').find((l) => l.includes('plain') && l.includes('win5'))!;
+    expect(plainLine).not.toContain('[dedicated:');
+    expect(plainLine.startsWith('*')).toBe(false);
+  });
+
+  it('passes dedicatedSlot/tabActive through unchanged in json format', async () => {
+    const entries = [
+      { session: 'semrush', surface: 'browser', kind: 'lease', windowId: 1234, dedicatedSlot: 'semrush', tabActive: true },
+    ];
+    mockSendCommand.mockResolvedValueOnce(entries);
+    const program = createProgram('', '');
+
+    await program.parseAsync(['node', 'opencli', 'browser', 'sessions', '-f', 'json']);
+
+    const out = JSON.parse(String(consoleLogSpy.mock.calls.at(-1)?.[0]));
+    expect(out).toEqual(entries);
+  });
+});
+
+describe('browser window command', () => {
+  const consoleLogSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+  beforeEach(() => {
+    process.exitCode = undefined;
+    consoleLogSpy.mockClear();
+    mockSendCommand.mockReset();
+  });
+
+  function lastJsonLog(): any {
+    const calls = consoleLogSpy.mock.calls;
+    if (calls.length === 0) throw new Error('Expected at least one console.log call');
+    const last = calls[calls.length - 1][0];
+    if (typeof last !== 'string') throw new Error(`Expected string arg to console.log, got ${typeof last}`);
+    return JSON.parse(last);
+  }
+
+  function allLogs(): string {
+    return consoleLogSpy.mock.calls.map((c) => String(c[0])).join('\n');
+  }
+
+  const sampleWindowInfo = {
+    slot: 'semrush',
+    windowId: 1234,
+    exists: true,
+    bounds: { left: 0, top: 0, width: 1280, height: 900 },
+    placement: { source: 'display', displayName: '虚拟 16:9', displayPattern: '虚拟', displayFound: true },
+    onDisplay: true,
+    activeTab: { owner: 'lease', session: 'semrush', url: 'https://semrush.com/report' },
+    tabs: { total: 2, leases: 1, placeholders: 1, automation: 0, foreign: 0 },
+    sessions: ['semrush'],
+    autoSelect: true,
+    foreignTabPolicy: 'evict',
+  };
+
+  describe('status', () => {
+    it('routes to sessions op=window-status and prints the data plus cliVersion (json)', async () => {
+      mockSendCommand.mockResolvedValueOnce({
+        supported: true,
+        protocol: 1,
+        capabilities: ['dedicated-window', 'window-slots'],
+        displays: [{ id: 'd1', name: '虚拟 16:9', primary: false, internal: false, bounds: { left: -2560, top: -1440, width: 2560, height: 1440 } }],
+        windows: [sampleWindowInfo],
+      });
+      const program = createProgram('', '');
+
+      await program.parseAsync(['node', 'opencli', 'browser', 'window', 'status', '-f', 'json']);
+
+      expect(mockSendCommand).toHaveBeenCalledWith('sessions', { op: 'window-status' });
+      const out = lastJsonLog();
+      expect(out.supported).toBe(true);
+      expect(out.cliVersion).toBe(PKG_VERSION);
+      expect(out.windows).toHaveLength(1);
+      expect(out.windows[0].slot).toBe('semrush');
+    });
+
+    it('defaults to table format and prints slot/window/displays information', async () => {
+      mockSendCommand.mockResolvedValueOnce({
+        supported: true,
+        displays: [{ id: 'd1', name: '虚拟 16:9', primary: false, internal: false, bounds: { left: -2560, top: -1440, width: 2560, height: 1440 } }],
+        windows: [sampleWindowInfo],
+      });
+      const program = createProgram('', '');
+
+      await program.parseAsync(['node', 'opencli', 'browser', 'window', 'status']);
+
+      const logs = allLogs();
+      expect(logs).toContain('semrush');
+      expect(logs).toContain('win1234');
+      expect(logs).toContain('Displays');
+      expect(logs).toContain('虚拟 16:9');
+    });
+
+    it('--slot filters the windows array client-side', async () => {
+      mockSendCommand.mockResolvedValueOnce({
+        supported: true,
+        displays: [],
+        windows: [sampleWindowInfo, { ...sampleWindowInfo, slot: 'similarweb', windowId: 999 }],
+      });
+      const program = createProgram('', '');
+
+      await program.parseAsync(['node', 'opencli', 'browser', 'window', 'status', '--slot', 'semrush', '-f', 'json']);
+
+      expect(mockSendCommand).toHaveBeenCalledWith('sessions', { op: 'window-status', windowSlot: 'semrush' });
+      const out = lastJsonLog();
+      expect(out.windows).toHaveLength(1);
+      expect(out.windows[0].slot).toBe('semrush');
+    });
+
+    it('prints {supported:false, reason:"extension-too-old"} and exits 0 when the extension answers with a plain array', async () => {
+      mockSendCommand.mockResolvedValueOnce([{ session: 'x', surface: 'browser', kind: 'lease' }]);
+      const program = createProgram('', '');
+
+      await program.parseAsync(['node', 'opencli', 'browser', 'window', 'status', '-f', 'json']);
+
+      expect(lastJsonLog()).toEqual({ supported: false, reason: 'extension-too-old' });
+      expect(process.exitCode).toBeUndefined();
+    });
+
+    it('prints {supported:false, reason:"bridge-unavailable"} and exits 1 when the daemon/bridge cannot be reached', async () => {
+      mockSendCommand.mockRejectedValueOnce(new Error('daemon not running'));
+      const program = createProgram('', '');
+
+      await program.parseAsync(['node', 'opencli', 'browser', 'window', 'status', '-f', 'json']);
+
+      const out = lastJsonLog();
+      expect(out.supported).toBe(false);
+      expect(out.reason).toBe('bridge-unavailable');
+      expect(out.error).toContain('daemon not running');
+      expect(process.exitCode).toBe(1);
+    });
+  });
+
+  describe('ensure', () => {
+    it('routes to sessions op=window-ensure with slot/display params and prints the data (json)', async () => {
+      mockSendCommand.mockResolvedValueOnce({ ...sampleWindowInfo, created: true, moved: false });
+      const program = createProgram('', '');
+
+      await program.parseAsync(['node', 'opencli', 'browser', 'window', 'ensure', '--slot', 'semrush', '--display', '虚拟', '-f', 'json']);
+
+      expect(mockSendCommand).toHaveBeenCalledWith('sessions', { op: 'window-ensure', windowSlot: 'semrush', windowDisplay: '虚拟' });
+      const out = lastJsonLog();
+      expect(out.created).toBe(true);
+      expect(out.moved).toBe(false);
+      expect(out.cliVersion).toBe(PKG_VERSION);
+    });
+
+    it('parses --bounds into windowBounds', async () => {
+      mockSendCommand.mockResolvedValueOnce({ ...sampleWindowInfo, created: false, moved: true });
+      const program = createProgram('', '');
+
+      await program.parseAsync(['node', 'opencli', 'browser', 'window', 'ensure', '--bounds', '0,0,1280,900', '-f', 'json']);
+
+      expect(mockSendCommand).toHaveBeenCalledWith('sessions', {
+        op: 'window-ensure',
+        windowBounds: { left: 0, top: 0, width: 1280, height: 900 },
+      });
+    });
+
+    it('rejects a malformed --bounds with a usage error, without calling sendCommand', async () => {
+      const program = createProgram('', '');
+
+      await program.parseAsync(['node', 'opencli', 'browser', 'window', 'ensure', '--bounds', 'nope', '-f', 'json']);
+
+      expect(mockSendCommand).not.toHaveBeenCalled();
+      expect(process.exitCode).toBe(2);
+    });
+
+    it('parses --foreign-tabs', async () => {
+      mockSendCommand.mockResolvedValueOnce(sampleWindowInfo);
+      const program = createProgram('', '');
+
+      await program.parseAsync(['node', 'opencli', 'browser', 'window', 'ensure', '--foreign-tabs', 'tolerate', '-f', 'json']);
+
+      expect(mockSendCommand).toHaveBeenCalledWith('sessions', { op: 'window-ensure', foreignTabPolicy: 'tolerate' });
+    });
+
+    it('rejects an invalid --foreign-tabs value', async () => {
+      const program = createProgram('', '');
+
+      await program.parseAsync(['node', 'opencli', 'browser', 'window', 'ensure', '--foreign-tabs', 'nope']);
+
+      expect(mockSendCommand).not.toHaveBeenCalled();
+      expect(process.exitCode).toBe(2);
+    });
+
+    it('prints {supported:false, reason:"extension-too-old"} and exits 0 when the extension answers with a plain array', async () => {
+      mockSendCommand.mockResolvedValueOnce([]);
+      const program = createProgram('', '');
+
+      await program.parseAsync(['node', 'opencli', 'browser', 'window', 'ensure', '-f', 'json']);
+
+      expect(lastJsonLog()).toEqual({ supported: false, reason: 'extension-too-old' });
+      expect(process.exitCode).toBeUndefined();
+    });
   });
 });
 

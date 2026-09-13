@@ -52,6 +52,7 @@ const BROWSER_SUBCOMMAND_NAMES: ReadonlySet<string> = new Set([
   'upload',
   'verify',
   'wait',
+  'window',
 ]);
 
 /**
@@ -119,40 +120,63 @@ export function rewriteBrowserArgv(argv: readonly string[]): string[] {
   if (BROWSER_SUBCOMMAND_NAMES.has(next)) return result;
   // Splice in --session <name> in place of the positional.
   result.splice(sessionIdx, 1, '--session', next);
-  // `--window` is a browser namespace option, so commander accepts it before the
-  // leaf command. Users naturally put it at the end:
-  // `browser work open https://x.com --window background`. Hoist that public
-  // form into the namespace-option slot instead of mirroring the option onto
-  // every browser leaf command.
-  hoistBrowserWindowOption(result, sessionIdx + 2);
+  // `--window` (and its dedicated-mode placement siblings --window-slot/
+  // --window-bounds/--window-display) are browser namespace options, so
+  // commander accepts them before the leaf command. Users naturally put them
+  // at the end: `browser work open https://x.com --window background`. Hoist
+  // that public form into the namespace-option slot instead of mirroring the
+  // options onto every browser leaf command.
+  hoistBrowserWindowOptions(result, sessionIdx + 2);
   return result;
 }
 
 /**
- * Move one trailing `--window <mode>` / `--window=<mode>` from after the browser
- * subcommand to just before it. Stops at `--` so literal browser arguments are
- * untouched. Mutates `argv` in place.
+ * Browser namespace options that a user naturally types after the leaf
+ * subcommand (`browser work open url --window dedicated --window-slot x`)
+ * but which commander only accepts before it. Kept in sync with the
+ * `.option(...)` calls on the `browser` command in cli.ts.
  */
-function hoistBrowserWindowOption(argv: string[], fromIndex: number): void {
+const HOISTABLE_WINDOW_OPTIONS: ReadonlySet<string> = new Set([
+  '--window', '--window-slot', '--window-bounds', '--window-display',
+]);
+
+/**
+ * Move trailing occurrences of the options in `HOISTABLE_WINDOW_OPTIONS`
+ * (`--flag <value>` or `--flag=<value>`) from after the browser subcommand to
+ * just before it, preserving encounter order. Stops scanning at a literal
+ * `--` separator so literal browser arguments are untouched. A flag found
+ * without a following value (bare trailing flag) is left exactly where it is
+ * — not hoisted — so commander reports its own "missing value" error instead
+ * of us silently relocating a malformed invocation. Mutates `argv` in place.
+ */
+function hoistBrowserWindowOptions(argv: string[], fromIndex: number): void {
   const subcommandIdx = argv.findIndex((tok, idx) => idx >= fromIndex && BROWSER_SUBCOMMAND_NAMES.has(tok));
   if (subcommandIdx === -1) return;
 
-  for (let i = subcommandIdx + 1; i < argv.length; i += 1) {
+  const hoisted: string[] = [];
+  let i = subcommandIdx + 1;
+  while (i < argv.length) {
     const tok = argv[i];
-    if (tok === '--') return;
-    if (tok.startsWith('--window=')) {
-      const removed = argv.splice(i, 1);
-      argv.splice(subcommandIdx, 0, ...removed);
-      return;
+    if (tok === '--') break;
+    const eq = tok.indexOf('=');
+    const key = eq === -1 ? tok : tok.slice(0, eq);
+    if (!HOISTABLE_WINDOW_OPTIONS.has(key)) {
+      i += 1;
+      continue;
     }
-    if (tok === '--window') {
-      const value = argv[i + 1];
-      if (value === undefined || value === '--') return;
-      const removed = argv.splice(i, 2);
-      argv.splice(subcommandIdx, 0, ...removed);
-      return;
+    if (eq !== -1) {
+      hoisted.push(...argv.splice(i, 1));
+      continue; // argv shrank in place; re-check the same index
     }
+    const value = argv[i + 1];
+    if (value === undefined || value === '--') {
+      i += 1; // bare trailing flag: leave it, keep scanning
+      continue;
+    }
+    hoisted.push(...argv.splice(i, 2));
+    // argv shrank in place; re-check the same index
   }
+  if (hoisted.length > 0) argv.splice(subcommandIdx, 0, ...hoisted);
 }
 
 /**
