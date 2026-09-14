@@ -1009,7 +1009,7 @@ export function createProgram(BUILTIN_CLIS: string, USER_CLIS: string): Command 
     // positional; main.ts argv preprocessor rewrites positional -> --session.
     .addOption(new Option('--session <name>', 'Internal — set automatically from the <session> positional').hideHelp())
     .option('--window <mode>', 'Window mode: dedicated (default — an OpenCLI-owned window, created unfocused and placed off your screen when a second display exists; the tab itself renders visible), background (hidden tab in your current window, never steals focus), active (selects the tab within its window only, no OS focus steal), foreground (raise + select), isolated (background in its own window)')
-    .option('--window-slot <name>', 'Dedicated window slot name (only used with --window dedicated; default "default")')
+    .option('--window-slot <name>', 'Pin this session to a named dedicated window (only used with --window dedicated). Omit it and the session borrows an idle window from the pool and hands it back when its lease ends')
     .option('--window-bounds <x,y,w,h>', 'Dedicated window explicit placement: left,top,width,height (only used with --window dedicated)')
     .option('--window-display <pattern>', 'Dedicated window display pattern: name substring or /regex/flags (only used with --window dedicated; ignored when --window-bounds is set)')
     .description('Browser control — navigate, click, type, extract, wait (no LLM needed)')
