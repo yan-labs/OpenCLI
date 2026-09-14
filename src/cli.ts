@@ -3563,7 +3563,7 @@ cli({
    * an error, so that shape — not an exception — is the "too old" signal. A
    * thrown error means the daemon/bridge itself could not be reached.
    */
-  async function sendWindowOp(op: 'window-status' | 'window-ensure' | 'window-list' | 'window-close', params: Record<string, unknown>): Promise<WindowOpOutcome> {
+  async function sendWindowOp(op: 'window-status' | 'window-ensure' | 'window-list' | 'window-close' | 'runtime-reload', params: Record<string, unknown>): Promise<WindowOpOutcome> {
     try {
       const data = await sendCommand('sessions', { op, ...params } as never);
       if (Array.isArray(data)) return { kind: 'unsupported', reason: 'extension-too-old' };
@@ -3810,6 +3810,24 @@ cli({
           console.log(`Remaining: ${remaining.length > 0 ? remaining.join(', ') : 'none'}`);
         }
         if (closed.length === 0 && skipped.length > 0) process.exitCode = EXIT_CODES.GENERIC_ERROR;
+      } catch (err) {
+        log.error(getErrorMessage(err));
+        process.exitCode = EXIT_CODES.USAGE_ERROR;
+      }
+    });
+
+  browserWindow.command('reload-extension')
+    .description('Reload the OpenCLI Chrome extension so a new build takes effect (drops all leases and automation windows)')
+    .action(async () => {
+      try {
+        // Applying a new extension build used to mean a human clicking Reload in
+        // chrome://extensions. The extension can do it to itself; it just needs asking.
+        const outcome = await sendWindowOp('runtime-reload', {});
+        if (outcome.kind === 'unsupported') {
+          printUnsupportedWindowOp(outcome);
+          return;
+        }
+        console.log('Extension reloading. Leases and dedicated windows are dropped; the daemon reconnects on its own.');
       } catch (err) {
         log.error(getErrorMessage(err));
         process.exitCode = EXIT_CODES.USAGE_ERROR;

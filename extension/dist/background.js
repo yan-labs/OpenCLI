@@ -2142,6 +2142,12 @@ async function assertDedicatedCapacity(state) {
 }
 async function reapIdleDedicatedWindows(now = Date.now()) {
   let closed = 0;
+  for (const state of dedicatedSlots.values()) {
+    for (const leaseKey of [...state.holders]) {
+      if (!automationSessions.has(leaseKey)) state.holders.delete(leaseKey);
+    }
+    if (state.holders.size === 0 && state.idleSince === null) state.idleSince = now;
+  }
   for (const state of [...dedicatedSlots.values()]) {
     if (state.holders.size > 0 || state.idleSince === null) continue;
     if (now - state.idleSince < dedicatedIdleTtlMs) continue;
@@ -2233,11 +2239,11 @@ function getDedicatedSlot(slot, pooled = false) {
   }
   return state;
 }
-function poolSlotFor(leaseKey) {
+function poolSlotFor(leaseKey, hold = false) {
   for (const state2 of dedicatedSlots.values()) if (state2.holders.has(leaseKey)) return state2;
   const idle = [...dedicatedSlots.values()].filter((state2) => state2.pooled && state2.holders.size === 0).sort((a, b) => Number(b.windowId !== null) - Number(a.windowId !== null) || (a.idleSince ?? 0) - (b.idleSince ?? 0));
   const state = idle[0] ?? getDedicatedSlot(nextPoolSlotName(), true);
-  holdDedicatedSlot(state, leaseKey);
+  if (hold) holdDedicatedSlot(state, leaseKey);
   return state;
 }
 function nextPoolSlotName() {
@@ -2352,13 +2358,13 @@ function dedicatedPlacementRequest(leaseKey) {
     ...overrides?.windowDisplay ? { display: overrides.windowDisplay } : {}
   };
 }
-function dedicatedSlotNameFor(leaseKey) {
+function dedicatedSlotNameFor(leaseKey, { hold = false } = {}) {
   const pinned = sessionOverrides.get(leaseKey)?.windowSlot;
   if (typeof pinned === "string" && DEDICATED_SLOT_PATTERN.test(pinned)) {
-    holdDedicatedSlot(getDedicatedSlot(pinned), leaseKey);
+    if (hold) holdDedicatedSlot(getDedicatedSlot(pinned), leaseKey);
     return pinned;
   }
-  return poolSlotFor(leaseKey).slot;
+  return poolSlotFor(leaseKey, hold).slot;
 }
 function applyDedicatedCommandFields(leaseKey, cmd) {
   if (typeof cmd.dedicatedIdleMs === "number" && Number.isFinite(cmd.dedicatedIdleMs) && cmd.dedicatedIdleMs > 0) {
@@ -2696,7 +2702,7 @@ async function createDedicatedTabLease(leaseKey, targetUrl) {
   }
 }
 async function createDedicatedTabLeaseInner(leaseKey, targetUrl) {
-  const slot = dedicatedSlotNameFor(leaseKey);
+  const slot = dedicatedSlotNameFor(leaseKey, { hold: true });
   const state = getDedicatedSlot(slot);
   const role = getOwnedWindowRole(leaseKey);
   const active = tabActivationFor(leaseKey);
@@ -2743,7 +2749,7 @@ async function createDedicatedTabLeaseInner(leaseKey, targetUrl) {
 async function applyDedicatedSessionPolicy(leaseKey, resolved) {
   const lease = automationSessions.get(leaseKey);
   if (!lease?.owned || lease.preferredTabId !== resolved.tabId) return resolved;
-  const slot = dedicatedSlotNameFor(leaseKey);
+  const slot = dedicatedSlotNameFor(leaseKey, { hold: true });
   const state = getDedicatedSlot(slot);
   let tab = resolved.tab ?? await chrome.tabs.get(resolved.tabId);
   if (state.windowId === null || tab.windowId !== state.windowId) {
@@ -3025,7 +3031,7 @@ async function getAutomationWindow(leaseKey, initialUrl) {
     }
   }
   if (getWindowMode(leaseKey) === "dedicated") {
-    return (await ensureDedicatedWindow(dedicatedSlotNameFor(leaseKey), {
+    return (await ensureDedicatedWindow(dedicatedSlotNameFor(leaseKey, { hold: true }), {
       ...dedicatedPlacementRequest(leaseKey),
       reposition: true,
       initialUrl

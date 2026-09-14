@@ -1881,6 +1881,15 @@ async function assertDedicatedCapacity(state: DedicatedSlotState): Promise<void>
  */
 async function reapIdleDedicatedWindows(now = Date.now()): Promise<number> {
   let closed = 0;
+  // Holders are lease keys; a key with no live lease behind it can only be a leak
+  // (a crashed command, a lease dropped through a path that did not pass here).
+  // Reconcile before deciding what is idle, or one leak would pin a window forever.
+  for (const state of dedicatedSlots.values()) {
+    for (const leaseKey of [...state.holders]) {
+      if (!automationSessions.has(leaseKey)) state.holders.delete(leaseKey);
+    }
+    if (state.holders.size === 0 && state.idleSince === null) state.idleSince = now;
+  }
   for (const state of [...dedicatedSlots.values()]) {
     if (state.holders.size > 0 || state.idleSince === null) continue;
     if (now - state.idleSince < dedicatedIdleTtlMs) continue;
@@ -1985,14 +1994,17 @@ function getDedicatedSlot(slot: string, pooled = false): DedicatedSlotState {
  * held at the same time does the pool grow, and `ensureDedicatedWindowUnlocked`
  * refuses to grow past what the display can show without overlap.
  */
-function poolSlotFor(leaseKey: string): DedicatedSlotState {
+function poolSlotFor(leaseKey: string, hold = false): DedicatedSlotState {
   for (const state of dedicatedSlots.values()) if (state.holders.has(leaseKey)) return state;
   const idle = [...dedicatedSlots.values()]
     .filter(state => state.pooled && state.holders.size === 0)
     // A live window first (no creation cost), then the one idle longest.
     .sort((a, b) => Number(b.windowId !== null) - Number(a.windowId !== null) || (a.idleSince ?? 0) - (b.idleSince ?? 0));
+  // Only an actual lease claims a window. A command that merely records policy (or a
+  // `close` for a session that no longer has a lease) must not take one: nothing would
+  // ever hand it back, and the slot would sit "busy" with no window behind it.
   const state = idle[0] ?? getDedicatedSlot(nextPoolSlotName(), true);
-  holdDedicatedSlot(state, leaseKey);
+  if (hold) holdDedicatedSlot(state, leaseKey);
   return state;
 }
 
@@ -2131,13 +2143,13 @@ function dedicatedPlacementRequest(leaseKey: string): DedicatedPlacementRequest 
  * one borrowed from the pool. Pinning stays supported (a script that wants a stable
  * window per tool still gets it) but is no longer what happens by default.
  */
-function dedicatedSlotNameFor(leaseKey: string): string {
+function dedicatedSlotNameFor(leaseKey: string, { hold = false }: { hold?: boolean } = {}): string {
   const pinned = sessionOverrides.get(leaseKey)?.windowSlot;
   if (typeof pinned === 'string' && DEDICATED_SLOT_PATTERN.test(pinned)) {
-    holdDedicatedSlot(getDedicatedSlot(pinned), leaseKey);
+    if (hold) holdDedicatedSlot(getDedicatedSlot(pinned), leaseKey);
     return pinned;
   }
-  return poolSlotFor(leaseKey).slot;
+  return poolSlotFor(leaseKey, hold).slot;
 }
 
 /** Record the dedicated-mode fields a command carries. Slot-level policy is last-writer-wins. */
@@ -2544,7 +2556,8 @@ async function createDedicatedTabLease(leaseKey: string, targetUrl: string): Pro
 }
 
 async function createDedicatedTabLeaseInner(leaseKey: string, targetUrl: string): Promise<ResolvedTab> {
-  const slot = dedicatedSlotNameFor(leaseKey);
+  // A lease is about to live in this window, so this is the one call that claims it.
+  const slot = dedicatedSlotNameFor(leaseKey, { hold: true });
   const state = getDedicatedSlot(slot);
   const role = getOwnedWindowRole(leaseKey);
   const active = tabActivationFor(leaseKey);
@@ -2597,7 +2610,8 @@ async function createDedicatedTabLeaseInner(leaseKey: string, targetUrl: string)
 async function applyDedicatedSessionPolicy(leaseKey: string, resolved: ResolvedTab): Promise<ResolvedTab> {
   const lease = automationSessions.get(leaseKey);
   if (!lease?.owned || lease.preferredTabId !== resolved.tabId) return resolved;
-  const slot = dedicatedSlotNameFor(leaseKey);
+  // An existing lease is being moved into its window: it holds the slot from here on.
+  const slot = dedicatedSlotNameFor(leaseKey, { hold: true });
   const state = getDedicatedSlot(slot);
   let tab = resolved.tab ?? await chrome.tabs.get(resolved.tabId);
   if (state.windowId === null || tab.windowId !== state.windowId) {
@@ -2933,7 +2947,7 @@ async function getAutomationWindow(leaseKey: string, initialUrl?: string): Promi
   }
 
   if (getWindowMode(leaseKey) === 'dedicated') {
-    return (await ensureDedicatedWindow(dedicatedSlotNameFor(leaseKey), {
+    return (await ensureDedicatedWindow(dedicatedSlotNameFor(leaseKey, { hold: true }), {
       ...dedicatedPlacementRequest(leaseKey),
       reposition: true,
       initialUrl,
@@ -4519,6 +4533,7 @@ export const __test__ = {
     ws = null;
   },
   getSession: (leaseKey: string = 'default') => automationSessions.get(leaseKey) ?? null,
+  forgetSession: (leaseKey: string) => automationSessions.delete(leaseKey),
   getAutomationWindowId: (leaseKey: string = 'default') => automationSessions.get(leaseKey)?.windowId ?? null,
   setAutomationWindowId: (leaseKey: string, windowId: number | null) => {
     if (windowId === null) {

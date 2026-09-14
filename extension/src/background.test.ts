@@ -4017,3 +4017,57 @@ describe('dedicated automation window — pool and layout', () => {
     expect(res.data.windows[0]).toMatchObject({ pooled: true, busy: true, holders: 1 });
   });
 });
+
+describe('dedicated automation window — holder bookkeeping', () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.useRealTimers();
+    MockWebSocket.instances = [];
+    vi.stubGlobal('WebSocket', MockWebSocket);
+    vi.stubGlobal('fetch', vi.fn(() => new Promise(() => {})));
+  });
+  afterEach(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    vi.unstubAllGlobals();
+  });
+
+  const useDedicated = (mod: any, key: string, fields: Record<string, unknown> = {}) => {
+    mod.__test__.sessionOverrides.set(key, { windowMode: 'dedicated' });
+    mod.__test__.applyDedicatedCommandFields(key, { id: 'x', action: 'exec', windowMode: 'dedicated', ...fields });
+  };
+
+  it('a command that never takes a lease does not claim a window', async () => {
+    const h = dedicatedHarness();
+    vi.stubGlobal('chrome', h.chrome);
+    const mod = await import('./background');
+    // Policy-only traffic: `close` on a session with nothing open, repeated.
+    for (let i = 0; i < 5; i += 1) useDedicated(mod, browserKey(`policy-${i}`));
+    for (const name of mod.__test__.dedicatedSlotNames()) {
+      expect(mod.__test__.getDedicatedSlot(name).holders).toEqual([]);
+    }
+    expect(h.chrome.windows.create).not.toHaveBeenCalled();
+  });
+
+  it('reaping reconciles holders whose lease is already gone', async () => {
+    const h = dedicatedHarness();
+    vi.stubGlobal('chrome', h.chrome);
+    const mod = await import('./background');
+    h.chrome.windows.remove = vi.fn(async (id: number) => { await h.closeWindow(id); });
+    const key = browserKey('ghost');
+    useDedicated(mod, key);
+    await mod.__test__.resolveTabId(undefined, key, 'https://ghost.example/');
+    const slot = mod.__test__.getDedicatedSlot().slot;
+    expect(mod.__test__.getDedicatedSlot(slot).holders).toEqual([key]);
+    // Drop the lease the way a crashed/forgotten command would: registry entry gone,
+    // no release path ever ran.
+    mod.__test__.forgetSession(key);
+    mod.__test__.setDedicatedIdleTtlMs(1);
+    // First pass notices the dead holder and starts the idle clock; the window is
+    // closed on the next pass, like any other idle window.
+    expect(await mod.__test__.reapIdleDedicatedWindows()).toBe(0);
+    expect(mod.__test__.getDedicatedSlot(slot).holders).toEqual([]);
+    await new Promise((r) => setTimeout(r, 5));
+    expect(await mod.__test__.reapIdleDedicatedWindows()).toBe(1);
+    expect(mod.__test__.dedicatedSlotNames()).toEqual([]);
+  });
+});
