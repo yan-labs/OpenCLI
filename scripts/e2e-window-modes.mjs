@@ -11,8 +11,12 @@
  *   node scripts/e2e-window-modes.mjs
  *
  * Needs a live browser: `opencli doctor` green, and the yan-labs extension
- * loaded. It opens example.com/.org/.net plus one `brave search` (public, no
- * login) and closes what it opened; the adapter tab releases itself on idle.
+ * loaded. It opens example.com (twice — once `--window isolated`, once with no
+ * `--window` flag at all to exercise the current `dedicated` default),
+ * example.net (`--window background`, the mode that used to be the default),
+ * example.org, plus one `brave search` (public, no login, `--window
+ * background`); it closes what it opened, and the adapter tab releases itself
+ * on idle.
  *
  * Exit code 0 = all checks passed, 1 = a check failed, 2 = could not run.
  */
@@ -63,7 +67,7 @@ async function main() {
     process.exit(2);
   }
 
-  const sessions = { user: `${RUN}-user`, def: `${RUN}-def`, isoA: `${RUN}-isoA`, isoB: `${RUN}-isoB` };
+  const sessions = { user: `${RUN}-user`, def: `${RUN}-def`, isoA: `${RUN}-isoA`, isoB: `${RUN}-isoB`, ded: `${RUN}-ded` };
 
   try {
     // The person's own window, learned by binding whatever tab they are on.
@@ -76,7 +80,10 @@ async function main() {
     }
     process.stdout.write(`\nyour window: win${userWindow}\n\n`);
 
-    await opencli(['browser', sessions.def, 'open', 'https://example.net']);
+    // `background` used to be the implicit default; it is now an explicit,
+    // opt-in mode, so ask for it by name to keep testing exactly what these
+    // checks were written to test (borrowing the window you're already in).
+    await opencli(['browser', sessions.def, '--window', 'background', 'open', 'https://example.net']);
     await opencli(['browser', sessions.isoA, '--window', 'isolated', 'open', 'https://example.com']);
     await opencli(['browser', sessions.isoB, '--window', 'isolated', 'open', 'https://example.org']);
 
@@ -85,7 +92,7 @@ async function main() {
     const isoA = win.get(sessions.isoA);
     const isoB = win.get(sessions.isoB);
 
-    check('default mode opens in the window you are already using',
+    check('background mode opens in the window you are already using',
       def === userWindow, `def=win${def} you=win${userWindow}`);
     check('isolated stays out of your window',
       isoA !== undefined && isoA !== userWindow, `isoA=win${isoA}`);
@@ -104,17 +111,40 @@ async function main() {
     check('each browser session sits in its own group named after it',
       groupOf(sessions.def) === `OpenCLI: ${sessions.def}` && groupOf(sessions.isoA) === `OpenCLI: ${sessions.isoA}`,
       `def="${groupOf(sessions.def)}" isoA="${groupOf(sessions.isoA)}"`);
-    check('default mode did not have to open a window of its own',
+    check('background mode did not have to open a window of its own',
       entries.find(e => e.session === sessions.def)?.windowFallbackReason == null,
       `reason=${entries.find(e => e.session === sessions.def)?.windowFallbackReason ?? 'none'}`);
 
+    // The new default: no `--window` flag at all now means `dedicated`, which
+    // promises a window of its own (never the one you're using), that never
+    // takes real OS focus, that leaves your own window's standing untouched —
+    // and, unlike a plain hidden background tab, still renders `visible`.
+    await opencli(['browser', sessions.ded, 'open', 'https://example.com']);
+    const dedWindow = (await sessionWindows()).get(sessions.ded);
+    check('dedicated (the new default, no --window flag) opens outside your window',
+      dedWindow !== undefined && dedWindow !== userWindow, `ded=win${dedWindow} you=win${userWindow}`);
+
+    const dedVisibility = (await opencli(['browser', sessions.ded, 'eval', 'document.visibilityState'])).trim();
+    check('dedicated tab reports visibilityState visible',
+      dedVisibility === 'visible', `visibilityState=${dedVisibility}`);
+
+    const dedHasFocus = (await opencli(['browser', sessions.ded, 'eval', 'document.hasFocus()'])).trim();
+    check('dedicated window does not take real OS focus',
+      dedHasFocus === 'false', `document.hasFocus()=${dedHasFocus}`);
+
+    const userWindowAfterDedicated = (await sessionWindows()).get(sessions.user);
+    check('opening a dedicated window leaves your focused window unchanged',
+      userWindowAfterDedicated === userWindow, `before=win${userWindow} after=win${userWindowAfterDedicated}`);
+
     // Adapter surface: the same rule. `opencli <site> …` used to spawn a window of
-    // its own by design; it now borrows yours and groups under the site name.
+    // its own by design; `--window background` makes it borrow yours and group
+    // under the site name, the same explicit-override reasoning as `def` above —
+    // the adapter surface now defaults to `dedicated` too.
     // `--keep-tab true` keeps the one-shot lease alive long enough to read it back
     // (the 30s adapter idle timeout releases it on its own afterwards).
-    await opencli(['brave', 'search', 'example', '--limit', '1', '--keep-tab', 'true']).catch(() => {});
+    await opencli(['brave', 'search', 'example', '--limit', '1', '--keep-tab', 'true', '--window', 'background']).catch(() => {});
     const adapter = (await sessionEntries()).find(e => e.surface === 'adapter' && String(e.session).startsWith('site:brave'));
-    check('adapter command opens in the window you are already using',
+    check('adapter command (--window background) opens in the window you are already using',
       adapter !== undefined && adapter.windowId === userWindow,
       adapter ? `adapter=win${adapter.windowId} you=win${userWindow}` : 'no adapter lease found (did `opencli brave search` run?)');
     check('adapter tabs are grouped under the site name',

@@ -40,6 +40,7 @@ export interface ResolvedDedicatedPlacement {
   windowDisplay?: string;
   autoSelect?: boolean;
   foreignTabPolicy?: ForeignTabPolicy;
+  dedicatedIdleMs?: number;
 }
 
 function nonEmpty(value: string | undefined): string | undefined {
@@ -83,6 +84,18 @@ export function parseAutoSelect(raw: string, varName: string): boolean {
 }
 
 /**
+ * Parse a positive integer milliseconds value (OPENCLI_DEDICATED_IDLE_MS).
+ * Unlike the other parsers here, an invalid value is dropped silently (returns
+ * undefined) rather than thrown: a stray/malformed idle-TTL override must
+ * never fail an otherwise-unrelated command, it just falls back to the
+ * extension's own default idle TTL.
+ */
+function parseDedicatedIdleMs(raw: string): number | undefined {
+  const num = Number(raw);
+  return Number.isFinite(num) && Number.isInteger(num) && num > 0 ? num : undefined;
+}
+
+/**
  * Resolve the override+env tier of dedicated-window placement. Pure function
  * of its two inputs so tests never touch the real process.env or module-level
  * state. Only fields with a resolved (non-empty) value are present on the
@@ -121,6 +134,13 @@ export function resolveDedicatedPlacement(
   } else {
     const rawForeign = nonEmpty(env.OPENCLI_DEDICATED_FOREIGN_TABS);
     if (rawForeign !== undefined) result.foreignTabPolicy = parseForeignTabPolicy(rawForeign, 'OPENCLI_DEDICATED_FOREIGN_TABS');
+  }
+
+  // No override tier for this field (no --window-idle-ms CLI flag exists) — env only.
+  const rawIdleMs = nonEmpty(env.OPENCLI_DEDICATED_IDLE_MS);
+  if (rawIdleMs !== undefined) {
+    const parsed = parseDedicatedIdleMs(rawIdleMs);
+    if (parsed !== undefined) result.dedicatedIdleMs = parsed;
   }
 
   return result;

@@ -267,7 +267,7 @@ export async function executeCommand(
       const siteSession = resolveSiteSession(cmd, opts.siteSession);
       const session = resolveAdapterBrowserSession(cmd, siteSession);
       const keepTab = resolveKeepTab(siteSession, opts.keepTab);
-      const windowMode = resolveBrowserWindowMode(cmd.defaultWindowMode ?? 'background', opts.windowMode);
+      const windowMode = resolveBrowserWindowMode(cmd.defaultWindowMode ?? 'dedicated', opts.windowMode);
       // Persistent-session write commands take a logical lease on the site
       // session so a concurrent retry fails fast instead of driving the same
       // Chrome tab. The runId flows to the daemon on every command (acquire +
@@ -614,7 +614,7 @@ function normalizeWindowMode(name: string, raw: unknown): BrowserWindowMode | nu
   throw new ArgumentError(`${name} must be one of: foreground, active, background, isolated, dedicated. Received: "${String(raw)}"`);
 }
 
-function resolveBrowserWindowMode(defaultMode: BrowserWindowMode = 'background', rawOption?: unknown): BrowserWindowMode {
+function resolveBrowserWindowMode(defaultMode: BrowserWindowMode = 'dedicated', rawOption?: unknown): BrowserWindowMode {
   return normalizeWindowMode('--window', rawOption)
     ?? normalizeWindowMode('OPENCLI_WINDOW', process.env.OPENCLI_WINDOW)
     ?? defaultMode;

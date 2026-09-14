@@ -550,15 +550,28 @@ function getWindowRole(key: string, ownership: LeaseOwnership): WindowRole {
   return ownership === 'borrowed' ? 'borrowed-user' : getOwnedWindowRole(key);
 }
 
-// Both surfaces default to background. Raising a window or switching the active
-// tab is a visible interruption of whatever the person is doing, and nothing about
-// automation needs it: background windows are not throttled, `visibilityState` stays
-// `visible`, and every headless tell reads negative. Foreground is opt-in via
-// `--window foreground` / `OPENCLI_WINDOW=foreground`, for the rare flow that
-// genuinely needs the window up front (OS-level dialogs, clipboard, a human
-// finishing a CAPTCHA).
+// Both surfaces default to `dedicated`: an automation window of our own, created
+// unfocused, placed on a secondary display when the machine has one, with the
+// session's tab selected inside it so the page actually renders.
+//
+// What the default used to be, and why it changed: `background` does NOT open a
+// window of our own — it *borrows the window the person is currently using* and
+// opens the session's tab there, in a labelled tab group, following them to
+// whatever window they move to (see ensureOwnedContainerWindowUnlocked). It never
+// raises anything, but a script doing that on the window someone is typing in is
+// exactly the interruption this mode was supposed to avoid, and a non-active tab
+// in their window reads `visibilityState: hidden`, so lazily rendered pages never
+// finish loading. `dedicated` keeps automation out of their windows entirely while
+// still rendering `visible`.
+//
+// `background` (hidden tab in the person's window), `active`, `foreground` (real OS
+// focus — some sites, e.g. PageSpeed Insights, only render for a truly frontmost
+// window) and `isolated` all remain available via `--window` / `OPENCLI_WINDOW`.
+const DEFAULT_WINDOW_MODE: WindowMode = 'dedicated';
+let defaultWindowMode: WindowMode = DEFAULT_WINDOW_MODE;
+
 function getWindowMode(key: string): WindowMode {
-  return sessionOverrides.get(key)?.windowMode ?? 'background';
+  return sessionOverrides.get(key)?.windowMode ?? defaultWindowMode;
 }
 
 function makeAlarmName(leaseKey: string): string {
@@ -1563,7 +1576,8 @@ function initialTabIsAvailable(tabId: number | undefined): tabId is number {
 type Rect = { left: number; top: number; width: number; height: number };
 type ForeignTabPolicy = 'evict' | 'tolerate';
 type DedicatedPlacement = {
-  source: 'bounds' | 'display' | 'none';
+  /** `auto` = chosen here (automation display + dynamic tile), the default since the pool landed. */
+  source: 'bounds' | 'display' | 'auto' | 'none';
   requestedBounds: Rect | null;
   displayPattern: string | null;
   displayName: string | null;
@@ -1573,6 +1587,8 @@ type DedicatedPlacement = {
 type DedicatedEnsureResult = { windowId: number; initialTabId?: number; created: boolean; moved: boolean };
 type DedicatedSlotState = {
   slot: string;
+  /** Allocated from the pool (name generated here) rather than pinned by a caller. */
+  pooled: boolean;
   windowId: number | null;
   placeholderTabIds: Set<number>;
   placement: DedicatedPlacement;
@@ -1580,6 +1596,12 @@ type DedicatedSlotState = {
   foreignTabPolicy: ForeignTabPolicy;
   evictedTabs: number;
   promise: Promise<DedicatedEnsureResult> | null;
+  /** Lease keys currently holding this window. Empty = idle = reusable and reapable. */
+  holders: Set<string>;
+  /** When the last holder left. null while held. */
+  idleSince: number | null;
+  /** Tile index on the automation display; decides where the dynamic layout puts it. */
+  tileIndex: number | null;
 };
 type DisplayInfo = { id: string; name: string; primary: boolean; internal: boolean; bounds: Rect; workArea: Rect | null };
 type DedicatedTabOwner = 'lease' | 'placeholder' | 'automation' | 'foreign';
@@ -1593,7 +1615,30 @@ function dedicatedPlaceholderUrl(slot: string): string {
   return `${DEDICATED_PLACEHOLDER_PREFIX}${slot}`;
 }
 const DEDICATED_CELL = { width: 1280, height: 900, offsetX: 80, offsetY: 60 };
-const DEDICATED_CAPABILITIES = ['dedicated-window', 'window-slots', 'window-bounds', 'window-display', 'auto-select', 'foreign-tab-policy'] as const;
+/** Tile a window gets when there is room: the size every scraper's DOM was calibrated against. */
+const DEDICATED_PREFERRED_TILE = { width: 1280, height: 900 };
+/**
+ * Smallest tile we will hand out. Below this a report page reflows into its narrow
+ * layout and the captured DOM stops being comparable with a single-window run, so
+ * the honest answer is "no slot free right now", not a window nobody can read.
+ */
+const DEDICATED_MIN_TILE = { width: 900, height: 620 };
+/** Pooled window names. `pool-1`, `pool-2`, … — never a caller's session name. */
+const DEDICATED_POOL_PREFIX = 'pool-';
+/**
+ * How long an idle automation window is kept before the daemon closes it. 15 minutes:
+ * long enough that a person stepping away mid-task (or a script pausing between two
+ * scrapes) still reuses the warm window instead of paying window creation + placement
+ * again, short enough that a machine left alone overnight ends up with no OpenCLI
+ * windows at all. Callers override it per command with OPENCLI_DEDICATED_IDLE_MS.
+ */
+const DEDICATED_IDLE_TTL_DEFAULT_MS = 15 * 60_000;
+const DEDICATED_REAP_ALARM = 'opencli-dedicated-reap';
+let dedicatedIdleTtlMs = DEDICATED_IDLE_TTL_DEFAULT_MS;
+const DEDICATED_CAPABILITIES = [
+  'dedicated-window', 'window-slots', 'window-bounds', 'window-display', 'auto-select', 'foreign-tab-policy',
+  'window-pool', 'window-close', 'window-list', 'idle-reap', 'auto-display', 'dynamic-layout',
+] as const;
 
 function emptyDedicatedPlacement(): DedicatedPlacement {
   return { source: 'none', requestedBounds: null, displayPattern: null, displayName: null, displayFound: null, cell: null };
@@ -1664,6 +1709,37 @@ function pickDisplay(displays: DisplayInfo[] | null, pattern: string | null): Di
   return displays.length === 1 && usable(displays[0]) ? displays[0] : null;
 }
 
+/**
+ * Grid for `count` windows on one display. Chrome reports a window whose pixels are
+ * fully covered by another window as `hidden` whatever its active tab is, so the
+ * layout's job is: never overlap. The grid therefore follows the number of windows
+ * actually live right now rather than a fixed cell size — one window gets a full
+ * 1280x900, four windows on a 2560x1410 work area get 1280x705 each. Tiles never
+ * grow past the preferred size (a scraper reading a 2560-wide viewport would see a
+ * different layout than every calibration run) and never shrink past the minimum
+ * (same reason, in the other direction) — `null` means this display cannot show
+ * that many windows, which is a capacity answer, not a placement.
+ */
+function dedicatedGrid(area: Rect, count: number): { cols: number; rows: number; width: number; height: number } | null {
+  const n = Math.max(1, Math.trunc(count));
+  const cols = Math.min(n, Math.max(1, Math.ceil(Math.sqrt(n))));
+  const rows = Math.max(1, Math.ceil(n / cols));
+  const width = Math.min(DEDICATED_PREFERRED_TILE.width, Math.floor(area.width / cols));
+  const height = Math.min(DEDICATED_PREFERRED_TILE.height, Math.floor(area.height / rows));
+  if (width < Math.min(DEDICATED_MIN_TILE.width, area.width) || height < Math.min(DEDICATED_MIN_TILE.height, area.height)) return null;
+  return { cols, rows, width, height };
+}
+
+/** How many windows this display can show side by side without overlapping. */
+function dedicatedCapacity(area: Rect): number {
+  let capacity = 0;
+  for (let n = 1; n <= 64; n += 1) {
+    if (!dedicatedGrid(area, n)) break;
+    capacity = n;
+  }
+  return capacity;
+}
+
 function dedicatedCellGrid(display: Rect): { width: number; height: number; cols: number; rows: number; offsetX: number; offsetY: number } {
   const width = Math.max(1, Math.min(DEDICATED_CELL.width, display.width));
   const height = Math.max(1, Math.min(DEDICATED_CELL.height, display.height));
@@ -1680,6 +1756,156 @@ function dedicatedCellGrid(display: Rect): { width: number; height: number; cols
  * another one is occluded, and occluded windows report `hidden`. Cells beyond the
  * grid wrap around (and then do overlap); `sessions`/`window status` show the cell.
  */
+/** Rectangle of tile `index` when `count` windows share the display. */
+function dedicatedTile(area: Rect, index: number, count: number): Rect | null {
+  const grid = dedicatedGrid(area, count);
+  if (!grid) return null;
+  const capacity = grid.cols * grid.rows;
+  const i = ((Math.trunc(index) % capacity) + capacity) % capacity;
+  const col = i % grid.cols;
+  const row = Math.floor(i / grid.cols);
+  const gapX = Math.max(0, Math.floor((area.width - grid.cols * grid.width) / Math.max(1, grid.cols + 1)));
+  const gapY = Math.max(0, Math.floor((area.height - grid.rows * grid.height) / Math.max(1, grid.rows + 1)));
+  return {
+    left: area.left + gapX + col * (grid.width + gapX),
+    top: area.top + gapY + row * (grid.height + gapY),
+    width: grid.width,
+    height: grid.height,
+  };
+}
+
+/**
+ * The display OpenCLI puts its windows on when nobody named one: a secondary screen
+ * if there is one (an external or virtual display is where automation belongs —
+ * nobody is looking at it), preferring one the OS does not call internal. With a
+ * single screen there is no choice to make; the window still never takes focus.
+ */
+function pickAutomationDisplay(displays: DisplayInfo[] | null): DisplayInfo | null {
+  const usable = (displays ?? []).filter(d => d.bounds.width > 0 && d.bounds.height > 0);
+  if (!usable.length) return null;
+  const secondary = usable.filter(d => !d.primary);
+  const external = secondary.find(d => d.internal === false);
+  return external ?? secondary[0] ?? usable[0];
+}
+
+function displayArea(display: DisplayInfo): Rect {
+  return display.workArea && display.workArea.width > 0 && display.workArea.height > 0 ? display.workArea : display.bounds;
+}
+
+/** Slots with a live window, in tile order. */
+function liveDedicatedStates(): DedicatedSlotState[] {
+  return [...dedicatedSlots.values()]
+    .filter(state => state.windowId !== null)
+    .sort((a, b) => (a.tileIndex ?? 0) - (b.tileIndex ?? 0) || a.slot.localeCompare(b.slot));
+}
+
+function claimTileIndex(state: DedicatedSlotState): number {
+  if (state.tileIndex !== null) return state.tileIndex;
+  const taken = new Set(liveDedicatedStates().map(s => s.tileIndex).filter((i): i is number => i !== null));
+  let index = 0;
+  while (taken.has(index)) index += 1;
+  state.tileIndex = index;
+  return index;
+}
+
+/**
+ * Re-tile every automatically placed window. Called whenever the number of windows
+ * changes, because "how many are live" is an input to the layout: the window that
+ * had the display to itself has to give half of it back when a second one appears.
+ * Windows a caller placed by hand (explicit bounds or display pattern) are left alone,
+ * and a move never passes `focused` — re-tiling must not raise anything.
+ */
+async function retileDedicatedWindows(displays: DisplayInfo[] | null): Promise<void> {
+  const display = pickAutomationDisplay(displays);
+  if (!display) return;
+  const area = displayArea(display);
+  const auto = liveDedicatedStates().filter(state => state.placement.source === 'auto');
+  if (!auto.length) return;
+  const count = auto.length;
+  const updateWindow = (chrome.windows as unknown as { update?: (id: number, info: Partial<Rect>) => Promise<unknown> }).update;
+  if (typeof updateWindow !== 'function') return;
+  for (let i = 0; i < auto.length; i += 1) {
+    const state = auto[i];
+    const target = dedicatedTile(area, i, count);
+    if (!target || state.windowId === null) continue;
+    state.tileIndex = i;
+    state.placement.requestedBounds = target;
+    state.placement.cell = i;
+    state.placement.displayName = display.name;
+    state.placement.displayFound = true;
+    let current: Rect | null = null;
+    try {
+      const win = await chrome.windows.get(state.windowId);
+      if (win.state !== undefined && win.state !== 'normal') continue; // fullscreen/minimised: reported, never resized
+      current = rectFromWindow(win);
+    } catch {
+      forgetDedicatedWindow(state);
+      continue;
+    }
+    if (current && current.left === target.left && current.top === target.top
+      && current.width === target.width && current.height === target.height) continue;
+    try {
+      await updateWindow(state.windowId, target);
+    } catch (err) {
+      console.warn(`[opencli] Failed to re-tile dedicated window ${state.windowId}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+}
+
+/**
+ * Refuse to open a window the display cannot show without overlapping another one.
+ * The old behaviour here was to wrap around and stack a new window exactly on top of
+ * an existing one, which Chrome then reported as `hidden` while `window status` still
+ * claimed `onDisplay: true` — silent, and the caller only found out by getting a page
+ * that never rendered. A thrown, named error is the honest form of the same fact:
+ * there is no free slot right now, wait and retry.
+ */
+async function assertDedicatedCapacity(state: DedicatedSlotState): Promise<void> {
+  if (state.windowId !== null) return;
+  const { displays } = await listDisplays();
+  const display = pickAutomationDisplay(displays);
+  if (!display) return; // No display info: Chrome places it, nothing to ration.
+  const capacity = dedicatedCapacity(displayArea(display));
+  const live = liveDedicatedStates().length;
+  if (capacity > 0 && live >= capacity) {
+    throw new Error(`dedicated-pool-exhausted: ${live} automation window(s) already fill ${display.name || 'the automation display'} `
+      + `(capacity ${capacity} at ${DEDICATED_MIN_TILE.width}x${DEDICATED_MIN_TILE.height} minimum). `
+      + 'Wait for a running task to finish, or close one with `opencli browser <session> window close --slot <name>`.');
+  }
+}
+
+/**
+ * Close idle automation windows. Nobody should have to tidy up after OpenCLI: a window
+ * whose last lease ended more than the idle TTL ago is closed here, and the pooled slot
+ * that owned it disappears with it. The next command creates a fresh one.
+ */
+async function reapIdleDedicatedWindows(now = Date.now()): Promise<number> {
+  let closed = 0;
+  for (const state of [...dedicatedSlots.values()]) {
+    if (state.holders.size > 0 || state.idleSince === null) continue;
+    if (now - state.idleSince < dedicatedIdleTtlMs) continue;
+    if (state.windowId !== null) {
+      const windowId = state.windowId;
+      try {
+        await chrome.windows.remove(windowId);
+        closed += 1;
+        console.log(`[opencli] Closed idle dedicated window ${windowId} (slot=${state.slot}, idle ${Math.round((now - state.idleSince) / 1000)}s)`);
+      } catch {
+        // Already gone; fall through and forget it either way.
+      }
+      forgetDedicatedWindow(state);
+    }
+    state.tileIndex = null;
+    if (state.pooled) dedicatedSlots.delete(state.slot);
+  }
+  if (closed) {
+    const { displays } = await listDisplays();
+    await retileDedicatedWindows(displays);
+    await persistDedicatedState();
+  }
+  return closed;
+}
+
 function computeDisplayCell(display: Rect, cell: number): Rect {
   const g = dedicatedCellGrid(display);
   const capacity = g.cols * g.rows;
@@ -1729,11 +1955,12 @@ async function listDisplays(): Promise<{ displays: DisplayInfo[] | null; error?:
   }
 }
 
-function getDedicatedSlot(slot: string): DedicatedSlotState {
+function getDedicatedSlot(slot: string, pooled = false): DedicatedSlotState {
   let state = dedicatedSlots.get(slot);
   if (!state) {
     state = {
       slot,
+      pooled,
       windowId: null,
       placeholderTabIds: new Set(),
       placement: emptyDedicatedPlacement(),
@@ -1741,10 +1968,52 @@ function getDedicatedSlot(slot: string): DedicatedSlotState {
       foreignTabPolicy: 'evict',
       evictedTabs: 0,
       promise: null,
+      holders: new Set(),
+      idleSince: Date.now(),
+      tileIndex: null,
     };
     dedicatedSlots.set(slot, state);
   }
   return state;
+}
+
+/**
+ * A pooled window for this lease. The pool is what makes "one window, reused" the
+ * normal case: a session name no longer owns a window for the life of the browser —
+ * it borrows one while it has a tab there, and hands it back when the lease ends.
+ * An idle window is reused whatever session emptied it; only when every window is
+ * held at the same time does the pool grow, and `ensureDedicatedWindowUnlocked`
+ * refuses to grow past what the display can show without overlap.
+ */
+function poolSlotFor(leaseKey: string): DedicatedSlotState {
+  for (const state of dedicatedSlots.values()) if (state.holders.has(leaseKey)) return state;
+  const idle = [...dedicatedSlots.values()]
+    .filter(state => state.pooled && state.holders.size === 0)
+    // A live window first (no creation cost), then the one idle longest.
+    .sort((a, b) => Number(b.windowId !== null) - Number(a.windowId !== null) || (a.idleSince ?? 0) - (b.idleSince ?? 0));
+  const state = idle[0] ?? getDedicatedSlot(nextPoolSlotName(), true);
+  holdDedicatedSlot(state, leaseKey);
+  return state;
+}
+
+function nextPoolSlotName(): string {
+  for (let n = 1; ; n += 1) {
+    const name = `${DEDICATED_POOL_PREFIX}${n}`;
+    if (!dedicatedSlots.has(name)) return name;
+  }
+}
+
+function holdDedicatedSlot(state: DedicatedSlotState, leaseKey: string): void {
+  state.holders.add(leaseKey);
+  state.idleSince = null;
+}
+
+/** The lease let go: the window becomes reusable now and reapable later. */
+function releaseDedicatedHolder(leaseKey: string): void {
+  for (const state of dedicatedSlots.values()) {
+    if (!state.holders.delete(leaseKey)) continue;
+    if (state.holders.size === 0) state.idleSince = Date.now();
+  }
 }
 
 function dedicatedSlotForWindow(windowId: number | null | undefined): DedicatedSlotState | undefined {
@@ -1778,6 +2047,9 @@ async function persistDedicatedState(): Promise<void> {
       autoSelect: state.autoSelect,
       foreignTabPolicy: state.foreignTabPolicy,
       evictedTabs: state.evictedTabs,
+      pooled: state.pooled,
+      idleSince: state.idleSince,
+      tileIndex: state.tileIndex,
     };
   }
   try {
@@ -1789,7 +2061,7 @@ async function persistDedicatedState(): Promise<void> {
 
 function coerceDedicatedPlacement(raw: unknown): DedicatedPlacement {
   const p = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
-  const source = p.source === 'bounds' || p.source === 'display' ? p.source : 'none';
+  const source = p.source === 'bounds' || p.source === 'display' || p.source === 'auto' ? p.source : 'none';
   return {
     source,
     requestedBounds: isRect(p.requestedBounds) ? normalizeRect(p.requestedBounds) : null,
@@ -1816,11 +2088,17 @@ async function restoreDedicatedState(): Promise<void> {
   for (const [slot, value] of Object.entries(stored.slots as Record<string, unknown>)) {
     if (!DEDICATED_SLOT_PATTERN.test(slot) || !value || typeof value !== 'object') continue;
     const raw = value as Record<string, unknown>;
-    const state = getDedicatedSlot(slot);
+    const state = getDedicatedSlot(slot, raw.pooled === true || slot.startsWith(DEDICATED_POOL_PREFIX));
     state.autoSelect = raw.autoSelect !== false;
     state.foreignTabPolicy = raw.foreignTabPolicy === 'tolerate' ? 'tolerate' : 'evict';
     state.evictedTabs = typeof raw.evictedTabs === 'number' ? raw.evictedTabs : 0;
     state.placement = coerceDedicatedPlacement(raw.placement);
+    state.tileIndex = typeof raw.tileIndex === 'number' && Number.isInteger(raw.tileIndex) ? raw.tileIndex : null;
+    // Leases do not survive a worker restart, so every restored window starts idle —
+    // and its idle clock starts now rather than before the restart, so a window is
+    // never reaped for time it spent while nothing could have used it.
+    state.holders.clear();
+    state.idleSince = Date.now();
     if (typeof raw.windowId !== 'number') continue;
     try {
       await chrome.windows.get(raw.windowId);
@@ -1848,14 +2126,30 @@ function dedicatedPlacementRequest(leaseKey: string): DedicatedPlacementRequest 
   };
 }
 
+/**
+ * The window this lease uses: the slot the caller pinned with `--window-slot`, else
+ * one borrowed from the pool. Pinning stays supported (a script that wants a stable
+ * window per tool still gets it) but is no longer what happens by default.
+ */
 function dedicatedSlotNameFor(leaseKey: string): string {
-  return normalizeDedicatedSlot(sessionOverrides.get(leaseKey)?.windowSlot);
+  const pinned = sessionOverrides.get(leaseKey)?.windowSlot;
+  if (typeof pinned === 'string' && DEDICATED_SLOT_PATTERN.test(pinned)) {
+    holdDedicatedSlot(getDedicatedSlot(pinned), leaseKey);
+    return pinned;
+  }
+  return poolSlotFor(leaseKey).slot;
 }
 
 /** Record the dedicated-mode fields a command carries. Slot-level policy is last-writer-wins. */
 function applyDedicatedCommandFields(leaseKey: string, cmd: Command): void {
-  const slot = normalizeDedicatedSlot(cmd.windowSlot);
-  const patch: SessionOverrides = { windowSlot: slot, autoSelect: cmd.autoSelect !== false };
+  if (typeof cmd.dedicatedIdleMs === 'number' && Number.isFinite(cmd.dedicatedIdleMs) && cmd.dedicatedIdleMs > 0) {
+    dedicatedIdleTtlMs = Math.round(cmd.dedicatedIdleMs);
+  }
+  // No slot on the command means "any pooled window", not the slot literally named
+  // `default` — that difference is the whole point of the pool.
+  const pinnedSlot = typeof cmd.windowSlot === 'string' && DEDICATED_SLOT_PATTERN.test(cmd.windowSlot) ? cmd.windowSlot : null;
+  const slot = pinnedSlot ?? dedicatedSlotNameFor(leaseKey);
+  const patch: SessionOverrides = { autoSelect: cmd.autoSelect !== false, ...(pinnedSlot ? { windowSlot: pinnedSlot } : {}) };
   // Placement is replaced as a whole: bounds and a display pattern never linger from an earlier command.
   if (isRect(cmd.windowBounds)) {
     patch.windowBounds = normalizeRect(cmd.windowBounds);
@@ -1894,7 +2188,30 @@ async function resolveDedicatedTarget(state: DedicatedSlotState, request: Dedica
   if (placement.source === 'bounds' && placement.requestedBounds) {
     return { target: placement.requestedBounds, area: placement.requestedBounds };
   }
-  if (placement.source !== 'display' || !placement.displayPattern) return { target: null, area: null };
+  // Nobody named a place: put it on the automation display, in its own tile of the
+  // layout for however many windows are live. This is what makes plain
+  // `opencli browser <session> open <url>` land off the person's screen by itself.
+  if (placement.source !== 'display' || !placement.displayPattern) {
+    const { displays } = await listDisplays();
+    const display = pickAutomationDisplay(displays);
+    if (!display) {
+      state.placement = { ...emptyDedicatedPlacement(), source: 'auto' };
+      return { target: null, area: null };
+    }
+    const area = displayArea(display);
+    const others = liveDedicatedStates().filter(s => s.slot !== state.slot).length;
+    const index = claimTileIndex(state);
+    const target = dedicatedTile(area, index, Math.max(others + 1, index + 1));
+    state.placement = {
+      source: 'auto',
+      requestedBounds: target,
+      displayPattern: null,
+      displayName: display.name,
+      displayFound: true,
+      cell: target ? index : null,
+    };
+    return { target, area: target };
+  }
 
   const { displays } = await listDisplays();
   const display = pickDisplay(displays, placement.displayPattern);
@@ -1953,6 +2270,7 @@ async function ensureDedicatedWindowUnlocked(
     const adopted = await adoptOrphanDedicatedWindow(state);
     if (adopted) win = adopted;
   }
+  if (!win || state.windowId === null) await assertDedicatedCapacity(state);
   const { target, area } = await resolveDedicatedTarget(state, request);
   let created = false;
   let moved = false;
@@ -1980,6 +2298,12 @@ async function ensureDedicatedWindowUnlocked(
       dedicatedTabCreatesInFlight -= 1;
     }
     console.log(`[opencli] Created dedicated window ${state.windowId} (slot=${state.slot}, placement=${state.placement.source}${state.placement.displayName ? `:${state.placement.displayName}#${state.placement.cell}` : ''})`);
+    // One more window means everyone's tile just got smaller: re-tile before returning,
+    // so the caller never sees a window that is about to move under it.
+    if (state.placement.source === 'auto') {
+      const { displays } = await listDisplays();
+      await retileDedicatedWindows(displays);
+    }
   } else if (request.reposition && target && area && (win.state === undefined || win.state === 'normal')) {
     // Minimized / maximized / fullscreen windows are reported, not moved: resizing one
     // would leave fullscreen (a Space switch on macOS) or un-minimize it.
@@ -2208,6 +2532,18 @@ async function closeRedundantPlaceholders(state: DedicatedSlotState): Promise<vo
 }
 
 async function createDedicatedTabLease(leaseKey: string, targetUrl: string): Promise<ResolvedTab> {
+  try {
+    return await createDedicatedTabLeaseInner(leaseKey, targetUrl);
+  } catch (err) {
+    // No lease was created, so nothing will release the window later: hand it back
+    // now, or a failed command (a full pool, a closed window) would leak a holder and
+    // keep a window out of the pool for the rest of the browser session.
+    releaseDedicatedHolder(leaseKey);
+    throw err;
+  }
+}
+
+async function createDedicatedTabLeaseInner(leaseKey: string, targetUrl: string): Promise<ResolvedTab> {
   const slot = dedicatedSlotNameFor(leaseKey);
   const state = getDedicatedSlot(slot);
   const role = getOwnedWindowRole(leaseKey);
@@ -2330,6 +2666,11 @@ async function releaseDedicatedLeaseTabUnlocked(state: DedicatedSlotState, tabId
 
 type DedicatedWindowInfo = {
   slot: string;
+  pooled: boolean;
+  holders: number;
+  busy: boolean;
+  idleMs: number | null;
+  tileIndex: number | null;
   windowId: number | null;
   exists: boolean;
   state: string | null;
@@ -2387,6 +2728,11 @@ async function describeDedicatedSlot(state: DedicatedSlotState, displays: Displa
   }
   return {
     slot: state.slot,
+    pooled: state.pooled,
+    holders: state.holders.size,
+    busy: state.holders.size > 0,
+    idleMs: state.idleSince === null ? null : Math.max(0, Date.now() - state.idleSince),
+    tileIndex: state.tileIndex,
     windowId: win ? state.windowId : null,
     exists: !!win,
     state: win?.state ?? null,
@@ -2402,7 +2748,60 @@ async function describeDedicatedSlot(state: DedicatedSlotState, displays: Displa
   };
 }
 
+/**
+ * Close one automation window (or all of them) and forget the slot. The pool makes
+ * windows disposable, so this is the honest counterpart to `ensure`: a caller that is
+ * done, or a person tidying up, has a command for it instead of hunting for the window.
+ * A window still held by a live lease is only closed with `force`.
+ */
+async function closeDedicatedWindows(target: { slot?: string | null; all?: boolean; force?: boolean }): Promise<{ closed: string[]; skipped: { slot: string; reason: string }[] }> {
+  const closed: string[] = [];
+  const skipped: { slot: string; reason: string }[] = [];
+  const states = target.all
+    ? [...dedicatedSlots.values()]
+    : [...dedicatedSlots.values()].filter(state => state.slot === target.slot);
+  for (const state of states) {
+    if (state.holders.size > 0 && !target.force) {
+      skipped.push({ slot: state.slot, reason: `held by ${state.holders.size} live lease(s); pass force to close anyway` });
+      continue;
+    }
+    if (state.windowId !== null) {
+      try {
+        await chrome.windows.remove(state.windowId);
+      } catch {
+        // Already gone.
+      }
+      forgetDedicatedWindow(state);
+    }
+    state.holders.clear();
+    state.idleSince = Date.now();
+    state.tileIndex = null;
+    dedicatedSlots.delete(state.slot);
+    closed.push(state.slot);
+  }
+  if (closed.length) {
+    const { displays } = await listDisplays();
+    await retileDedicatedWindows(displays);
+    await persistDedicatedState();
+  }
+  return { closed, skipped };
+}
+
 async function handleDedicatedWindowOp(cmd: Command): Promise<Result> {
+  if (cmd.op === 'runtime-reload') {
+    // Applying a new extension build used to need a human in chrome://extensions;
+    // the reply is sent first because the reload kills this worker mid-flight.
+    setTimeout(() => { try { chrome.runtime.reload(); } catch { /* nothing left to do */ } }, 150);
+    return { id: cmd.id, ok: true, data: { reloading: true, note: 'extension reloading; leases and dedicated windows are dropped' } };
+  }
+  if (cmd.op === 'window-close') {
+    const all = cmd.windowSlot === undefined || cmd.windowSlot === null || cmd.windowSlot === '';
+    const { closed, skipped } = await closeDedicatedWindows({
+      ...(all ? { all: true } : { slot: String(cmd.windowSlot) }),
+      force: cmd.force === true,
+    });
+    return { id: cmd.id, ok: true, data: { closed, skipped, remaining: [...dedicatedSlots.keys()].sort() } };
+  }
   if (cmd.op === 'window-ensure') {
     const slot = normalizeDedicatedSlot(cmd.windowSlot);
     const state = getDedicatedSlot(slot);
@@ -2423,6 +2822,10 @@ async function handleDedicatedWindowOp(cmd: Command): Promise<Result> {
     if (filter && state.slot !== filter) continue;
     windows.push(await describeDedicatedSlot(state, displays));
   }
+  const automationDisplay = pickAutomationDisplay(displays);
+  const area = automationDisplay ? displayArea(automationDisplay) : null;
+  const capacity = area ? dedicatedCapacity(area) : null;
+  const live = liveDedicatedStates().length;
   return {
     id: cmd.id,
     ok: true,
@@ -2432,6 +2835,16 @@ async function handleDedicatedWindowOp(cmd: Command): Promise<Result> {
       capabilities: [...DEDICATED_CAPABILITIES],
       displays,
       ...(displays === null ? { displaysError: error } : {}),
+      pool: {
+        // What a caller needs to decide "run now or queue": how many windows the
+        // automation display can show without overlap, how many exist, how many are free.
+        automationDisplay: automationDisplay ? { id: automationDisplay.id, name: automationDisplay.name, primary: automationDisplay.primary, internal: automationDisplay.internal, area } : null,
+        capacity,
+        live,
+        idle: [...dedicatedSlots.values()].filter(s => s.holders.size === 0).length,
+        free: capacity === null ? null : Math.max(0, capacity - live) + [...dedicatedSlots.values()].filter(s => s.holders.size === 0 && s.windowId !== null).length,
+        idleTtlMs: dedicatedIdleTtlMs,
+      },
       windows,
     },
   };
@@ -2604,6 +3017,7 @@ function initialize(): void {
   if (initialized) return;
   initialized = true;
   chrome.alarms.create('keepalive', { periodInMinutes: 0.5 }); // Chrome production minimum: 30 seconds
+  chrome.alarms.create(DEDICATED_REAP_ALARM, { periodInMinutes: 0.5 });
   executor.registerListeners();
   try {
     const registerFrameTracking = (executor as { registerFrameTracking?: () => void }).registerFrameTracking;
@@ -2658,6 +3072,10 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   // gate on recovery so releaseLease never persists an empty snapshot.
   await workerReady;
   if (alarm.name === 'keepalive') void connect();
+  if (alarm.name === DEDICATED_REAP_ALARM) {
+    await reapIdleDedicatedWindows().catch(() => 0);
+    return;
+  }
   const leaseKey = leaseKeyFromAlarmName(alarm.name);
   if (!leaseKey) return;
   if ((activeCommandCounts.get(leaseKey) ?? 0) > 0) {
@@ -3585,7 +4003,7 @@ function stripOpenCliFrameRoutingParams(params: Record<string, unknown>, stripFr
 }
 
 async function handleSessions(cmd: Command): Promise<Result> {
-  if (cmd.op === 'window-status' || cmd.op === 'window-ensure') return handleDedicatedWindowOp(cmd);
+  if (cmd.op === 'window-status' || cmd.op === 'window-ensure' || cmd.op === 'window-list' || cmd.op === 'window-close' || cmd.op === 'runtime-reload') return handleDedicatedWindowOp(cmd);
   if (cmd.op === 'cleanup') {
     const keys = [...automationSessions.keys()];
     for (const key of keys) await releaseLease(key, 'cleanup');
@@ -3815,6 +4233,9 @@ async function releaseLease(leaseKey: string, reason: string = 'released'): Prom
       await safeDetach(tabId);
       identity.evictTab(tabId);
       const dedicatedSlot = dedicatedSlotForWindow(session.windowId);
+      // Whatever happens to the tab, the window goes back to the pool for the next
+      // caller and starts its idle clock.
+      releaseDedicatedHolder(leaseKey);
       if (dedicatedSlot) {
         // Dedicated windows outlive their leases: the last tab stays as a placeholder.
         const outcome = await releaseDedicatedLeaseTab(dedicatedSlot, tabId);
@@ -4017,10 +4438,31 @@ export const __test__ = {
   restoreDedicatedState,
   handleDedicatedWindowOp,
   setForeignTabSettleMs: (ms: number) => { foreignTabSettleMs = ms; },
-  getDedicatedSlot: (slot: string = 'default') => {
-    const state = dedicatedSlots.get(slot);
+  // Lets a test pin the mode a session gets when no command ever named one.
+  setDefaultWindowMode: (mode: WindowMode) => { defaultWindowMode = mode; },
+  resetDefaultWindowMode: () => { defaultWindowMode = DEFAULT_WINDOW_MODE; },
+  // Pool / layout / reaper surface.
+  dedicatedSlotNames: () => [...dedicatedSlots.keys()],
+  dedicatedGrid,
+  dedicatedTile,
+  dedicatedCapacity,
+  pickAutomationDisplay,
+  reapIdleDedicatedWindows,
+  closeDedicatedWindows,
+  setDedicatedIdleTtlMs: (ms: number) => { dedicatedIdleTtlMs = ms; },
+  getDedicatedIdleTtlMs: () => dedicatedIdleTtlMs,
+  // No slot name = "the automation window", whatever the pool called it: tests that
+  // predate pooling asked for slot `default` and meant exactly that.
+  getDedicatedSlot: (slot?: string) => {
+    const state = slot !== undefined
+      ? dedicatedSlots.get(slot)
+      : (liveDedicatedStates()[0] ?? [...dedicatedSlots.values()][0]);
     return state ? {
       slot: state.slot,
+      pooled: state.pooled,
+      holders: [...state.holders],
+      idleSince: state.idleSince,
+      tileIndex: state.tileIndex,
       windowId: state.windowId,
       placeholderTabIds: [...state.placeholderTabIds],
       placement: { ...state.placement },

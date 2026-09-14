@@ -1327,8 +1327,10 @@ function getOwnedWindowRole(key) {
 function getWindowRole(key, ownership) {
   return ownership === "borrowed" ? "borrowed-user" : getOwnedWindowRole(key);
 }
+const DEFAULT_WINDOW_MODE = "dedicated";
+let defaultWindowMode = DEFAULT_WINDOW_MODE;
 function getWindowMode(key) {
-  return sessionOverrides.get(key)?.windowMode ?? "background";
+  return sessionOverrides.get(key)?.windowMode ?? defaultWindowMode;
 }
 function makeAlarmName(leaseKey) {
   return `${LEASE_IDLE_ALARM_PREFIX}${encodeURIComponent(leaseKey)}`;
@@ -1958,7 +1960,26 @@ function dedicatedPlaceholderUrl(slot) {
   return `${DEDICATED_PLACEHOLDER_PREFIX}${slot}`;
 }
 const DEDICATED_CELL = { width: 1280, height: 900, offsetX: 80, offsetY: 60 };
-const DEDICATED_CAPABILITIES = ["dedicated-window", "window-slots", "window-bounds", "window-display", "auto-select", "foreign-tab-policy"];
+const DEDICATED_PREFERRED_TILE = { width: 1280, height: 900 };
+const DEDICATED_MIN_TILE = { width: 900, height: 620 };
+const DEDICATED_POOL_PREFIX = "pool-";
+const DEDICATED_IDLE_TTL_DEFAULT_MS = 15 * 6e4;
+const DEDICATED_REAP_ALARM = "opencli-dedicated-reap";
+let dedicatedIdleTtlMs = DEDICATED_IDLE_TTL_DEFAULT_MS;
+const DEDICATED_CAPABILITIES = [
+  "dedicated-window",
+  "window-slots",
+  "window-bounds",
+  "window-display",
+  "auto-select",
+  "foreign-tab-policy",
+  "window-pool",
+  "window-close",
+  "window-list",
+  "idle-reap",
+  "auto-display",
+  "dynamic-layout"
+];
 function emptyDedicatedPlacement() {
   return { source: "none", requestedBounds: null, displayPattern: null, displayName: null, displayFound: null, cell: null };
 }
@@ -2010,6 +2031,23 @@ function pickDisplay(displays, pattern) {
   if (secondary) return secondary;
   return displays.length === 1 && usable(displays[0]) ? displays[0] : null;
 }
+function dedicatedGrid(area, count) {
+  const n = Math.max(1, Math.trunc(count));
+  const cols = Math.min(n, Math.max(1, Math.ceil(Math.sqrt(n))));
+  const rows = Math.max(1, Math.ceil(n / cols));
+  const width = Math.min(DEDICATED_PREFERRED_TILE.width, Math.floor(area.width / cols));
+  const height = Math.min(DEDICATED_PREFERRED_TILE.height, Math.floor(area.height / rows));
+  if (width < Math.min(DEDICATED_MIN_TILE.width, area.width) || height < Math.min(DEDICATED_MIN_TILE.height, area.height)) return null;
+  return { cols, rows, width, height };
+}
+function dedicatedCapacity(area) {
+  let capacity = 0;
+  for (let n = 1; n <= 64; n += 1) {
+    if (!dedicatedGrid(area, n)) break;
+    capacity = n;
+  }
+  return capacity;
+}
 function dedicatedCellGrid(display) {
   const width = Math.max(1, Math.min(DEDICATED_CELL.width, display.width));
   const height = Math.max(1, Math.min(DEDICATED_CELL.height, display.height));
@@ -2018,6 +2056,114 @@ function dedicatedCellGrid(display) {
   const offsetX = Math.max(0, Math.min(DEDICATED_CELL.offsetX, Math.floor((display.width - cols * width) / cols)));
   const offsetY = Math.max(0, Math.min(DEDICATED_CELL.offsetY, Math.floor((display.height - rows * height) / rows)));
   return { width, height, cols, rows, offsetX, offsetY };
+}
+function dedicatedTile(area, index, count) {
+  const grid = dedicatedGrid(area, count);
+  if (!grid) return null;
+  const capacity = grid.cols * grid.rows;
+  const i = (Math.trunc(index) % capacity + capacity) % capacity;
+  const col = i % grid.cols;
+  const row = Math.floor(i / grid.cols);
+  const gapX = Math.max(0, Math.floor((area.width - grid.cols * grid.width) / Math.max(1, grid.cols + 1)));
+  const gapY = Math.max(0, Math.floor((area.height - grid.rows * grid.height) / Math.max(1, grid.rows + 1)));
+  return {
+    left: area.left + gapX + col * (grid.width + gapX),
+    top: area.top + gapY + row * (grid.height + gapY),
+    width: grid.width,
+    height: grid.height
+  };
+}
+function pickAutomationDisplay(displays) {
+  const usable = (displays ?? []).filter((d) => d.bounds.width > 0 && d.bounds.height > 0);
+  if (!usable.length) return null;
+  const secondary = usable.filter((d) => !d.primary);
+  const external = secondary.find((d) => d.internal === false);
+  return external ?? secondary[0] ?? usable[0];
+}
+function displayArea(display) {
+  return display.workArea && display.workArea.width > 0 && display.workArea.height > 0 ? display.workArea : display.bounds;
+}
+function liveDedicatedStates() {
+  return [...dedicatedSlots.values()].filter((state) => state.windowId !== null).sort((a, b) => (a.tileIndex ?? 0) - (b.tileIndex ?? 0) || a.slot.localeCompare(b.slot));
+}
+function claimTileIndex(state) {
+  if (state.tileIndex !== null) return state.tileIndex;
+  const taken = new Set(liveDedicatedStates().map((s) => s.tileIndex).filter((i) => i !== null));
+  let index = 0;
+  while (taken.has(index)) index += 1;
+  state.tileIndex = index;
+  return index;
+}
+async function retileDedicatedWindows(displays) {
+  const display = pickAutomationDisplay(displays);
+  if (!display) return;
+  const area = displayArea(display);
+  const auto = liveDedicatedStates().filter((state) => state.placement.source === "auto");
+  if (!auto.length) return;
+  const count = auto.length;
+  const updateWindow = chrome.windows.update;
+  if (typeof updateWindow !== "function") return;
+  for (let i = 0; i < auto.length; i += 1) {
+    const state = auto[i];
+    const target = dedicatedTile(area, i, count);
+    if (!target || state.windowId === null) continue;
+    state.tileIndex = i;
+    state.placement.requestedBounds = target;
+    state.placement.cell = i;
+    state.placement.displayName = display.name;
+    state.placement.displayFound = true;
+    let current = null;
+    try {
+      const win = await chrome.windows.get(state.windowId);
+      if (win.state !== void 0 && win.state !== "normal") continue;
+      current = rectFromWindow(win);
+    } catch {
+      forgetDedicatedWindow(state);
+      continue;
+    }
+    if (current && current.left === target.left && current.top === target.top && current.width === target.width && current.height === target.height) continue;
+    try {
+      await updateWindow(state.windowId, target);
+    } catch (err) {
+      console.warn(`[opencli] Failed to re-tile dedicated window ${state.windowId}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+}
+async function assertDedicatedCapacity(state) {
+  if (state.windowId !== null) return;
+  const { displays } = await listDisplays();
+  const display = pickAutomationDisplay(displays);
+  if (!display) return;
+  const capacity = dedicatedCapacity(displayArea(display));
+  const live = liveDedicatedStates().length;
+  if (capacity > 0 && live >= capacity) {
+    throw new Error(`dedicated-pool-exhausted: ${live} automation window(s) already fill ${display.name || "the automation display"} (capacity ${capacity} at ${DEDICATED_MIN_TILE.width}x${DEDICATED_MIN_TILE.height} minimum). Wait for a running task to finish, or close one with \`opencli browser <session> window close --slot <name>\`.`);
+  }
+}
+async function reapIdleDedicatedWindows(now = Date.now()) {
+  let closed = 0;
+  for (const state of [...dedicatedSlots.values()]) {
+    if (state.holders.size > 0 || state.idleSince === null) continue;
+    if (now - state.idleSince < dedicatedIdleTtlMs) continue;
+    if (state.windowId !== null) {
+      const windowId = state.windowId;
+      try {
+        await chrome.windows.remove(windowId);
+        closed += 1;
+        console.log(`[opencli] Closed idle dedicated window ${windowId} (slot=${state.slot}, idle ${Math.round((now - state.idleSince) / 1e3)}s)`);
+      } catch {
+      }
+      forgetDedicatedWindow(state);
+    }
+    state.tileIndex = null;
+    if (state.pooled) dedicatedSlots.delete(state.slot);
+  }
+  if (closed) {
+    const { displays } = await listDisplays();
+    await retileDedicatedWindows(displays);
+    await persistDedicatedState();
+  }
+  return closed;
 }
 function computeDisplayCell(display, cell) {
   const g = dedicatedCellGrid(display);
@@ -2066,22 +2212,49 @@ async function listDisplays() {
     return { displays: null, error: err instanceof Error ? err.message : String(err) };
   }
 }
-function getDedicatedSlot(slot) {
+function getDedicatedSlot(slot, pooled = false) {
   let state = dedicatedSlots.get(slot);
   if (!state) {
     state = {
       slot,
+      pooled,
       windowId: null,
       placeholderTabIds: /* @__PURE__ */ new Set(),
       placement: emptyDedicatedPlacement(),
       autoSelect: true,
       foreignTabPolicy: "evict",
       evictedTabs: 0,
-      promise: null
+      promise: null,
+      holders: /* @__PURE__ */ new Set(),
+      idleSince: Date.now(),
+      tileIndex: null
     };
     dedicatedSlots.set(slot, state);
   }
   return state;
+}
+function poolSlotFor(leaseKey) {
+  for (const state2 of dedicatedSlots.values()) if (state2.holders.has(leaseKey)) return state2;
+  const idle = [...dedicatedSlots.values()].filter((state2) => state2.pooled && state2.holders.size === 0).sort((a, b) => Number(b.windowId !== null) - Number(a.windowId !== null) || (a.idleSince ?? 0) - (b.idleSince ?? 0));
+  const state = idle[0] ?? getDedicatedSlot(nextPoolSlotName(), true);
+  holdDedicatedSlot(state, leaseKey);
+  return state;
+}
+function nextPoolSlotName() {
+  for (let n = 1; ; n += 1) {
+    const name = `${DEDICATED_POOL_PREFIX}${n}`;
+    if (!dedicatedSlots.has(name)) return name;
+  }
+}
+function holdDedicatedSlot(state, leaseKey) {
+  state.holders.add(leaseKey);
+  state.idleSince = null;
+}
+function releaseDedicatedHolder(leaseKey) {
+  for (const state of dedicatedSlots.values()) {
+    if (!state.holders.delete(leaseKey)) continue;
+    if (state.holders.size === 0) state.idleSince = Date.now();
+  }
 }
 function dedicatedSlotForWindow(windowId) {
   if (windowId === null || windowId === void 0) return void 0;
@@ -2109,7 +2282,10 @@ async function persistDedicatedState() {
       placement: state.placement,
       autoSelect: state.autoSelect,
       foreignTabPolicy: state.foreignTabPolicy,
-      evictedTabs: state.evictedTabs
+      evictedTabs: state.evictedTabs,
+      pooled: state.pooled,
+      idleSince: state.idleSince,
+      tileIndex: state.tileIndex
     };
   }
   try {
@@ -2119,7 +2295,7 @@ async function persistDedicatedState() {
 }
 function coerceDedicatedPlacement(raw) {
   const p = raw && typeof raw === "object" ? raw : {};
-  const source = p.source === "bounds" || p.source === "display" ? p.source : "none";
+  const source = p.source === "bounds" || p.source === "display" || p.source === "auto" ? p.source : "none";
   return {
     source,
     requestedBounds: isRect(p.requestedBounds) ? normalizeRect(p.requestedBounds) : null,
@@ -2144,11 +2320,14 @@ async function restoreDedicatedState() {
   for (const [slot, value] of Object.entries(stored.slots)) {
     if (!DEDICATED_SLOT_PATTERN.test(slot) || !value || typeof value !== "object") continue;
     const raw = value;
-    const state = getDedicatedSlot(slot);
+    const state = getDedicatedSlot(slot, raw.pooled === true || slot.startsWith(DEDICATED_POOL_PREFIX));
     state.autoSelect = raw.autoSelect !== false;
     state.foreignTabPolicy = raw.foreignTabPolicy === "tolerate" ? "tolerate" : "evict";
     state.evictedTabs = typeof raw.evictedTabs === "number" ? raw.evictedTabs : 0;
     state.placement = coerceDedicatedPlacement(raw.placement);
+    state.tileIndex = typeof raw.tileIndex === "number" && Number.isInteger(raw.tileIndex) ? raw.tileIndex : null;
+    state.holders.clear();
+    state.idleSince = Date.now();
     if (typeof raw.windowId !== "number") continue;
     try {
       await chrome.windows.get(raw.windowId);
@@ -2174,11 +2353,20 @@ function dedicatedPlacementRequest(leaseKey) {
   };
 }
 function dedicatedSlotNameFor(leaseKey) {
-  return normalizeDedicatedSlot(sessionOverrides.get(leaseKey)?.windowSlot);
+  const pinned = sessionOverrides.get(leaseKey)?.windowSlot;
+  if (typeof pinned === "string" && DEDICATED_SLOT_PATTERN.test(pinned)) {
+    holdDedicatedSlot(getDedicatedSlot(pinned), leaseKey);
+    return pinned;
+  }
+  return poolSlotFor(leaseKey).slot;
 }
 function applyDedicatedCommandFields(leaseKey, cmd) {
-  const slot = normalizeDedicatedSlot(cmd.windowSlot);
-  const patch = { windowSlot: slot, autoSelect: cmd.autoSelect !== false };
+  if (typeof cmd.dedicatedIdleMs === "number" && Number.isFinite(cmd.dedicatedIdleMs) && cmd.dedicatedIdleMs > 0) {
+    dedicatedIdleTtlMs = Math.round(cmd.dedicatedIdleMs);
+  }
+  const pinnedSlot = typeof cmd.windowSlot === "string" && DEDICATED_SLOT_PATTERN.test(cmd.windowSlot) ? cmd.windowSlot : null;
+  const slot = pinnedSlot ?? dedicatedSlotNameFor(leaseKey);
+  const patch = { autoSelect: cmd.autoSelect !== false, ...pinnedSlot ? { windowSlot: pinnedSlot } : {} };
   if (isRect(cmd.windowBounds)) {
     patch.windowBounds = normalizeRect(cmd.windowBounds);
     patch.windowDisplay = typeof cmd.windowDisplay === "string" && cmd.windowDisplay.trim() ? cmd.windowDisplay.trim() : void 0;
@@ -2207,7 +2395,27 @@ async function resolveDedicatedTarget(state, request) {
   if (placement.source === "bounds" && placement.requestedBounds) {
     return { target: placement.requestedBounds, area: placement.requestedBounds };
   }
-  if (placement.source !== "display" || !placement.displayPattern) return { target: null, area: null };
+  if (placement.source !== "display" || !placement.displayPattern) {
+    const { displays: displays2 } = await listDisplays();
+    const display2 = pickAutomationDisplay(displays2);
+    if (!display2) {
+      state.placement = { ...emptyDedicatedPlacement(), source: "auto" };
+      return { target: null, area: null };
+    }
+    const area = displayArea(display2);
+    const others = liveDedicatedStates().filter((s) => s.slot !== state.slot).length;
+    const index = claimTileIndex(state);
+    const target = dedicatedTile(area, index, Math.max(others + 1, index + 1));
+    state.placement = {
+      source: "auto",
+      requestedBounds: target,
+      displayPattern: null,
+      displayName: display2.name,
+      displayFound: true,
+      cell: target ? index : null
+    };
+    return { target, area: target };
+  }
   const { displays } = await listDisplays();
   const display = pickDisplay(displays, placement.displayPattern);
   if (!display) {
@@ -2256,6 +2464,7 @@ async function ensureDedicatedWindowUnlocked(state, request) {
     const adopted = await adoptOrphanDedicatedWindow(state);
     if (adopted) win = adopted;
   }
+  if (!win || state.windowId === null) await assertDedicatedCapacity(state);
   const { target, area } = await resolveDedicatedTarget(state, request);
   let created = false;
   let moved = false;
@@ -2280,6 +2489,10 @@ async function ensureDedicatedWindowUnlocked(state, request) {
       dedicatedTabCreatesInFlight -= 1;
     }
     console.log(`[opencli] Created dedicated window ${state.windowId} (slot=${state.slot}, placement=${state.placement.source}${state.placement.displayName ? `:${state.placement.displayName}#${state.placement.cell}` : ""})`);
+    if (state.placement.source === "auto") {
+      const { displays } = await listDisplays();
+      await retileDedicatedWindows(displays);
+    }
   } else if (request.reposition && target && area && (win.state === void 0 || win.state === "normal")) {
     const current = rectFromWindow(win);
     if (!current || !rectCenterInside(current, area)) {
@@ -2475,6 +2688,14 @@ async function closeRedundantPlaceholders(state) {
   await persistDedicatedState();
 }
 async function createDedicatedTabLease(leaseKey, targetUrl) {
+  try {
+    return await createDedicatedTabLeaseInner(leaseKey, targetUrl);
+  } catch (err) {
+    releaseDedicatedHolder(leaseKey);
+    throw err;
+  }
+}
+async function createDedicatedTabLeaseInner(leaseKey, targetUrl) {
   const slot = dedicatedSlotNameFor(leaseKey);
   const state = getDedicatedSlot(slot);
   const role = getOwnedWindowRole(leaseKey);
@@ -2626,6 +2847,11 @@ async function describeDedicatedSlot(state, displays) {
   }
   return {
     slot: state.slot,
+    pooled: state.pooled,
+    holders: state.holders.size,
+    busy: state.holders.size > 0,
+    idleMs: state.idleSince === null ? null : Math.max(0, Date.now() - state.idleSince),
+    tileIndex: state.tileIndex,
     windowId: win ? state.windowId : null,
     exists: !!win,
     state: win?.state ?? null,
@@ -2640,7 +2866,53 @@ async function describeDedicatedSlot(state, displays) {
     evictedTabs: state.evictedTabs
   };
 }
+async function closeDedicatedWindows(target) {
+  const closed = [];
+  const skipped = [];
+  const states = target.all ? [...dedicatedSlots.values()] : [...dedicatedSlots.values()].filter((state) => state.slot === target.slot);
+  for (const state of states) {
+    if (state.holders.size > 0 && !target.force) {
+      skipped.push({ slot: state.slot, reason: `held by ${state.holders.size} live lease(s); pass force to close anyway` });
+      continue;
+    }
+    if (state.windowId !== null) {
+      try {
+        await chrome.windows.remove(state.windowId);
+      } catch {
+      }
+      forgetDedicatedWindow(state);
+    }
+    state.holders.clear();
+    state.idleSince = Date.now();
+    state.tileIndex = null;
+    dedicatedSlots.delete(state.slot);
+    closed.push(state.slot);
+  }
+  if (closed.length) {
+    const { displays } = await listDisplays();
+    await retileDedicatedWindows(displays);
+    await persistDedicatedState();
+  }
+  return { closed, skipped };
+}
 async function handleDedicatedWindowOp(cmd) {
+  if (cmd.op === "runtime-reload") {
+    setTimeout(() => {
+      try {
+        chrome.runtime.reload();
+      } catch {
+      }
+    }, 150);
+    return { id: cmd.id, ok: true, data: { reloading: true, note: "extension reloading; leases and dedicated windows are dropped" } };
+  }
+  if (cmd.op === "window-close") {
+    const all = cmd.windowSlot === void 0 || cmd.windowSlot === null || cmd.windowSlot === "";
+    const { closed, skipped } = await closeDedicatedWindows({
+      ...all ? { all: true } : { slot: String(cmd.windowSlot) },
+      force: cmd.force === true
+    });
+    return { id: cmd.id, ok: true, data: { closed, skipped, remaining: [...dedicatedSlots.keys()].sort() } };
+  }
   if (cmd.op === "window-ensure") {
     const slot = normalizeDedicatedSlot(cmd.windowSlot);
     const state = getDedicatedSlot(slot);
@@ -2661,6 +2933,10 @@ async function handleDedicatedWindowOp(cmd) {
     if (filter && state.slot !== filter) continue;
     windows.push(await describeDedicatedSlot(state, displays));
   }
+  const automationDisplay = pickAutomationDisplay(displays);
+  const area = automationDisplay ? displayArea(automationDisplay) : null;
+  const capacity = area ? dedicatedCapacity(area) : null;
+  const live = liveDedicatedStates().length;
   return {
     id: cmd.id,
     ok: true,
@@ -2670,6 +2946,16 @@ async function handleDedicatedWindowOp(cmd) {
       capabilities: [...DEDICATED_CAPABILITIES],
       displays,
       ...displays === null ? { displaysError: error } : {},
+      pool: {
+        // What a caller needs to decide "run now or queue": how many windows the
+        // automation display can show without overlap, how many exist, how many are free.
+        automationDisplay: automationDisplay ? { id: automationDisplay.id, name: automationDisplay.name, primary: automationDisplay.primary, internal: automationDisplay.internal, area } : null,
+        capacity,
+        live,
+        idle: [...dedicatedSlots.values()].filter((s) => s.holders.size === 0).length,
+        free: capacity === null ? null : Math.max(0, capacity - live) + [...dedicatedSlots.values()].filter((s) => s.holders.size === 0 && s.windowId !== null).length,
+        idleTtlMs: dedicatedIdleTtlMs
+      },
       windows
     }
   };
@@ -2806,6 +3092,7 @@ function initialize() {
   if (initialized) return;
   initialized = true;
   chrome.alarms.create("keepalive", { periodInMinutes: 0.5 });
+  chrome.alarms.create(DEDICATED_REAP_ALARM, { periodInMinutes: 0.5 });
   registerListeners();
   try {
     const registerFrameTracking$1 = registerFrameTracking;
@@ -2839,6 +3126,10 @@ initialize();
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   await workerReady;
   if (alarm.name === "keepalive") void connect();
+  if (alarm.name === DEDICATED_REAP_ALARM) {
+    await reapIdleDedicatedWindows().catch(() => 0);
+    return;
+  }
   const leaseKey = leaseKeyFromAlarmName(alarm.name);
   if (!leaseKey) return;
   if ((activeCommandCounts.get(leaseKey) ?? 0) > 0) {
@@ -3575,7 +3866,7 @@ function stripOpenCliFrameRoutingParams(params, stripFrameId) {
   return rest;
 }
 async function handleSessions(cmd) {
-  if (cmd.op === "window-status" || cmd.op === "window-ensure") return handleDedicatedWindowOp(cmd);
+  if (cmd.op === "window-status" || cmd.op === "window-ensure" || cmd.op === "window-list" || cmd.op === "window-close" || cmd.op === "runtime-reload") return handleDedicatedWindowOp(cmd);
   if (cmd.op === "cleanup") {
     const keys = [...automationSessions.keys()];
     for (const key of keys) await releaseLease(key, "cleanup");
@@ -3749,6 +4040,7 @@ async function releaseLease(leaseKey, reason = "released") {
       await safeDetach(tabId);
       evictTab(tabId);
       const dedicatedSlot = dedicatedSlotForWindow(session.windowId);
+      releaseDedicatedHolder(leaseKey);
       if (dedicatedSlot) {
         const outcome = await releaseDedicatedLeaseTab(dedicatedSlot, tabId);
         console.log(`[opencli] Released dedicated tab lease ${tabId} (${outcome}, slot=${dedicatedSlot.slot}, session=${session.session}, surface=${session.surface}, ${reason})`);

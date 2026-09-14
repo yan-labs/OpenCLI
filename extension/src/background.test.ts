@@ -281,6 +281,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
 
     const result = await mod.__test__.handleTabs({ id: '1', action: 'tabs', op: 'list', session: adapterKey('twitter') }, adapterKey('twitter'));
@@ -332,6 +335,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
 
     const result = await mod.__test__.handleCommand({ id: 'frames', action: 'frames', session: 'twitter', surface: 'adapter' });
@@ -372,6 +378,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
 
     const result = await mod.__test__.handleCommand({ id: 'frames', action: 'frames', session: 'twitter', surface: 'adapter' });
@@ -387,6 +396,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
 
     expect(mod.__test__.getSessionName(adapterKey('twitter'))).toBe(adapterKey('twitter'));
     expect(mod.__test__.getCommandSurface({ session: adapterKey('twitter') })).toBe('browser');
@@ -399,6 +411,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
 
     const result = await mod.__test__.handleCommand({
@@ -424,6 +439,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
     // URL-less commands on the browser surface no longer auto-create a tab — that
     // guard is what stops a mistyped session name from spawning an orphan blank tab.
@@ -456,6 +474,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
 
     const result = await mod.__test__.handleCommand({
@@ -496,6 +517,9 @@ describe('background tab isolation', () => {
     }));
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
 
     const result = await mod.__test__.handleCommand({
@@ -540,6 +564,9 @@ describe('background tab isolation', () => {
     }));
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     const result = await mod.__test__.handleCommand({
       id: 'download',
       action: 'wait-download',
@@ -599,6 +626,9 @@ describe('background tab isolation', () => {
     }));
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
 
     const listResult = await mod.__test__.handleCommand({ id: 'frames', action: 'frames', session: 'twitter', surface: 'adapter' });
@@ -643,6 +673,9 @@ describe('background tab isolation', () => {
     }));
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
 
     // 120s transport timeout → 115s CDP deadline
@@ -673,6 +706,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
 
     const result = await mod.__test__.handleTabs({ id: '2', action: 'tabs', op: 'new', url: 'https://new.example', session: adapterKey('twitter') }, adapterKey('twitter'));
@@ -688,6 +724,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     const result = await mod.__test__.handleTabs(
       { id: 'first-new', action: 'tabs', op: 'new', url: 'https://first.example', session: browserKey('default') },
       browserKey('default'),
@@ -704,6 +743,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
 
     const result = await mod.__test__.handleTabs(
@@ -727,6 +769,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
 
     const result = await mod.__test__.handleNavigate(
@@ -776,6 +821,9 @@ describe('background tab isolation', () => {
     }));
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
 
     const result = await mod.__test__.handleNavigate(
@@ -814,6 +862,9 @@ describe('background tab isolation', () => {
     }));
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
 
     const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
@@ -865,6 +916,9 @@ describe('background tab isolation', () => {
     }));
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
 
     const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
@@ -900,6 +954,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
 
     expect(mod.__test__.isTargetUrl('https://example.com/', 'https://example.com')).toBe(true);
     expect(mod.__test__.isTargetUrl('https://example.com/#feed', 'https://example.com/#settings')).toBe(false);
@@ -1002,6 +1059,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
     vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true })));
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     await mod.__test__.connectForTest();
     const socket = MockWebSocket.instances[0];
     expect(socket.readyState).toBe(MockWebSocket.CONNECTING);
@@ -1017,6 +1077,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false })));
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.resetReconnectState();
 
     mod.__test__.setReconnectAttempts(0);
@@ -1041,6 +1104,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true })));
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.resetReconnectState();
     mod.__test__.setReconnectAttempts(5);
 
@@ -1133,6 +1199,9 @@ describe('background tab isolation', () => {
     }));
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
 
     const [first, second] = await Promise.all([
@@ -1171,6 +1240,9 @@ describe('background tab isolation', () => {
     }));
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
     mod.__test__.setAutomationWindowId(adapterKey('zhihu'), 2);
 
@@ -1199,6 +1271,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     await mod.__test__.resolveTabId(undefined, adapterKey('first'));
     await mod.__test__.resolveTabId(undefined, adapterKey('second'));
     expect(mod.__test__.getSession(adapterKey('second'))).toEqual(expect.objectContaining({ preferredTabId: 10 }));
@@ -1221,6 +1296,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     await mod.__test__.resolveTabId(undefined, adapterKey('twitter'));
 
     const result = await mod.__test__.handleTabs(
@@ -1253,6 +1331,9 @@ describe('background tab isolation', () => {
     });
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     await mod.__test__.reconcileTargetLeaseRegistry();
 
     expect(chrome.windows.remove).not.toHaveBeenCalled();
@@ -1310,6 +1391,9 @@ describe('background tab isolation', () => {
     });
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     await mod.__test__.reconcileTargetLeaseRegistry();
 
     expect(mod.__test__.getSession(adapterKey('twitter'))).toEqual(expect.objectContaining({
@@ -1363,6 +1447,9 @@ describe('background tab isolation', () => {
     });
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     await mod.__test__.reconcileTargetLeaseRegistry();
 
     const alarmName = `opencli:lease-idle:${encodeURIComponent(adapterKey('twitter'))}`;
@@ -1383,6 +1470,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     await mod.__test__.resolveTabId(undefined, adapterKey('alarm'));
 
     const onAlarmListener = chrome.alarms.onAlarm.addListener.mock.calls[0][0];
@@ -1398,6 +1488,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     await mod.__test__.resolveTabId(undefined, adapterKey('first'));
 
     const onAlarmListener = chrome.alarms.onAlarm.addListener.mock.calls[0][0];
@@ -1423,6 +1516,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setSession(adapterKey('stale-a'), { windowId: 90, owned: true, preferredTabId: null });
     mod.__test__.setSession(adapterKey('stale-b'), { windowId: 91, owned: true, preferredTabId: null });
 
@@ -1441,6 +1537,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     const tabId = await mod.__test__.resolveTabId(undefined, adapterKey('twitter'));
 
     // Adapter tabs used to sit ungrouped in a window of their own. Now they live
@@ -1457,6 +1556,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     const a = await mod.__test__.resolveTabId(undefined, browserKey('recon'), 'https://a.example');
     const b = await mod.__test__.resolveTabId(undefined, browserKey('checkout'), 'https://b.example');
     const c = await mod.__test__.resolveTabId(undefined, adapterKey('reddit'), 'https://c.example');
@@ -1484,6 +1586,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     // What the CLI actually sends: `site:<site>` for a persistent site session,
     // `site:<site>:<uuid>` for a one-shot run.
     const persistent = await mod.__test__.resolveTabId(undefined, adapterKey('site:reddit'), 'https://reddit.example/p');
@@ -1500,6 +1605,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     const viaBrowser = await mod.__test__.resolveTabId(undefined, browserKey('reddit'), 'https://reddit.example/a');
     const viaAdapter = await mod.__test__.resolveTabId(undefined, adapterKey('reddit'), 'https://reddit.example/b');
 
@@ -1520,6 +1628,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     const tabId = await mod.__test__.resolveTabId(undefined, browserKey('recon'), 'https://example.com');
 
     // A second Chrome window landing on top of their layout is a worse interruption
@@ -1536,6 +1647,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     const tabId = await mod.__test__.resolveTabId(undefined, adapterKey('twitter'));
 
     // Adapter runs used to get a window of their own "because nobody watches
@@ -1583,6 +1697,9 @@ describe('background tab isolation', () => {
       vi.stubGlobal('chrome', chrome);
 
       const mod = await import('./background');
+      // This block is about what `background` mode does — the mode the person's own
+      // window is borrowed for. The shipped default is `dedicated`; pin it here.
+      mod.__test__.setDefaultWindowMode('background');
       await mod.__test__.resolveTabId(undefined, adapterKey('twitter'), 'https://x.example');
 
       expect(chrome.windows.create, name).toHaveBeenCalled();
@@ -1607,6 +1724,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     const browserTab = await mod.__test__.resolveTabId(undefined, browserKey('recon'), 'https://a.example');
     const adapterTab = await mod.__test__.resolveTabId(undefined, adapterKey('twitter'), 'https://b.example');
 
@@ -1634,6 +1754,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.sessionOverrides.set(browserKey('iso'), { windowMode: 'isolated' });
     await mod.__test__.resolveTabId(undefined, browserKey('iso'), 'https://iso.example');
 
@@ -1648,6 +1771,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     // Simulate a container adopted by an older build: it points at the person's
     // window but carries no `borrowed` flag, so the flag alone would call it ours.
     // Window 2 holds one of the person's own pages in the mock fixture.
@@ -1672,6 +1798,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(browserKey('recon'), 3);
     mod.__test__.sessionOverrides.set(browserKey('recon'), { windowMode: 'isolated' });
 
@@ -1700,6 +1829,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.sessionOverrides.set(browserKey('iso'), { windowMode: 'isolated' });
     const tabId = await mod.__test__.resolveTabId(undefined, browserKey('iso'), 'https://example.org');
 
@@ -1723,6 +1855,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     // An earlier session borrowed window 8. The person has since moved to window 9.
     mod.__test__.setAutomationWindowId(browserKey('earlier'), 8);
 
@@ -1753,6 +1888,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.sessionOverrides.set(browserKey('isoA'), { windowMode: 'isolated' });
     mod.__test__.sessionOverrides.set(browserKey('isoB'), { windowMode: 'isolated' });
 
@@ -1786,6 +1924,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.sessionOverrides.set(browserKey('iso'), { windowMode: 'isolated' });
     const isoTab = await mod.__test__.resolveTabId(undefined, browserKey('iso'), 'https://iso.example');
     const isoWindow = tabs.find((tab) => tab.id === isoTab)?.windowId;
@@ -1814,6 +1955,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     // A call that names window 4 must confine itself to window 4.
     await mod.__test__.ensureOwnedContainerGroup('interactive', browserKey('prev'), 4, [40]);
 
@@ -1836,6 +1980,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setSession(browserKey('iso'), { windowId: 8, owned: true, preferredTabId: 80 });
     const found = await mod.__test__.ensureOwnedContainerGroup('interactive', browserKey('prev'), null, []);
 
@@ -1850,6 +1997,9 @@ describe('background tab isolation', () => {
     const { chrome } = createChromeMock();
     vi.stubGlobal('chrome', chrome);
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
 
     // A mode the command handler forgets is dropped silently — the flag parses, the
     // command succeeds, and the behaviour is just the default. Assert every mode
@@ -1873,6 +2023,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.sessionOverrides.set(browserKey('recon'), { windowMode: 'isolated' });
     const tabId = await mod.__test__.resolveTabId(undefined, browserKey('recon'), 'https://example.com');
 
@@ -1887,6 +2040,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     const tabId = await mod.__test__.resolveTabId(undefined, browserKey('recon'), 'https://example.com');
 
     expect(chrome.windows.create).toHaveBeenCalled();
@@ -1899,6 +2055,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     const tabId = await mod.__test__.resolveTabId(undefined, browserKey('recon'), 'https://example.com');
     const before = tabs.length;
     await mod.__test__.releaseLease(browserKey('recon'), 'test');
@@ -1931,6 +2090,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     // URL-less commands on the browser surface are refused so a mistyped session
     // cannot spawn an orphan blank tab; `tabs op:new` is the explicit way to open
     // one. The adapter surface still creates its automation tab without a URL.
@@ -1977,6 +2139,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     const result = await mod.__test__.handleCommand({
       id: 'new-foreground',
       action: 'tabs',
@@ -1996,6 +2161,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     const firstTabId = await mod.__test__.resolveTabId(undefined, adapterKey('first'));
     const secondTabId = await mod.__test__.resolveTabId(undefined, adapterKey('second'));
 
@@ -2023,6 +2191,9 @@ describe('background tab isolation', () => {
     });
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     await mod.__test__.reconcileTargetLeaseRegistry();
     chrome.windows.create.mockClear();
 
@@ -2060,6 +2231,9 @@ describe('background tab isolation', () => {
     });
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     await mod.__test__.reconcileTargetLeaseRegistry();
     chrome.windows.create.mockClear();
 
@@ -2094,6 +2268,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     const tabId = await mod.__test__.resolveTabId(undefined, adapterKey('twitter'));
 
     // A group titled by an older build is not ours to adopt: no lease, no
@@ -2119,6 +2296,9 @@ describe('background tab isolation', () => {
     });
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     await mod.__test__.reconcileTargetLeaseRegistry();
     chrome.windows.create.mockClear();
 
@@ -2137,6 +2317,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     const result = await mod.__test__.handleBind(
       { id: 'bind', action: 'bind', session: browserKey('default') },
       browserKey('default'),
@@ -2156,6 +2339,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
 
     const tabId = await mod.__test__.resolveTabId(undefined, adapterKey('twitter'));
@@ -2174,6 +2360,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
 
     const tabId = await mod.__test__.resolveTabId(1, adapterKey('twitter'));
@@ -2192,6 +2381,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
 
     // Should still resolve (by finding/creating a tab in the correct window)
@@ -2204,6 +2396,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setSession(adapterKey('twitter'), { windowId: 1, owned: true, preferredTabId: 3 });
 
     const tabId = await mod.__test__.resolveTabId(undefined, adapterKey('twitter'));
@@ -2225,6 +2420,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
 
     mod.__test__.resetWindowIdleTimer(adapterKey('twitter'));
@@ -2244,6 +2442,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
 
     const first = await mod.__test__.handleCommand({
       id: 'persistent-nav-1',
@@ -2286,6 +2487,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(browserKey('default'), 1);
 
     mod.__test__.resetWindowIdleTimer(browserKey('default'));
@@ -2305,6 +2509,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(browserKey('default'), 1);
 
     // Set a custom timeout override
@@ -2327,6 +2534,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(browserKey('default'), 1);
     mod.__test__.sessionOverrides.set(browserKey('default'), { idleTimeoutMs: 300_000 });
 
@@ -2346,6 +2556,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(browserKey('default'), 1);
 
     // Default for browser:* is 10 min
@@ -2370,6 +2583,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
 
     // Set up a session with window ID 42 and a custom timeout override
     mod.__test__.setAutomationWindowId(browserKey('default'), 42);
@@ -2394,6 +2610,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
 
     const result = await mod.__test__.handleBind({
       id: 'bind-current-window-only',
@@ -2414,6 +2633,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
 
     const bound = await mod.__test__.handleBind({
       id: 'bind-good',
@@ -2440,6 +2662,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(browserKey('default'), 1);
 
     const result = await mod.__test__.handleBind({
@@ -2465,6 +2690,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setSession(browserKey('default'), { windowId: 2, owned: false, preferredTabId: 2 });
 
     expect(mod.__test__.getIdleTimeout(browserKey('default'))).toBe(-1);
@@ -2480,6 +2708,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setSession(browserKey('default'), { windowId: 2, owned: false, preferredTabId: 2 });
 
     const result = await mod.__test__.handleCommand({
@@ -2501,6 +2732,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setSession(browserKey('default'), { windowId: 2, owned: false, preferredTabId: 2 });
 
     const onRemovedListener = chrome.tabs.onRemoved.addListener.mock.calls[0][0];
@@ -2515,6 +2749,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setSession(browserKey('default'), { windowId: 2, owned: false, preferredTabId: 999 });
 
     const result = await mod.__test__.handleCommand({
@@ -2538,6 +2775,9 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setSession(browserKey('default'), { windowId: 2, owned: false, preferredTabId: 2 });
 
     const result = await mod.__test__.handleCommand({
@@ -2566,6 +2806,9 @@ describe('background tab isolation', () => {
     }));
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setSession(browserKey('default'), { windowId: 2, owned: false, preferredTabId: 2 });
 
     const nav = await mod.__test__.handleCommand({
@@ -2644,6 +2887,9 @@ describe('background tab isolation', () => {
     const { gate, readDirect } = gateRegistryRead(chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
 
     // Wake the worker via the idle alarm before recovery has restored state.
     const onAlarmListener = chrome.alarms.onAlarm.addListener.mock.calls[0][0];
@@ -2704,6 +2950,9 @@ describe('background tab isolation', () => {
     const { gate, readDirect } = gateRegistryRead(chrome);
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
 
     // Wake the worker via an unrelated tab-close before recovery.
     const onRemovedListener = chrome.tabs.onRemoved.addListener.mock.calls[0][0];
@@ -2742,6 +2991,9 @@ describe('background tab isolation', () => {
     });
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     await mod.__test__.reconcileTargetLeaseRegistry();
 
     // The orphan was adopted and titled for its session — no second group spawned.
@@ -2772,6 +3024,9 @@ describe('background tab isolation', () => {
     });
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     await mod.__test__.reconcileTargetLeaseRegistry();
 
     expect(groups).toHaveLength(1);
@@ -2798,6 +3053,9 @@ describe('background tab isolation', () => {
     });
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     await mod.__test__.reconcileTargetLeaseRegistry();
 
     // With no session to name it after there is nothing safe to do with it:
@@ -2823,6 +3081,9 @@ describe('background tab isolation', () => {
     });
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     await mod.__test__.reconcileTargetLeaseRegistry();
 
     expect(chrome.windows.create).not.toHaveBeenCalled();
@@ -2855,6 +3116,9 @@ describe('background tab isolation', () => {
     });
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     await mod.__test__.reconcileTargetLeaseRegistry();
 
     // The user group is untouched: no retitle, no merge, no group mutation.
@@ -2887,6 +3151,9 @@ describe('background tab isolation', () => {
     });
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     await mod.__test__.reconcileTargetLeaseRegistry();
 
     // The user group is untouched: no retitle, no merge, no group mutation.
@@ -2919,6 +3186,9 @@ describe('background tab isolation', () => {
     });
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     await mod.__test__.reconcileTargetLeaseRegistry();
 
     // The user window was never claimed as an owned container.
@@ -2968,6 +3238,9 @@ describe('background tab isolation', () => {
     });
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     await mod.__test__.reconcileTargetLeaseRegistry();
 
     // The stale lease was not resurrected onto the user's tab, and the tab was
@@ -2993,6 +3266,9 @@ describe('background tab isolation', () => {
     });
 
     const mod = await import('./background');
+    // This block is about what `background` mode does — the mode the person's own
+    // window is borrowed for. The shipped default is `dedicated`; pin it here.
+    mod.__test__.setDefaultWindowMode('background');
     await mod.__test__.reconcileTargetLeaseRegistry();
 
     expect(chrome.storage.local.remove).toHaveBeenCalledWith(REGISTRY_KEY);
@@ -3166,8 +3442,13 @@ describe('dedicated automation window', () => {
     useDedicated(mod, b, { autoSelect: false });
     const tabA = await mod.__test__.resolveTabId(undefined, a, 'https://a.example/');
     const tabB = await mod.__test__.resolveTabId(undefined, b, 'https://b.example/');
-    expect(h.tabs.find((t) => t.id === tabB)?.windowId).toBe(h.tabs.find((t) => t.id === tabA)?.windowId);
-    expect(h.chrome.tabs.create).toHaveBeenCalledWith(expect.objectContaining({ url: 'https://b.example/', active: false }));
+    // Two leases held at the same time are two tasks that both need to render, so the
+    // pool gives them a window each (tiled, never stacked) instead of one shared window
+    // where only the active tab would be visible.
+    expect(h.tabs.find((t) => t.id === tabB)?.windowId).not.toBe(h.tabs.find((t) => t.id === tabA)?.windowId);
+    // The second window is created for b directly on its URL, and unfocused like every
+    // automation window — `tabs.create` only appears when a window already exists.
+    expect(h.chrome.windows.create).toHaveBeenCalledWith(expect.objectContaining({ url: 'https://b.example/', focused: false }));
 
     h.tabs.find((t) => t.id === tabA)!.active = false;
     h.chrome.tabs.update.mockClear();
@@ -3228,7 +3509,7 @@ describe('dedicated automation window', () => {
 
     await mod.__test__.releaseLease(key, 'test');
     // The last lease leaves a placeholder instead of closing the window.
-    expect(h.chrome.tabs.update).toHaveBeenCalledWith(first, { url: 'about:blank#opencli-dedicated=default' });
+    expect(h.chrome.tabs.update).toHaveBeenCalledWith(first, { url: `about:blank#opencli-dedicated=${mod.__test__.getDedicatedSlot()?.slot}` });
     expect(h.chrome.tabs.remove).not.toHaveBeenCalledWith(first);
     expect(h.chrome.windows.remove).not.toHaveBeenCalled();
     expect(mod.__test__.getDedicatedSlot()?.placeholderTabIds).toEqual([first]);
@@ -3381,6 +3662,9 @@ describe('dedicated automation window', () => {
     const h = dedicatedHarness();
     vi.stubGlobal('chrome', h.chrome);
     const mod = await import('./background');
+    // The four pre-dedicated modes still behave exactly as they did — asked for by
+    // name, since `dedicated` is now what a session gets when nobody names a mode.
+    mod.__test__.setDefaultWindowMode('background');
     const tabId = await mod.__test__.resolveTabId(undefined, browserKey('plain'), 'https://plain.example/');
     expect(h.tabs.find((t) => t.id === tabId)?.windowId).toBe(2);
     expect(mod.__test__.getDedicatedSlot()).toBeNull();
@@ -3547,5 +3831,189 @@ describe('dedicated automation window — review regressions', () => {
     const res = (await mod.__test__.handleSessions({ id: 'e', action: 'sessions', op: 'window-ensure', windowSlot: 's' })).data;
     expect(res).toMatchObject({ moved: false, state: 'fullscreen', onDisplay: false });
     expect(h.chrome.windows.update).not.toHaveBeenCalled();
+  });
+});
+
+// ─── Window pool, dynamic layout, idle reaping (2026-09-14) ──────────────
+describe('dedicated automation window — pool and layout', () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.useRealTimers();
+    MockWebSocket.instances = [];
+    vi.stubGlobal('WebSocket', MockWebSocket);
+    vi.stubGlobal('fetch', vi.fn(() => new Promise(() => {})));
+  });
+  afterEach(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    vi.unstubAllGlobals();
+  });
+
+  const useDedicated = (mod: any, key: string, fields: Record<string, unknown> = {}) => {
+    mod.__test__.sessionOverrides.set(key, { windowMode: 'dedicated' });
+    mod.__test__.applyDedicatedCommandFields(key, { id: 'x', action: 'exec', windowMode: 'dedicated', ...fields });
+  };
+  const overlaps = (a: any, b: any) => a.left < b.left + b.width && b.left < a.left + a.width
+    && a.top < b.top + b.height && b.top < a.top + a.height;
+
+  it('grid/tile/capacity: tiles never overlap, never shrink past the minimum, and capacity is honest', async () => {
+    vi.stubGlobal('chrome', dedicatedHarness().chrome);
+    const mod = await import('./background');
+    const area = { left: -2560, top: -1440, width: 2560, height: 1440 };
+    expect(mod.__test__.dedicatedGrid(area, 1)).toMatchObject({ cols: 1, rows: 1, width: 1280, height: 900 });
+    const capacity = mod.__test__.dedicatedCapacity(area);
+    expect(capacity).toBeGreaterThanOrEqual(2);
+    expect(mod.__test__.dedicatedGrid(area, capacity + 1)).toBeNull();
+    for (let n = 1; n <= capacity; n += 1) {
+      const rects = Array.from({ length: n }, (_, i) => mod.__test__.dedicatedTile(area, i, n));
+      expect(rects.every((r: any) => r !== null)).toBe(true);
+      for (let i = 0; i < n; i += 1) {
+        for (let j = i + 1; j < n; j += 1) expect(overlaps(rects[i], rects[j])).toBe(false);
+        expect(rects[i].left).toBeGreaterThanOrEqual(area.left);
+        expect(rects[i].top).toBeGreaterThanOrEqual(area.top);
+        expect(rects[i].left + rects[i].width).toBeLessThanOrEqual(area.left + area.width);
+        expect(rects[i].top + rects[i].height).toBeLessThanOrEqual(area.top + area.height);
+      }
+    }
+  });
+
+  it('picks a secondary, non-internal display for automation and never the built-in one', async () => {
+    vi.stubGlobal('chrome', dedicatedHarness().chrome);
+    const mod = await import('./background');
+    const internal = { id: '1', name: '', primary: true, internal: true, bounds: { left: 0, top: 0, width: 1512, height: 982 }, workArea: null };
+    const virt = { id: '8', name: '', primary: false, internal: false, bounds: { left: -2560, top: -1440, width: 2560, height: 1440 }, workArea: null };
+    expect(mod.__test__.pickAutomationDisplay([internal, virt])?.id).toBe('8');
+    // Lid closed: the virtual screen is the only one left and inherits `primary`.
+    expect(mod.__test__.pickAutomationDisplay([{ ...virt, primary: true }])?.id).toBe('8');
+    expect(mod.__test__.pickAutomationDisplay([])).toBeNull();
+  });
+
+  it('ten one-shot sessions in a row reuse one window instead of opening ten', async () => {
+    const h = dedicatedHarness();
+    vi.stubGlobal('chrome', h.chrome);
+    const mod = await import('./background');
+    const windowIds = new Set<number>();
+    for (let i = 0; i < 10; i += 1) {
+      const key = browserKey(`one-shot-${i}`);
+      useDedicated(mod, key);
+      const tabId = await mod.__test__.resolveTabId(undefined, key, `https://run-${i}.example/`);
+      windowIds.add(h.tabs.find((t: any) => t.id === tabId)!.windowId);
+      await mod.__test__.releaseLease(key, 'test');
+    }
+    expect(windowIds.size).toBe(1);
+    expect(h.chrome.windows.create).toHaveBeenCalledTimes(1);
+    expect(mod.__test__.dedicatedSlotNames()).toHaveLength(1);
+    // The one window it kept is idle and named by the pool, not by any session.
+    const slot = mod.__test__.getDedicatedSlot();
+    expect(slot.pooled).toBe(true);
+    expect(slot.slot).toMatch(/^pool-\d+$/);
+    expect(slot.holders).toEqual([]);
+  });
+
+  it('concurrent sessions each get their own window, tiled without overlap on the automation display', async () => {
+    const h = dedicatedHarness();
+    vi.stubGlobal('chrome', h.chrome);
+    const mod = await import('./background');
+    const keys = ['a', 'b', 'c'].map((n) => browserKey(`conc-${n}`));
+    const tabIds: number[] = [];
+    for (const key of keys) {
+      useDedicated(mod, key);
+      tabIds.push(await mod.__test__.resolveTabId(undefined, key, `https://${key}.example/`));
+    }
+    const windowIds = tabIds.map((id) => h.tabs.find((t: any) => t.id === id)!.windowId);
+    expect(new Set(windowIds).size).toBe(3);
+    const rects = windowIds.map((id) => h.windows.get(id)!);
+    for (let i = 0; i < rects.length; i += 1) {
+      for (let j = i + 1; j < rects.length; j += 1) expect(overlaps(rects[i], rects[j])).toBe(false);
+      // On the virtual display (negative origin), never on the person's screen.
+      expect(rects[i].left).toBeLessThan(0);
+      expect(rects[i].focused).toBe(false);
+    }
+    // Freeing one hands its window back to the pool for the next caller.
+    await mod.__test__.releaseLease(keys[0], 'test');
+    const next = browserKey('conc-d');
+    useDedicated(mod, next);
+    const reused = await mod.__test__.resolveTabId(undefined, next, 'https://d.example/');
+    expect(h.tabs.find((t: any) => t.id === reused)!.windowId).toBe(windowIds[0]);
+    expect(h.chrome.windows.create).toHaveBeenCalledTimes(3);
+  });
+
+  it('refuses to overlap when the display is full and says so instead of stacking silently', async () => {
+    const h = dedicatedHarness();
+    vi.stubGlobal('chrome', h.chrome);
+    const mod = await import('./background');
+    const capacity = mod.__test__.dedicatedCapacity({ left: -2560, top: -1440, width: 2560, height: 1440 });
+    for (let i = 0; i < capacity; i += 1) {
+      const key = browserKey(`full-${i}`);
+      useDedicated(mod, key);
+      await mod.__test__.resolveTabId(undefined, key, `https://full-${i}.example/`);
+    }
+    const overflow = browserKey('overflow');
+    useDedicated(mod, overflow);
+    await expect(mod.__test__.resolveTabId(undefined, overflow, 'https://overflow.example/'))
+      .rejects.toThrow(/dedicated-pool-exhausted/);
+    expect(h.chrome.windows.create).toHaveBeenCalledTimes(capacity);
+    // The failed command holds nothing: its would-be slot is idle, so it is reusable
+    // and reapable instead of pinning a window nobody owns.
+    const stranded = mod.__test__.dedicatedSlotNames().filter((n: string) => !mod.__test__.getDedicatedSlot(n).windowId);
+    for (const name of stranded) expect(mod.__test__.getDedicatedSlot(name).holders).toEqual([]);
+  });
+
+  it('closes an idle window once its TTL passes, and never one that is still held', async () => {
+    const h = dedicatedHarness();
+    vi.stubGlobal('chrome', h.chrome);
+    const mod = await import('./background');
+    h.chrome.windows.remove = vi.fn(async (id: number) => { await h.closeWindow(id); });
+    const held = browserKey('held');
+    const done = browserKey('done');
+    useDedicated(mod, held);
+    useDedicated(mod, done);
+    const heldTab = await mod.__test__.resolveTabId(undefined, held, 'https://held.example/');
+    await mod.__test__.resolveTabId(undefined, done, 'https://done.example/');
+    await mod.__test__.releaseLease(done, 'test');
+
+    mod.__test__.setDedicatedIdleTtlMs(60_000);
+    expect(await mod.__test__.reapIdleDedicatedWindows()).toBe(0); // too young
+    mod.__test__.setDedicatedIdleTtlMs(1);
+    await new Promise((r) => setTimeout(r, 5));
+    expect(await mod.__test__.reapIdleDedicatedWindows()).toBe(1);
+    // The held session's window is untouched, and its slot is still there.
+    expect(h.tabs.find((t: any) => t.id === heldTab)).toBeTruthy();
+    expect(mod.__test__.dedicatedSlotNames()).toHaveLength(1);
+  });
+
+  it('window-close closes a window on request, and refuses a busy one unless forced', async () => {
+    const h = dedicatedHarness();
+    vi.stubGlobal('chrome', h.chrome);
+    const mod = await import('./background');
+    h.chrome.windows.remove = vi.fn(async (id: number) => { await h.closeWindow(id); });
+    const key = browserKey('busy');
+    useDedicated(mod, key);
+    await mod.__test__.resolveTabId(undefined, key, 'https://busy.example/');
+    const slot = mod.__test__.getDedicatedSlot().slot;
+
+    const refused = await mod.__test__.handleDedicatedWindowOp({ id: '1', action: 'sessions', op: 'window-close', windowSlot: slot });
+    expect(refused.data.closed).toEqual([]);
+    expect(refused.data.skipped[0]).toMatchObject({ slot });
+    expect(h.chrome.windows.remove).not.toHaveBeenCalled();
+
+    const forced = await mod.__test__.handleDedicatedWindowOp({ id: '2', action: 'sessions', op: 'window-close', windowSlot: slot, force: true });
+    expect(forced.data.closed).toEqual([slot]);
+    expect(h.chrome.windows.remove).toHaveBeenCalled();
+    expect(mod.__test__.dedicatedSlotNames()).toEqual([]);
+  });
+
+  it('window-status reports pool capacity, how many windows are live and how many are free', async () => {
+    const h = dedicatedHarness();
+    vi.stubGlobal('chrome', h.chrome);
+    const mod = await import('./background');
+    const key = browserKey('pool-status');
+    useDedicated(mod, key);
+    await mod.__test__.resolveTabId(undefined, key, 'https://status.example/');
+    const res = await mod.__test__.handleDedicatedWindowOp({ id: '1', action: 'sessions', op: 'window-list' });
+    expect(res.data.capabilities).toEqual(expect.arrayContaining(['window-pool', 'window-close', 'window-list', 'idle-reap', 'auto-display', 'dynamic-layout']));
+    expect(res.data.pool).toMatchObject({ live: 1, idle: 0 });
+    expect(res.data.pool.capacity).toBeGreaterThanOrEqual(2);
+    expect(res.data.pool.automationDisplay.primary).toBe(false);
+    expect(res.data.windows[0]).toMatchObject({ pooled: true, busy: true, holders: 1 });
   });
 });

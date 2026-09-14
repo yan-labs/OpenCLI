@@ -268,6 +268,8 @@ export interface DaemonCommand {
   autoSelect?: boolean;
   /** Policy for tabs that appear in a dedicated window without being opened by OpenCLI. Default 'evict' (applied by the extension when omitted). */
   foreignTabPolicy?: 'evict' | 'tolerate';
+  /** Idle TTL (ms) for the dedicated window pool, from OPENCLI_DEDICATED_IDLE_MS. Overrides the extension's default when set; omitted otherwise. */
+  dedicatedIdleMs?: number;
   /** Custom idle timeout in seconds for this session. Overrides the default. */
   idleTimeout?: number;
   /** Frame index for cross-frame operations (0-based, from 'frames' action) */
@@ -397,12 +399,15 @@ async function sendCommandRaw(
   const preferredContextId = routing.preferredContextId;
   const windowMode = params.windowMode ?? envWindowMode;
 
-  // The two session-independent window ops always carry placement (that IS
+  // The four session-independent window ops always carry placement (that IS
   // their payload); every other command carries it only in dedicated mode.
   // Env parsing (and its "invalid value" errors) only runs when the fields
   // are actually going to be used, so an unrelated command never fails
   // because of a stale/malformed OPENCLI_WINDOW_BOUNDS left in the shell.
-  const isWindowOp = action === 'sessions' && (params.op === 'window-status' || params.op === 'window-ensure');
+  const isWindowOp = action === 'sessions' && (
+    params.op === 'window-status' || params.op === 'window-ensure'
+    || params.op === 'window-list' || params.op === 'window-close'
+  );
   const placement = windowMode === 'dedicated' || isWindowOp
     ? resolveDedicatedPlacement(process.env, _windowPlacementOverride)
     : {};
@@ -411,6 +416,7 @@ async function sendCommandRaw(
   const windowDisplay = params.windowDisplay ?? placement.windowDisplay;
   const autoSelect = params.autoSelect ?? placement.autoSelect;
   const foreignTabPolicy = params.foreignTabPolicy ?? placement.foreignTabPolicy;
+  const dedicatedIdleMs = params.dedicatedIdleMs ?? placement.dedicatedIdleMs;
 
   let id = generateId();
   let ensureUsed = false;
@@ -459,6 +465,7 @@ async function sendCommandRaw(
       ...(windowDisplay !== undefined && { windowDisplay }),
       ...(autoSelect !== undefined && { autoSelect }),
       ...(foreignTabPolicy !== undefined && { foreignTabPolicy }),
+      ...(dedicatedIdleMs !== undefined && { dedicatedIdleMs }),
       // Carry the run identity so the daemon can acquire/refresh a write lease.
       // The same runId across every daemon command in one CLI invocation is the
       // heartbeat that keeps a long-running holder alive.

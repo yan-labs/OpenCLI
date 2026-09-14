@@ -7,9 +7,10 @@
 >
 > | | 上游 / Chrome 应用商店版 | 这个 fork |
 > |---|---|---|
-> | 默认窗口模式 | 前台 | **后台** |
-> | `browser` 的标签页开在哪 | 新开一个 1280×900 的窗口 | **你当前正在用的那个窗口** |
+> | 默认窗口模式 | 前台 | **dedicated（离屏自动化窗口，创建时不抢焦点）** |
+> | `browser` 的标签页开在哪 | 新开一个会抢焦点的 1280×900 窗口 | **它自己的专属窗口——绝不是你正在用的那个** |
 > | 你正在看的标签页 | 被切走 | **不动** |
+> | `--window background` | 没有 | 借用**你当前正在用的窗口**，而不是另开一个 |
 > | `--window isolated` | 没有 | 后台 + **独立窗口** |
 > | `browser sessions` | —— | 报 **windowId**，谁占着哪个标签页一目了然 |
 > | `browser batch` / `sessions` / `cleanup` | —— | 有 |
@@ -193,7 +194,7 @@ Agent 在内部自动处理所有 `opencli browser` 命令——你只需用自�
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `OPENCLI_WINDOW` | 命令默认值 | 设为 `foreground` 或 `background` 来覆盖 Browser Bridge 窗口位置。浏览器型命令也支持 `--window <foreground\|background>` |
+| `OPENCLI_WINDOW` | `dedicated` | 设为 `foreground`、`active`、`background`、`isolated` 或 `dedicated` 来覆盖 Browser Bridge 窗口位置。浏览器型命令也支持 `--window <mode>` |
 | `OPENCLI_BROWSER_CONNECT_TIMEOUT` | `45` | 浏览器连接超时（秒） |
 | `OPENCLI_BROWSER_COMMAND_TIMEOUT` | `60` | 单个浏览器命令超时（秒） |
 | `OPENCLI_CDP_ENDPOINT` | — | Chrome DevTools Protocol 端点，用于远程浏览器或 Electron 应用 |
@@ -203,7 +204,7 @@ Agent 在内部自动处理所有 `opencli browser` 命令——你只需用自�
 
 Browser Bridge daemon 与扩展的通信端口固定为 `localhost:19825`，不再支持通过 `OPENCLI_DAEMON_PORT` 配置自定义端口。
 
-`opencli browser *` 必须紧跟一个 `<session>` 位置参数，默认使用前台窗口，并保留该 session 的 tab lease，直到你手动执行 `opencli browser <session> close` 或等空闲超时。浏览器型 adapter 默认使用后台 adapter 窗口并在命令结束后释放一次性 tab lease；如果需要调试最终页面，可以传 `--window foreground --keep-tab true`。
+`opencli browser *` 必须紧跟一个 `<session>` 位置参数，并保留该 session 的 tab lease，直到你手动执行 `opencli browser <session> close` 或等空闲超时。`opencli browser *` 和浏览器型 adapter 现在都默认使用 `dedicated` 窗口——一个池化、离屏、创建时不抢焦点的自动化窗口，普通调用不会再打扰你正在用的窗口；传 `--window background` 可以改回借用你当前窗口，对少数只认真实前台焦点的站点（如 PageSpeed Insights、Google Trends、AITDK）需要显式传 `--window foreground`。如果需要调试最终页面，可以传 `--window foreground --keep-tab true`。
 
 ## 内置命令
 

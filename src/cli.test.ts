@@ -1266,9 +1266,10 @@ describe('browser tab targeting commands', () => {
 
     await program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'state']);
 
-    // Background is the default now: automation must not raise a window or switch the
-    // active tab unless someone asked for foreground explicitly.
-    expect(mockBrowserConnect).toHaveBeenCalledWith({ timeout: 45, session: 'test', surface: 'browser', windowMode: 'background' });
+    // Dedicated is the default now: automation gets its own OpenCLI-owned window
+    // (created unfocused, placed off-screen when possible) unless the caller opts
+    // into a different mode explicitly.
+    expect(mockBrowserConnect).toHaveBeenCalledWith({ timeout: 45, session: 'test', surface: 'browser', windowMode: 'dedicated' });
     expect(browserState.page?.snapshot).toHaveBeenCalled();
     expect(mockSetDaemonRunContext).toHaveBeenCalledWith(expect.objectContaining({
       runId: expect.stringMatching(/^run_/), command: 'browser state', access: 'read',
@@ -1285,6 +1286,26 @@ describe('browser tab targeting commands', () => {
 
     expect(mockBrowserConnect).toHaveBeenCalledWith({ timeout: 45, session: 'test', surface: 'browser', windowMode: 'background' });
     expect(browserState.page?.snapshot).toHaveBeenCalled();
+  });
+
+  it('OPENCLI_WINDOW overrides the dedicated default but loses to an explicit --window flag', async () => {
+    // Uses objectContaining rather than an exact match: this describe block has
+    // a pre-existing (unrelated) preferredContextId mock mismatch that already
+    // fails several exact-match assertions here — this test only cares about
+    // windowMode precedence, so it shouldn't ride along with that failure.
+    process.env.OPENCLI_WINDOW = 'active';
+    try {
+      const program = createProgram('', '');
+      await program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'state']);
+      expect(mockBrowserConnect).toHaveBeenCalledWith(expect.objectContaining({ windowMode: 'active' }));
+
+      mockBrowserConnect.mockClear();
+      const program2 = createProgram('', '');
+      await program2.parseAsync(['node', 'opencli', 'browser', '--session', 'test', '--window', 'foreground', 'state']);
+      expect(mockBrowserConnect).toHaveBeenCalledWith(expect.objectContaining({ windowMode: 'foreground' }));
+    } finally {
+      delete process.env.OPENCLI_WINDOW;
+    }
   });
 
   it('passes the opt-in AX source to browser state', async () => {
@@ -2145,6 +2166,134 @@ describe('browser window command', () => {
       const program = createProgram('', '');
 
       await program.parseAsync(['node', 'opencli', 'browser', 'window', 'ensure', '-f', 'json']);
+
+      expect(lastJsonLog()).toEqual({ supported: false, reason: 'extension-too-old' });
+      expect(process.exitCode).toBeUndefined();
+    });
+  });
+
+  describe('list', () => {
+    const sampleListInfo = {
+      ...sampleWindowInfo,
+      pooled: true,
+      holders: 0,
+      busy: false,
+      idleMs: 65_000,
+      tileIndex: 0,
+    };
+
+    it('routes to sessions op=window-list and prints the data plus cliVersion (json)', async () => {
+      mockSendCommand.mockResolvedValueOnce({
+        supported: true,
+        displays: [],
+        windows: [sampleListInfo],
+        pool: { automationDisplay: '虚拟 16:9', capacity: 4, live: 1, idle: 1, free: 3, idleTtlMs: 300_000 },
+      });
+      const program = createProgram('', '');
+
+      await program.parseAsync(['node', 'opencli', 'browser', 'window', 'list', '-f', 'json']);
+
+      expect(mockSendCommand).toHaveBeenCalledWith('sessions', { op: 'window-list' });
+      const out = lastJsonLog();
+      expect(out.cliVersion).toBe(PKG_VERSION);
+      expect(out.windows).toHaveLength(1);
+      expect(out.windows[0].tileIndex).toBe(0);
+      expect(out.pool).toMatchObject({ capacity: 4, live: 1, idle: 1, free: 3, idleTtlMs: 300_000 });
+    });
+
+    it('defaults to table format and prints a compact per-window line plus a pool summary', async () => {
+      mockSendCommand.mockResolvedValueOnce({
+        supported: true,
+        displays: [],
+        windows: [sampleListInfo],
+        pool: { automationDisplay: '虚拟 16:9', capacity: 4, live: 1, idle: 1, free: 3, idleTtlMs: 300_000 },
+      });
+      const program = createProgram('', '');
+
+      await program.parseAsync(['node', 'opencli', 'browser', 'window', 'list']);
+
+      const logs = allLogs();
+      expect(logs).toContain('semrush');
+      expect(logs).toContain('win1234');
+      expect(logs).toContain('idle');
+      expect(logs).toContain('capacity=4');
+      expect(logs).toContain('free=3');
+      expect(logs).toContain('idleTtl=300s');
+    });
+
+    it('prints {supported:false, reason:"extension-too-old"} for a pre-pool extension', async () => {
+      mockSendCommand.mockResolvedValueOnce([]);
+      const program = createProgram('', '');
+
+      await program.parseAsync(['node', 'opencli', 'browser', 'window', 'list', '-f', 'json']);
+
+      expect(lastJsonLog()).toEqual({ supported: false, reason: 'extension-too-old' });
+      expect(process.exitCode).toBeUndefined();
+    });
+  });
+
+  describe('close', () => {
+    it('routes to sessions op=window-close with no params when --slot/--force are omitted', async () => {
+      mockSendCommand.mockResolvedValueOnce({ closed: ['default'], skipped: [], remaining: [] });
+      const program = createProgram('', '');
+
+      await program.parseAsync(['node', 'opencli', 'browser', 'window', 'close', '-f', 'json']);
+
+      expect(mockSendCommand).toHaveBeenCalledWith('sessions', { op: 'window-close' });
+      const out = lastJsonLog();
+      expect(out.closed).toEqual(['default']);
+      expect(out.cliVersion).toBe(PKG_VERSION);
+      expect(process.exitCode).toBeUndefined();
+    });
+
+    it('passes --slot and --force through as windowSlot/force', async () => {
+      mockSendCommand.mockResolvedValueOnce({ closed: ['semrush'], skipped: [], remaining: [] });
+      const program = createProgram('', '');
+
+      await program.parseAsync(['node', 'opencli', 'browser', 'window', 'close', '--slot', 'semrush', '--force', '-f', 'json']);
+
+      expect(mockSendCommand).toHaveBeenCalledWith('sessions', { op: 'window-close', windowSlot: 'semrush', force: true });
+    });
+
+    it('prints a readable summary in table mode', async () => {
+      mockSendCommand.mockResolvedValueOnce({
+        closed: ['default'],
+        skipped: [{ slot: 'semrush', reason: 'live lease held' }],
+        remaining: ['semrush'],
+      });
+      const program = createProgram('', '');
+
+      await program.parseAsync(['node', 'opencli', 'browser', 'window', 'close']);
+
+      const logs = allLogs();
+      expect(logs).toContain('Closed: default');
+      expect(logs).toContain('Skipped: semrush (live lease held)');
+      expect(logs).toContain('Remaining: semrush');
+    });
+
+    it('exits non-zero only when nothing was closed AND something was skipped', async () => {
+      mockSendCommand.mockResolvedValueOnce({ closed: [], skipped: [{ slot: 'semrush', reason: 'live lease held' }], remaining: ['semrush'] });
+      const program = createProgram('', '');
+
+      await program.parseAsync(['node', 'opencli', 'browser', 'window', 'close', '-f', 'json']);
+
+      expect(process.exitCode).toBe(1);
+    });
+
+    it('does not treat a partial success (some closed, some skipped) as a failure', async () => {
+      mockSendCommand.mockResolvedValueOnce({ closed: ['default'], skipped: [{ slot: 'semrush', reason: 'live lease held' }], remaining: ['semrush'] });
+      const program = createProgram('', '');
+
+      await program.parseAsync(['node', 'opencli', 'browser', 'window', 'close', '-f', 'json']);
+
+      expect(process.exitCode).toBeUndefined();
+    });
+
+    it('prints {supported:false, reason:"extension-too-old"} for a pre-pool extension', async () => {
+      mockSendCommand.mockResolvedValueOnce([]);
+      const program = createProgram('', '');
+
+      await program.parseAsync(['node', 'opencli', 'browser', 'window', 'close', '-f', 'json']);
 
       expect(lastJsonLog()).toEqual({ supported: false, reason: 'extension-too-old' });
       expect(process.exitCode).toBeUndefined();

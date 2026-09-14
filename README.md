@@ -7,9 +7,10 @@
 >
 > | | upstream / Chrome Web Store build | this fork |
 > |---|---|---|
-> | default window mode | foreground | **background** |
-> | where a `browser` tab opens | a new 1280×900 window | **the window you are already in** |
+> | default window mode | foreground | **dedicated** — an off-screen automation window, created unfocused |
+> | where a `browser` tab opens | a new 1280×900 window that steals your focus | **its own dedicated window — never the one you're using** |
 > | your active tab | gets switched away | **untouched** |
+> | `--window background` | not available | borrows **the window you're already in** instead of opening one |
 > | `--window isolated` | not available | background **in its own window** |
 > | `browser sessions` | — | reports **windowId**, so you can tell who owns which tab |
 > | `browser batch` / `sessions` / `cleanup` | — | available |
@@ -210,7 +211,7 @@ When the site you need is not yet covered, use the `opencli-adapter-author` skil
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OPENCLI_PROFILE` | — | Browser Bridge profile alias/contextId to use when multiple Chrome profiles are connected |
-| `OPENCLI_WINDOW` | command default | Set to `foreground` or `background` to override Browser Bridge window placement. Browser-backed commands also accept `--window <foreground\|background>`. |
+| `OPENCLI_WINDOW` | `dedicated` | Set to `foreground`, `active`, `background`, `isolated`, or `dedicated` to override Browser Bridge window placement. Browser-backed commands also accept `--window <mode>`. |
 | `OPENCLI_BROWSER_CONNECT_TIMEOUT` | `45` | Seconds to wait for browser connection |
 | `OPENCLI_BROWSER_COMMAND_TIMEOUT` | `60` | Seconds to wait for a single browser command |
 | `OPENCLI_CDP_ENDPOINT` | — | Chrome DevTools Protocol endpoint for remote browser or Electron apps |
@@ -218,7 +219,7 @@ When the site you need is not yet covered, use the `opencli-adapter-author` skil
 | `OPENCLI_VERBOSE` | `false` | Enable verbose logging (`-v` flag also works) |
 | `DEBUG_SNAPSHOT` | — | Set to `1` for DOM snapshot debug output |
 
-`opencli browser *` requires an explicit `<session>` positional, uses a foreground browser window by default, and keeps that session's tab lease until `opencli browser <session> close` or idle cleanup. Browser-backed adapters use a background adapter window and release one-shot tab leases by default. Interactive adapters can declare `siteSession: 'persistent'` to keep a stable site tab for continuity; pass `--site-session ephemeral` for a one-shot tab.
+`opencli browser *` requires an explicit `<session>` positional and keeps that session's tab lease until `opencli browser <session> close` or idle cleanup. Both `opencli browser *` and browser-backed adapters default to a `dedicated` window now — a pooled, off-screen automation window that is never focused — so plain calls never disturb the window you're using; pass `--window background` to borrow your current window instead, or `--window foreground` for the few sites (e.g. PageSpeed Insights, Google Trends, AITDK) that only render for a truly frontmost window. Interactive adapters can declare `siteSession: 'persistent'` to keep a stable site tab for continuity; pass `--site-session ephemeral` for a one-shot tab.
 
 ## Built-in Commands
 

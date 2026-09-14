@@ -145,6 +145,19 @@ describe('resolveDedicatedPlacement', () => {
       .toThrow(/OPENCLI_WINDOW_AUTOSELECT must be/);
   });
 
+  it('reads OPENCLI_DEDICATED_IDLE_MS as a positive integer', () => {
+    expect(resolveDedicatedPlacement({ OPENCLI_DEDICATED_IDLE_MS: '60000' }, null)).toEqual({
+      dedicatedIdleMs: 60_000,
+    });
+  });
+
+  it('silently drops a non-numeric or non-positive OPENCLI_DEDICATED_IDLE_MS instead of throwing', () => {
+    expect(resolveDedicatedPlacement({ OPENCLI_DEDICATED_IDLE_MS: 'nope' }, null)).toEqual({});
+    expect(resolveDedicatedPlacement({ OPENCLI_DEDICATED_IDLE_MS: '0' }, null)).toEqual({});
+    expect(resolveDedicatedPlacement({ OPENCLI_DEDICATED_IDLE_MS: '-5' }, null)).toEqual({});
+    expect(resolveDedicatedPlacement({ OPENCLI_DEDICATED_IDLE_MS: '12.5' }, null)).toEqual({});
+  });
+
   it('does not validate env vars that an override already supplies (override short-circuits parsing)', () => {
     // Malformed env for bounds/autoSelect/foreignTabPolicy would normally throw,
     // but an override for that exact field must win without ever parsing env.

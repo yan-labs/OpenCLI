@@ -617,7 +617,7 @@ async function getBrowserPage(
     surface: 'browser',
     ...profileRouteParams(profileSelection),
     ...(idleTimeout && idleTimeout > 0 && { idleTimeout }),
-    windowMode: opts.windowMode ?? getBrowserWindowMode(undefined, 'background'),
+    windowMode: opts.windowMode ?? getBrowserWindowMode(undefined, 'dedicated'),
   });
   const targetScope = getBrowserScope(session, profileSelection?.contextId);
   const resolvedTargetPage = targetPage
@@ -1008,7 +1008,7 @@ export function createProgram(BUILTIN_CLIS: string, USER_CLIS: string): Command 
     // program.parseAsync callers (tests). User-facing surface is the <session>
     // positional; main.ts argv preprocessor rewrites positional -> --session.
     .addOption(new Option('--session <name>', 'Internal — set automatically from the <session> positional').hideHelp())
-    .option('--window <mode>', 'Window mode: background (default, reuses your current window, never steals focus), active (selects the tab within its window only, no OS focus steal), foreground (raise + select), isolated (background in its own window), dedicated (OpenCLI\'s own window, optionally placed on a given display; never touches your windows)')
+    .option('--window <mode>', 'Window mode: dedicated (default — an OpenCLI-owned window, created unfocused and placed off your screen when a second display exists; the tab itself renders visible), background (hidden tab in your current window, never steals focus), active (selects the tab within its window only, no OS focus steal), foreground (raise + select), isolated (background in its own window)')
     .option('--window-slot <name>', 'Dedicated window slot name (only used with --window dedicated; default "default")')
     .option('--window-bounds <x,y,w,h>', 'Dedicated window explicit placement: left,top,width,height (only used with --window dedicated)')
     .option('--window-display <pattern>', 'Dedicated window display pattern: name substring or /regex/flags (only used with --window dedicated; ignored when --window-bounds is set)')
@@ -1113,6 +1113,11 @@ still usable even when navigation is reported as timed out.
   }
 
   function logBrowserCommandError(err: BrowserCommandError): void {
+    if (err.message.includes('dedicated-pool-exhausted')) {
+      log.error(`All automation window slots are busy (${err.message}).`);
+      log.error('Wait a moment and retry, or free one explicitly: opencli browser window close --slot <name>');
+      return;
+    }
     log.error(err.message);
     if (err.hint) log.error(`Hint: ${err.hint}`);
   }
@@ -1161,7 +1166,7 @@ still usable even when navigation is reported as timed out.
         const targetPage = getBrowserTargetId(command);
         session = getBrowserSession(command);
         const profileSelection = getBrowserProfileSelection(command);
-        const windowMode = getBrowserWindowMode(command, 'background');
+        const windowMode = getBrowserWindowMode(command, 'dedicated');
         // --window-slot/--window-bounds/--window-display override env for this
         // invocation only; sendCommandRaw resolves them (dedicated mode only)
         // with this override taking precedence over OPENCLI_WINDOW_*.
@@ -3514,6 +3519,38 @@ cli({
     windows: DedicatedWindowInfo[];
   }
 
+  /** Pool summary attached to the `window-list` response, alongside the same `windows[]`/`displays` shape as `window-status`. */
+  interface DedicatedWindowPoolInfo {
+    automationDisplay?: string | null;
+    capacity?: number;
+    live?: number;
+    idle?: number;
+    free?: number;
+    idleTtlMs?: number;
+  }
+  /** A `window-list` entry: the `window-status` shape plus pool bookkeeping. */
+  type DedicatedWindowListInfo = DedicatedWindowInfo & {
+    pooled?: boolean;
+    holders?: number;
+    busy?: boolean;
+    idleMs?: number;
+    tileIndex?: number;
+  };
+  interface WindowListData {
+    supported: true;
+    protocol?: number;
+    capabilities?: string[];
+    displays: WindowStatusData['displays'];
+    displaysError?: string;
+    windows: DedicatedWindowListInfo[];
+    pool?: DedicatedWindowPoolInfo;
+  }
+  interface WindowCloseData {
+    closed: string[];
+    skipped: { slot: string; reason: string }[];
+    remaining: string[];
+  }
+
   type WindowOpOutcome =
     | { kind: 'supported'; data: Record<string, unknown> }
     | { kind: 'unsupported'; reason: 'extension-too-old' }
@@ -3526,7 +3563,7 @@ cli({
    * an error, so that shape — not an exception — is the "too old" signal. A
    * thrown error means the daemon/bridge itself could not be reached.
    */
-  async function sendWindowOp(op: 'window-status' | 'window-ensure', params: Record<string, unknown>): Promise<WindowOpOutcome> {
+  async function sendWindowOp(op: 'window-status' | 'window-ensure' | 'window-list' | 'window-close', params: Record<string, unknown>): Promise<WindowOpOutcome> {
     try {
       const data = await sendCommand('sessions', { op, ...params } as never);
       if (Array.isArray(data)) return { kind: 'unsupported', reason: 'extension-too-old' };
@@ -3574,6 +3611,36 @@ cli({
     row.tabs = formatTabsForTable(info.tabs);
     row.foreign = info.foreignTabPolicy ?? '-';
     return row;
+  }
+
+  function formatIdleMsForTable(ms: number | null | undefined): string {
+    if (ms === null || ms === undefined || !Number.isFinite(ms)) return '-';
+    if (ms < 1000) return `${ms}ms`;
+    const totalSeconds = Math.floor(ms / 1000);
+    if (totalSeconds < 60) return `${totalSeconds}s`;
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    return seconds > 0 ? `${minutes}m${seconds}s` : `${minutes}m`;
+  }
+
+  function dedicatedWindowListRow(info: DedicatedWindowListInfo): Record<string, string> {
+    return {
+      slot: info.slot,
+      window: info.windowId === null || info.windowId === undefined ? '-' : `win${info.windowId}`,
+      state: info.busy ? 'busy' : 'idle',
+      idle: info.busy ? '-' : formatIdleMsForTable(info.idleMs),
+      tile: info.tileIndex === null || info.tileIndex === undefined ? '-' : String(info.tileIndex),
+      bounds: formatBoundsForTable(info.bounds),
+      tabs: formatTabsForTable(info.tabs),
+    };
+  }
+
+  function printPoolSummary(pool: DedicatedWindowPoolInfo | undefined): void {
+    if (!pool) return;
+    console.log();
+    const idleTtl = typeof pool.idleTtlMs === 'number' ? `${Math.round(pool.idleTtlMs / 1000)}s` : '-';
+    const display = pool.automationDisplay ? ` display=${pool.automationDisplay}` : '';
+    console.log(`Pool: capacity=${pool.capacity ?? '-'} live=${pool.live ?? '-'} idle=${pool.idle ?? '-'} free=${pool.free ?? '-'} idleTtl=${idleTtl}${display}`);
   }
 
   function printDisplaysSection(data: Pick<WindowStatusData, 'displays' | 'displaysError'>): void {
@@ -3675,6 +3742,74 @@ cli({
         if (info.placement?.displayPattern && info.placement?.displayFound === false) {
           console.log(`Note: display pattern "${info.placement.displayPattern}" matched no connected display.`);
         }
+      } catch (err) {
+        log.error(getErrorMessage(err));
+        process.exitCode = EXIT_CODES.USAGE_ERROR;
+      }
+    });
+
+  browserWindow.command('list')
+    .description('List pooled dedicated automation windows: busy/idle, tiling, and pool capacity')
+    .option('-f, --format <fmt>', 'Output format: table (default) or json', 'table')
+    .action(async (opts: { format?: string }) => {
+      try {
+        const outcome = await sendWindowOp('window-list', {});
+        if (outcome.kind === 'unsupported') {
+          printUnsupportedWindowOp(outcome);
+          return;
+        }
+        const data = outcome.data as unknown as WindowListData;
+        const windows = Array.isArray(data.windows) ? data.windows : [];
+        const payload = { ...data, windows, cliVersion: PKG_VERSION };
+        if (opts.format === 'json') {
+          console.log(JSON.stringify(payload, null, 2));
+          return;
+        }
+        if (windows.length === 0) {
+          console.log('No dedicated windows tracked yet.');
+        } else {
+          renderOutput(windows.map(dedicatedWindowListRow), {
+            fmt: 'table',
+            columns: ['slot', 'window', 'state', 'idle', 'tile', 'bounds', 'tabs'],
+          });
+        }
+        printPoolSummary(data.pool);
+        printDisplaysSection(data);
+      } catch (err) {
+        log.error(getErrorMessage(err));
+        process.exitCode = EXIT_CODES.USAGE_ERROR;
+      }
+    });
+
+  browserWindow.command('close')
+    .description('Close pooled dedicated automation window(s)')
+    .option('--slot <name>', 'Slot to close (omit to close all)')
+    .option('--force', 'Close even while a live lease holds the window')
+    .option('-f, --format <fmt>', 'Output format: table (default) or json', 'table')
+    .action(async (opts: { slot?: string; force?: boolean; format?: string }) => {
+      try {
+        const params: Record<string, unknown> = {};
+        if (typeof opts.slot === 'string' && opts.slot.trim()) params.windowSlot = opts.slot.trim();
+        if (opts.force) params.force = true;
+        const outcome = await sendWindowOp('window-close', params);
+        if (outcome.kind === 'unsupported') {
+          printUnsupportedWindowOp(outcome);
+          return;
+        }
+        const data = outcome.data as unknown as WindowCloseData;
+        const closed = Array.isArray(data.closed) ? data.closed : [];
+        const skipped = Array.isArray(data.skipped) ? data.skipped : [];
+        const remaining = Array.isArray(data.remaining) ? data.remaining : [];
+        if (opts.format === 'json') {
+          console.log(JSON.stringify({ closed, skipped, remaining, cliVersion: PKG_VERSION }, null, 2));
+        } else {
+          console.log(closed.length > 0 ? `Closed: ${closed.join(', ')}` : 'Closed: none');
+          if (skipped.length > 0) {
+            console.log(`Skipped: ${skipped.map((s) => `${s.slot} (${s.reason})`).join(', ')}`);
+          }
+          console.log(`Remaining: ${remaining.length > 0 ? remaining.join(', ') : 'none'}`);
+        }
+        if (closed.length === 0 && skipped.length > 0) process.exitCode = EXIT_CODES.GENERIC_ERROR;
       } catch (err) {
         log.error(getErrorMessage(err));
         process.exitCode = EXIT_CODES.USAGE_ERROR;

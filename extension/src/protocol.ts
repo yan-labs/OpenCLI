@@ -45,7 +45,7 @@ export interface Command {
    * Sub-operation. tabs: list, new, close, select. sessions: list (default),
    * cleanup, window-status, window-ensure (dedicated automation windows).
    */
-  op?: 'list' | 'new' | 'close' | 'select' | 'cleanup' | 'window-status' | 'window-ensure';
+  op?: 'list' | 'new' | 'close' | 'select' | 'cleanup' | 'window-status' | 'window-ensure' | 'window-list' | 'window-close' | 'runtime-reload';
   /** Tab index for tabs select/close */
   index?: number;
   /** Cookie domain filter */
@@ -96,6 +96,14 @@ export interface Command {
   autoSelect?: boolean;
   /** `dedicated` only: what to do with tabs OpenCLI did not open that appear in a dedicated window (default 'evict'). */
   foreignTabPolicy?: 'evict' | 'tolerate';
+  /**
+   * `dedicated` only: how long an automation window may sit idle before the extension
+   * closes it (milliseconds). Sent with every dedicated command so the current CLI's
+   * OPENCLI_DEDICATED_IDLE_MS wins; omitted leaves the extension default (15 min).
+   */
+  dedicatedIdleMs?: number;
+  /** sessions window-close: close a window even while a live lease still holds it. */
+  force?: boolean;
   /** Custom idle timeout in seconds for this session. Overrides the default. */
   idleTimeout?: number;
   /** Frame index for cross-frame operations (0-based, from 'frames' action) */

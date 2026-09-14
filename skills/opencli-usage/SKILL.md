@@ -70,7 +70,7 @@ These appear on any adapter that talks to Chrome, plus all `opencli browser` sub
 
 | flag | effect |
 |------|--------|
-| `--window <mode>` | `background` (default), `active`, `foreground`, `isolated`, or `dedicated`. **Use `background` for most agent work** — it never raises the window or selects the tab, so `visibilityState` stays `hidden`. `active` makes the tab the active tab of its own window without raising that window (`visibilityState` is `visible` only while the window isn't fully covered by another app). `foreground` raises the window to the OS foreground — interrupts the user, use only when they need to watch. `isolated` is `background` in its own separate window. `dedicated` keeps the session in a named automation window, in this same Chrome and profile, that is never focused; auto-select still makes its tab that window's active tab before each command, so it renders `visible` without stealing focus — see "Avoiding focus stealing" below. None of these are headless: `navigator.webdriver` is `false` and plugins are present regardless of mode. Override globally with `OPENCLI_WINDOW=<mode>`. |
+| `--window <mode>` | `dedicated` (default), `background`, `active`, `foreground`, or `isolated`. **`dedicated` needs no flag for most agent work** — it opens the session in a pooled, off-screen OpenCLI-owned automation window, created unfocused and never raised, that still renders `visible` (auto-select makes the tab that window's active tab before each command). `background` instead borrows whichever window you are currently using and drops the tab into a labelled group there, following you if you switch windows — it never raises or selects, so `visibilityState` stays `hidden`; reach for it only when you deliberately want the tab inside the user's own window. `active` makes the tab the active tab of its own window without raising that window (`visibilityState` is `visible` only while the window isn't fully covered by another app). `foreground` raises the window to the OS foreground — interrupts the user; required for the confirmed sites that only render for a truly frontmost window (PageSpeed Insights, Google Trends chart rendering, AITDK's cross-origin iframe panel), otherwise reserve it for when they need to watch. `isolated` is `background` in its own separate window. None of these are headless: `navigator.webdriver` is `false` and plugins are present regardless of mode. Override globally with `OPENCLI_WINDOW=<mode>`. See "Window modes: dedicated by default" below. |
 | `--site-session <mode>` | `ephemeral` (default) or `persistent`. Persistent keeps the browser session tab alive after the command finishes; ephemeral releases it. |
 | `--keep-tab <bool>` | `true` or `false`. Keep the browser tab lease after the command finishes. |
 
@@ -86,38 +86,56 @@ Command-specific flags (`--limit`, `--tab`, `--filter`, …) are not universal �
 
 A few commands override the default via `cmd.defaultFormat` (e.g. chat commands default to `plain`), so don't assume without reading `--help`.
 
-## Avoiding focus stealing
+## Window modes: dedicated by default
 
-By default, adapter commands and `opencli browser open` may raise the Chrome window and switch to the target tab, stealing your desktop focus. **Set `background` mode to prevent this:**
-
-```bash
-# Per-command
-opencli browser work --window background open "https://..."
-opencli google search "test" --window background
-
-# Or globally (recommended for agent work)
-export OPENCLI_WINDOW=background
-```
-
-Background mode is **not** headless — it uses the real logged-in Chrome with all cookies and plugins, and `navigator.webdriver` is `false`. That's a separate axis from visibility, though: a `background` tab's `visibilityState` is always `hidden` — it is never the active tab of its window and its window is never raised. There is no reason to use foreground mode for automated work; request foreground only when the user explicitly wants to watch.
-
-### Getting a visible tab without stealing focus
-
-`active` and `foreground` do give you `visibilityState: visible`, but only while their window isn't fully covered by another app — once something else fully occludes it, Chrome marks even the active tab `hidden` after a few seconds (a non-active tab is always `hidden`), which can stall lazy-loaded content or a `requestAnimationFrame` loop that depends on staying visible.
-
-When you need a tab that renders visibly and must never interrupt the user, reach for `dedicated` mode instead:
+Both `opencli browser <session> <cmd>` and every site-adapter command default to `dedicated` mode — no flag needed. `dedicated` opens the session in a pooled, off-screen OpenCLI-owned automation window that is created unfocused and never raised, so plain calls never disturb the window you're using or steal your desktop focus:
 
 ```bash
-export OPENCLI_WINDOW=dedicated
-export OPENCLI_WINDOW_DISPLAY="<virtual-display-name-pattern>"
+opencli browser work open "https://..."     # dedicated by default
+opencli google search "test"                # same for adapter commands
 ```
 
-This places the session's window on a display (or tiled cell on one) that nobody is looking at — still the same Chrome, same profile as the user, just a separate window that is created unfocused and never raised. Auto-select (on by default) makes the session's tab that window's active tab before every page-scoped command, so `visibilityState` reads `visible` on a window that never reaches the OS foreground. See the `opencli-browser` skill and `opencli browser window status` for the full dedicated-window interface (slots, bounds, display matching, foreign-tab handling).
+`dedicated` is **not** headless — it uses the real logged-in Chrome with all cookies and plugins, and `navigator.webdriver` is `false`. Auto-select (on by default) makes the session's tab that window's active tab before every page-scoped command, so `visibilityState` reads `visible` on a window that never reaches the OS foreground.
+
+Reach for the other modes only when you deliberately want something different:
+
+- **`background`** — borrows whichever window you are currently using and drops the session's tab into a labelled tab group there, following you if you switch windows. It never raises anything and never selects the tab, so `visibilityState` stays `hidden` — use it only when you want the tab to live inside the user's own window instead of a separate one.
+- **`active`** — selects the tab within its own window without raising that window. `visibilityState` is `visible` only while the window isn't fully covered by another app; once something else fully occludes it, Chrome marks even the active tab `hidden` after a few seconds (a non-active tab is always `hidden`), which can stall lazy-loaded content or a `requestAnimationFrame` loop that depends on staying visible. `dedicated`'s own tiling (see below) avoids this by construction.
+- **`foreground`** — raises the window to real OS focus. Interrupts the user — use it when they explicitly want to watch, or for the confirmed handful of sites that only render for a truly frontmost window: **PageSpeed Insights** (pagespeed.web.dev), **Google Trends** chart rendering, and **AITDK**'s cross-origin iframe panel. Callers driving those sites must keep passing `--window foreground` explicitly; that's expected, not a bug.
+- **`isolated`** — `background` in its own separate window (one shared window for every isolated session, unlike `dedicated`'s per-lease pool).
+
+```bash
+opencli browser work --window background open "https://..."                    # borrow the user's window instead
+opencli browser work --window foreground open "https://pagespeed.web.dev/..."  # sites that need real OS focus
+```
 
 The `--window` flag sits **between the session name and the subcommand** for `opencli browser`:
 ```bash
 opencli browser <session> --window background <command>   # correct
 opencli browser <session> <command> --window background   # also works
+```
+
+### Dedicated windows: pool, layout, and capacity
+
+`dedicated` windows are pooled, not one-per-session: anonymous `pool-1`, `pool-2`, … windows are borrowed for the duration of a command's lease and returned to the pool when it ends, so ten one-shot commands in a row reuse one window instead of piling up ten. Pass `--window-slot <name>` to pin a named window instead of drawing from the pool, for a caller that wants a stable, addressable window across calls.
+
+Window size is dynamic and non-overlapping: tiles are computed from the automation display's work area and however many automation windows are live right now — one window gets 1280×900, more windows get progressively smaller tiles down to a 900×620 floor, never a fixed grid that wraps around and stacks windows on top of each other. This matters because Chrome reports a fully covered window as `hidden` regardless of its actual tab state, which used to corrupt scrapes silently.
+
+Capacity is finite and honest: when the automation display cannot fit another window without overlapping one already there, the command fails closed with an error starting `dedicated-pool-exhausted:` telling you to wait for a task to finish or free a slot — it will never stack an unseeable window while claiming success.
+
+Idle windows are reaped automatically: an automation window with no live lease is closed by the extension after an idle TTL (default 15 minutes), overridable via `OPENCLI_DEDICATED_IDLE_MS` (milliseconds, sent with each `dedicated` command). No manual cleanup is needed.
+
+With no `--window-display` / `OPENCLI_WINDOW_DISPLAY` / `--window-bounds`, the extension auto-picks the automation display: a secondary display when one exists (preferring a non-internal one — an external or virtual screen — over the built-in panel), else the only display. Automation windows are always created unfocused and never raised.
+
+Inspect and manage the pool directly:
+
+```bash
+opencli browser <session> window list                          # every automation window: busy/idle, tile, pool capacity/live/idle/free, idle TTL
+opencli browser <session> window close                         # close every automation window not held by a live lease
+opencli browser <session> window close --slot pool-2           # close one window by slot
+opencli browser <session> window close --slot pool-2 --force   # close it even if a live lease still holds it
+opencli browser <session> window status                        # per-slot status
+opencli browser <session> window ensure --slot mine --display "<pattern>"  # create/move a pinned slot
 ```
 
 ## Environment variables
@@ -128,12 +146,13 @@ opencli browser <session> <command> --window background   # also works
 | `OPENCLI_BROWSER_COMMAND_TIMEOUT` | `60` | Per-command timeout. |
 | `OPENCLI_CDP_ENDPOINT` | — | Manual CDP endpoint override (dev / remote Chrome / Electron). |
 | `OPENCLI_CACHE_DIR` | `~/.opencli/cache` | Network capture + browser-state cache. |
-| `OPENCLI_WINDOW` | command-specific | `foreground`, `active`, `background`, `isolated`, or `dedicated` browser window mode. |
-| `OPENCLI_WINDOW_SLOT` | `default` | Named dedicated-window slot (`dedicated` mode only); use a different slot per session that needs concurrent visibility. |
+| `OPENCLI_WINDOW` | `dedicated` | `foreground`, `active`, `background`, `isolated`, or `dedicated` browser window mode. |
+| `OPENCLI_WINDOW_SLOT` | — (drawn from the pool) | Pin a named `dedicated`-mode window instead of borrowing one from the pool; use a different slot per session that needs a stable, concurrently-visible window. |
 | `OPENCLI_WINDOW_BOUNDS` | — | `x,y,w,h` integers; explicit placement for the dedicated window. |
-| `OPENCLI_WINDOW_DISPLAY` | — | Display-name pattern (`/re/flags` or substring); tiles the dedicated window onto the matching display. |
+| `OPENCLI_WINDOW_DISPLAY` | — (auto-picked) | Display-name pattern (`/re/flags` or substring); tiles the dedicated window onto the matching display. Unset, the extension prefers a secondary, non-internal display. |
 | `OPENCLI_WINDOW_AUTOSELECT` | `on` | `1/0/true/false/on/off`; `dedicated` mode only — whether the session's tab is made the window's active tab before every page-scoped command. |
 | `OPENCLI_DEDICATED_FOREIGN_TABS` | `evict` | `evict` or `tolerate`; how a dedicated window handles a tab that wasn't opened by OpenCLI. |
+| `OPENCLI_DEDICATED_IDLE_MS` | `900000` (15 min) | Milliseconds of no live lease before the extension closes an idle `dedicated` window. Sent with each `dedicated` command. |
 | `OPENCLI_VERBOSE` | `false` | Verbose logging (also triggered by `-v`). |
 
 ## Browser batch — multiple operations in one call

@@ -1,5 +1,25 @@
 # Changelog
 
+## [Unreleased]
+
+Default browser window placement changes from `background` to `dedicated`, and `dedicated` grows a pool, a dynamic layout, and window-management subcommands.
+
+### ⚠ BREAKING CHANGES
+
+* **browser window** — the default window mode for both `opencli browser <session> <cmd>` and every site-adapter command changes from `background` to `dedicated`. `background` never opened a window of its own — it borrows whichever window you are currently using and drops the session's tab into a labelled tab group there, following you if you switch windows (its tab has always reported `visibilityState: hidden`); that borrowing is what made plain calls disturb the window you were in. `dedicated` instead opens the session in an OpenCLI-owned automation window, off to the side and created unfocused, while still rendering `visible`. Explicit `--window <mode>` and `OPENCLI_WINDOW` continue to override the default, so callers that want the old borrowing behavior pass `--window background` / `OPENCLI_WINDOW=background` explicitly.
+
+### Features
+
+* **browser window** — `dedicated` windows are now pooled instead of one-per-session: anonymous `pool-1`, `pool-2`, … windows are borrowed for the duration of a command's lease and returned to the pool when it ends, so a run of one-shot commands reuses one window instead of accumulating one per session. `--window-slot <name>` still pins a named window for callers that want a stable one.
+* **browser window** — dynamic, non-overlapping tile layout: window size is computed from the automation display's work area and the number of automation windows live right now (1280×900 for a single window, shrinking to a 900×620 floor as more windows share the display) instead of a fixed grid that could wrap around and stack windows on top of each other — Chrome reports a fully covered window as `hidden`, which was silently corrupting scrapes.
+* **browser window** — idle `dedicated` windows are reaped automatically: an automation window with no live lease is closed by the extension after 15 minutes by default, overridable per command via `OPENCLI_DEDICATED_IDLE_MS` (milliseconds).
+* **browser window** — with no `--window-display` / `--window-bounds`, the extension now auto-picks the automation display: a secondary display when one exists (preferring a non-internal, i.e. external or virtual, display), else the only display. Automation windows are always created unfocused and never raised.
+* **browser window** — two new subcommands: `opencli browser <session> window list` (every automation window plus pool capacity/live/idle/free counts and the idle TTL) and `opencli browser <session> window close [--slot <name>] [--force]` (closes one window, or all when `--slot` is omitted; refuses a window still held by a live lease unless `--force`).
+
+### Bug Fixes
+
+* **browser window** — a `dedicated` command that would overlap another window on the automation display now fails closed with a `dedicated-pool-exhausted:` error telling the caller to wait or free a slot, instead of stacking a window nobody can see while `window status` still reported `onDisplay: true`.
+
 ## [1.8.4](https://github.com/jackwener/opencli/compare/v1.8.3...v1.8.4) (2026-06-15)
 
 Patch release surfacing the bundled skills directory, expanding the auth subsystem across 50+ adapters, refactoring the extension's tab-group model, and adding ten or so new adapter capabilities.

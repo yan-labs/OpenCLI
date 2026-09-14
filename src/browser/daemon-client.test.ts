@@ -505,6 +505,68 @@ describe('daemon-client', () => {
       expect(lastRequestBody()).not.toHaveProperty('windowSlot');
     });
 
+    it('always attaches placement fields for the sessions window-list op, regardless of windowMode', async () => {
+      vi.stubEnv('OPENCLI_WINDOW_SLOT', 'semrush');
+      mockOkResponse();
+
+      await sendCommand('sessions', { op: 'window-list' });
+
+      expect(lastRequestBody().windowSlot).toBe('semrush');
+    });
+
+    it('always attaches placement fields for the sessions window-close op, regardless of windowMode', async () => {
+      vi.stubEnv('OPENCLI_WINDOW_SLOT', 'semrush');
+      mockOkResponse();
+
+      await sendCommand('sessions', { op: 'window-close' });
+
+      expect(lastRequestBody().windowSlot).toBe('semrush');
+    });
+
+    it('OPENCLI_DEDICATED_IDLE_MS reaches the command as dedicatedIdleMs on a dedicated-mode command', async () => {
+      vi.stubEnv('OPENCLI_DEDICATED_IDLE_MS', '60000');
+      mockOkResponse();
+
+      await sendCommand('exec', { code: '1', windowMode: 'dedicated' });
+
+      expect(lastRequestBody().dedicatedIdleMs).toBe(60_000);
+    });
+
+    it('OPENCLI_DEDICATED_IDLE_MS reaches the command on the session-independent window ops too', async () => {
+      vi.stubEnv('OPENCLI_DEDICATED_IDLE_MS', '45000');
+      mockOkResponse();
+
+      await sendCommand('sessions', { op: 'window-list' });
+
+      expect(lastRequestBody().dedicatedIdleMs).toBe(45_000);
+    });
+
+    it('does NOT attach dedicatedIdleMs for a non-dedicated, non-window-op command even when the env var is set', async () => {
+      vi.stubEnv('OPENCLI_DEDICATED_IDLE_MS', '60000');
+      mockOkResponse();
+
+      await sendCommand('exec', { code: '1', windowMode: 'background' });
+
+      expect(lastRequestBody()).not.toHaveProperty('dedicatedIdleMs');
+    });
+
+    it('silently drops a bogus OPENCLI_DEDICATED_IDLE_MS instead of throwing or attaching it', async () => {
+      vi.stubEnv('OPENCLI_DEDICATED_IDLE_MS', 'not-a-number');
+      mockOkResponse();
+
+      await expect(sendCommand('exec', { code: '1', windowMode: 'dedicated' })).resolves.toBe('ok');
+      expect(lastRequestBody()).not.toHaveProperty('dedicatedIdleMs');
+    });
+
+    it('an explicit dedicatedIdleMs param wins over the env var', async () => {
+      vi.stubEnv('OPENCLI_DEDICATED_IDLE_MS', '60000');
+      mockOkResponse();
+
+      await sendCommand('exec', { code: '1', windowMode: 'dedicated', dedicatedIdleMs: 15_000 });
+
+      expect(lastRequestBody().dedicatedIdleMs).toBe(15_000);
+    });
+
     it('throws naming OPENCLI_WINDOW_BOUNDS on a malformed value, only when placement is actually resolved', async () => {
       vi.stubEnv('OPENCLI_WINDOW_BOUNDS', 'garbage');
       mockOkResponse();

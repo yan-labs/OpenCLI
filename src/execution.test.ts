@@ -208,8 +208,8 @@ describe('executeCommand — non-browser timeout', () => {
     await executeCommand(cmd, {}, false, { keepTab: 'false' });
 
     expect(sessionOpts).toHaveLength(2);
-    expect(sessionOpts[0]).toMatchObject({ session: 'site:test-execution', windowMode: 'background', siteSession: 'persistent' });
-    expect(sessionOpts[1]).toMatchObject({ session: 'site:test-execution', windowMode: 'background', siteSession: 'persistent' });
+    expect(sessionOpts[0]).toMatchObject({ session: 'site:test-execution', windowMode: 'dedicated', siteSession: 'persistent' });
+    expect(sessionOpts[1]).toMatchObject({ session: 'site:test-execution', windowMode: 'dedicated', siteSession: 'persistent' });
     expect(sessionOpts[0]?.idleTimeout).toBeUndefined();
     expect(sessionOpts[1]?.idleTimeout).toBeUndefined();
     expect(closeWindow).not.toHaveBeenCalled();
@@ -245,8 +245,8 @@ describe('executeCommand — non-browser timeout', () => {
     expect(sessionOpts[0]?.session).not.toBe(sessionOpts[1]?.session);
     expect(sessionOpts[0]?.idleTimeout).toBeUndefined();
     expect(sessionOpts[1]?.idleTimeout).toBeUndefined();
-    expect(sessionOpts[0]?.windowMode).toBe('background');
-    expect(sessionOpts[1]?.windowMode).toBe('background');
+    expect(sessionOpts[0]?.windowMode).toBe('dedicated');
+    expect(sessionOpts[1]?.windowMode).toBe('dedicated');
     expect(closeWindow).toHaveBeenCalledTimes(2);
     vi.restoreAllMocks();
   });
@@ -560,6 +560,58 @@ describe('executeCommand — non-browser timeout', () => {
     await executeCommand(cmd, {});
 
     expect(sessionOpts[0]).toMatchObject({ windowMode: 'foreground' });
+    vi.restoreAllMocks();
+  });
+
+  it('falls back to dedicated when the command has no defaultWindowMode and the user passes no --window', async () => {
+    const closeWindow = vi.fn().mockResolvedValue(undefined);
+    const mockPage = { closeWindow } as any;
+    const sessionOpts: Array<{ windowMode?: string }> = [];
+
+    vi.spyOn(capRouting, 'shouldUseBrowserSession').mockReturnValue(true);
+    vi.spyOn(runtime, 'browserSession').mockImplementation(async (_Factory, fn, opts) => {
+      sessionOpts.push(opts ?? {});
+      return fn(mockPage);
+    });
+
+    const cmd = cli({
+      site: 'test-execution',
+      name: 'browser-fallback-window-mode', access: 'read',
+      description: 'test fallback window mode is dedicated',
+      browser: true,
+      strategy: Strategy.PUBLIC,
+      func: async () => [{ ok: true }],
+    });
+
+    await executeCommand(cmd, {});
+
+    expect(sessionOpts[0]).toMatchObject({ windowMode: 'dedicated' });
+    vi.restoreAllMocks();
+  });
+
+  it('an explicit --window flag still wins over the dedicated default even with no defaultWindowMode', async () => {
+    const closeWindow = vi.fn().mockResolvedValue(undefined);
+    const mockPage = { closeWindow } as any;
+    const sessionOpts: Array<{ windowMode?: string }> = [];
+
+    vi.spyOn(capRouting, 'shouldUseBrowserSession').mockReturnValue(true);
+    vi.spyOn(runtime, 'browserSession').mockImplementation(async (_Factory, fn, opts) => {
+      sessionOpts.push(opts ?? {});
+      return fn(mockPage);
+    });
+
+    const cmd = cli({
+      site: 'test-execution',
+      name: 'browser-explicit-window-mode', access: 'read',
+      description: 'test explicit --window beats the dedicated default',
+      browser: true,
+      strategy: Strategy.PUBLIC,
+      func: async () => [{ ok: true }],
+    });
+
+    await executeCommand(cmd, {}, false, { windowMode: 'background' });
+
+    expect(sessionOpts[0]).toMatchObject({ windowMode: 'background' });
     vi.restoreAllMocks();
   });
 
