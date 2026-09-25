@@ -68,6 +68,10 @@ type BrowserNetworkItem = {
   bodyFullSize?: number;
   /** True when the capture layer had to cap the stored body to protect memory. */
   bodyTruncated?: boolean;
+  /** True when the capture layer could not obtain the body (body is null, not empty). */
+  bodyUnavailable?: boolean;
+  /** Why the body is unavailable; set together with bodyUnavailable. */
+  bodyError?: string;
   /** Epoch milliseconds when the request was observed. */
   timestamp?: number;
   /** Sanitized request context captured by CDP. */
@@ -227,6 +231,12 @@ async function captureNetworkItems(page: import('./types.js').IPage): Promise<Br
           body,
           bodyFullSize: fullSize,
           bodyTruncated: truncated,
+          ...(e.responseBodyUnavailable === true
+            ? {
+              bodyUnavailable: true,
+              bodyError: typeof e.responseBodyError === 'string' ? e.responseBodyError : 'response body unavailable',
+            }
+            : {}),
           timestamp: timestampFromRaw(e.timestamp),
           ...(request ? { request } : {}),
         };
@@ -2704,6 +2714,10 @@ still usable even when navigation is reported as timed out.
             ? 'capture-limit'
             : 'max-body';
         }
+        if (entry.body_unavailable === true) {
+          detailEnvelope.body_unavailable = true;
+          detailEnvelope.body_error = entry.body_error ?? 'response body unavailable';
+        }
         console.log(JSON.stringify(detailEnvelope, null, 2));
         return;
       }
@@ -2731,6 +2745,7 @@ still usable even when navigation is reported as timed out.
               ct: item.ct,
               size: item.size,
               ...(item.bodyTruncated ? { body_truncated: true } : {}),
+              ...(item.bodyUnavailable ? { body_unavailable: true } : {}),
             }));
           }
           await new Promise((resolve) => setTimeout(resolve, FOLLOW_POLL_MS));
@@ -2766,6 +2781,9 @@ still usable even when navigation is reported as timed out.
           ...(it.bodyTruncated ? { body_truncated: true } : {}),
           ...(it.bodyTruncated && typeof it.bodyFullSize === 'number'
             ? { body_full_size: it.bodyFullSize }
+            : {}),
+          ...(it.bodyUnavailable
+            ? { body_unavailable: true, body_error: it.bodyError ?? 'response body unavailable' }
             : {}),
           ...(it.request ? { request: it.request } : {}),
         }));
@@ -2825,6 +2843,11 @@ still usable even when navigation is reported as timed out.
         envelope.body_truncated_count = truncatedCount;
         envelope.body_truncated_hint = 'Some bodies exceeded the capture limit; their `shape` reflects only the captured prefix.';
       }
+      const unavailableCount = visible.filter((s) => s.entry.body_unavailable).length;
+      if (unavailableCount > 0) {
+        envelope.body_unavailable_count = unavailableCount;
+        envelope.body_unavailable_hint = 'Some responses completed but their body could not be captured (see each entry\'s `body_error`); their `body` is null, not empty.';
+      }
 
       if (opts.raw) {
         envelope.entries = visible.map((s) => ({
@@ -2842,6 +2865,7 @@ still usable even when navigation is reported as timed out.
           size: s.entry.size,
           shape: s.shape,
           ...(s.entry.body_truncated ? { body_truncated: true } : {}),
+          ...(s.entry.body_unavailable ? { body_unavailable: true } : {}),
         }));
         envelope.detail_hint = 'Run "browser network --detail <key>" for full body.';
       }

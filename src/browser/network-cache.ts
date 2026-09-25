@@ -32,6 +32,12 @@ export interface CachedNetworkEntry {
      */
     body_truncated?: boolean;
     body_full_size?: number;
+    /**
+     * Set (with `body_error`) when the capture layer could not obtain the
+     * response body; `body` is then null. Absent on entries with a body.
+     */
+    body_unavailable?: boolean;
+    body_error?: string;
     timestamp?: number;
     /** Sanitized request context; credential values and opaque bodies are omitted. */
     request?: SafeNetworkRequest;

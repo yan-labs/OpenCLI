@@ -222,7 +222,15 @@ export async function discoverPlugins(): Promise<void> {
  * Unlike discoverClisFromFs, this does NOT expect nested site subdirectories.
  */
 async function discoverPluginDir(dir: string, site: string): Promise<void> {
-  const files = await fs.promises.readdir(dir);
+  let files: string[];
+  try {
+    files = await fs.promises.readdir(dir);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return; // Plugin dir vanished concurrently (e.g. being uninstalled/updated) — skip it.
+    log.warn(`Failed to read plugin directory ${dir}: ${getErrorMessage(err)}`);
+    return;
+  }
   const fileSet = new Set(files);
   await Promise.all(files.map(async (file) => {
     const filePath = path.join(dir, file);

@@ -89,6 +89,20 @@ const tabAttachedEventCounts = new Map<number, number>();
 // on the direct-CDP path. Keep in sync.
 const CDP_RESPONSE_BODY_CAPTURE_LIMIT = 8 * 1024 * 1024;
 const CDP_REQUEST_BODY_CAPTURE_LIMIT = 1 * 1024 * 1024;
+/**
+ * Upper bound on response-body chars held by one tab's capture between reads.
+ * Bodies are fetched eagerly at Network.loadingFinished (Chrome discards its
+ * own buffer on detach/eviction), so without a ceiling an unread capture on a
+ * chatty page would grow without limit. Past the budget a body is NOT stored
+ * and the entry is flagged `responseBodyUnavailable` with the reason.
+ */
+const CDP_RESPONSE_BODY_TOTAL_BUDGET = 64 * 1024 * 1024;
+/** Deadline for one Network.getResponseBody — shorter than the generic 60s command deadline. */
+const CDP_BODY_FETCH_TIMEOUT_MS = 15_000;
+/** How long a capture read waits for bodies still being fetched before flagging them. */
+const CDP_READ_PENDING_BODY_WAIT_MS = 10_000;
+/** Deadline for chrome.debugger.getTargets when double-checking a timed-out probe. */
+const CDP_TARGET_QUERY_TIMEOUT_MS = 1_000;
 
 type NetworkCaptureEntry = {
   kind: 'cdp';
@@ -105,6 +119,14 @@ type NetworkCaptureEntry = {
   responsePreview?: string;
   responseBodyFullSize?: number;
   responseBodyTruncated?: boolean;
+  /**
+   * Set (with `responseBodyError`) when the response body could not be
+   * captured. `responsePreview` is then absent — an unavailable body is never
+   * reported as an empty string. Absent on entries whose body was captured.
+   */
+  responseBodyUnavailable?: boolean;
+  /** Human-readable reason the body is unavailable (CDP error, re-attach, budget, request failure). */
+  responseBodyError?: string;
   timestamp: number;
 };
 
@@ -112,7 +134,24 @@ type NetworkCaptureState = {
   patterns: string[];
   entries: NetworkCaptureEntry[];
   requestToIndex: Map<string, number>;
+  /** Network.getResponseBody calls still running, keyed by the entry they fill in. */
+  bodyFetchesInFlight: Map<NetworkCaptureEntry, Promise<void>>;
+  /** Response-body chars stored on undrained entries (see CDP_RESPONSE_BODY_TOTAL_BUDGET). */
+  storedBodyChars: number;
+  /** Bumped on every read, so a body fetch that lands after its entry was drained does not count against the budget. */
+  generation: number;
 };
+
+function createNetworkCaptureState(patterns: string[]): NetworkCaptureState {
+  return {
+    patterns,
+    entries: [],
+    requestToIndex: new Map(),
+    bodyFetchesInFlight: new Map(),
+    storedBodyChars: 0,
+    generation: 0,
+  };
+}
 
 export type DownloadWaitResult = {
   downloaded: boolean;
@@ -142,6 +181,22 @@ const CDP_COMMAND_TIMEOUT_MS = 60_000;
 const CDP_PROBE_TIMEOUT_MS = 2_000;
 
 /**
+ * Raised when a chrome.debugger command misses its deadline. A distinct class
+ * lets the health-check tell "renderer busy, command still queued" apart from
+ * a real CDP failure ("Debugger is not attached", "Inspected target navigated
+ * or closed"). The message is unchanged from the previous plain Error.
+ */
+export class CdpCommandTimeoutError extends Error {
+  readonly method: string;
+  readonly timeoutMs: number;
+  constructor(method: string, timeoutMs: number) {
+    super(`CDP command ${method} timed out after ${Math.round(timeoutMs / 1000)}s — the page may be blocked by a native dialog (alert/confirm/print)`);
+    this.method = method;
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+/**
  * chrome.debugger.sendCommand with a deadline. The underlying command cannot
  * be cancelled — this only unblocks the caller so the CLI gets an error
  * instead of an infinite hang.
@@ -164,9 +219,7 @@ export async function sendDebuggerCommand<T = unknown>(
     return await Promise.race([
       commandPromise,
       new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error(
-          `CDP command ${method} timed out after ${Math.round(timeoutMs / 1000)}s — the page may be blocked by a native dialog (alert/confirm/print)`,
-        )), timeoutMs);
+        timer = setTimeout(() => reject(new CdpCommandTimeoutError(method, timeoutMs)), timeoutMs);
       }),
     ]);
   } finally {
@@ -203,7 +256,18 @@ export async function ensureAttached(tabId: number, aggressiveRetry: boolean = f
         expression: '1', returnByValue: true,
       }, CDP_PROBE_TIMEOUT_MS);
       return; // Still attached and working
-    } catch {
+    } catch (err) {
+      // A probe that merely TIMED OUT usually means the renderer main thread is
+      // busy (heavy SPA boot, long tasks): Runtime.evaluate queues behind it.
+      // That is not a stale attach, and tearing the session down is actively
+      // harmful — the forced detach below discards every response body Chrome
+      // buffered for the old session, so requests that had already finished
+      // come back with no body. Only re-attach when the probe failed with a
+      // real CDP error or Chrome confirms the debugger is really gone.
+      if (err instanceof CdpCommandTimeoutError && await isDebuggerAttachedToTab(tabId)) {
+        console.warn(`[opencli] health-check probe for tab ${tabId} timed out after ${CDP_PROBE_TIMEOUT_MS}ms but the debugger is still attached — page busy, keeping the session`);
+        return;
+      }
       // Stale cache entry — need to re-attach
       attached.delete(tabId);
     }
@@ -287,6 +351,10 @@ export async function ensureAttached(tabId: number, aggressiveRetry: boolean = f
   if (preservedNetworkCapture) {
     try {
       await sendDebuggerCommand({ tabId }, 'Network.enable');
+      // The old session's response buffers died with the detach: any entry
+      // whose body was not fetched yet can never get one. Say so explicitly
+      // instead of letting it surface as a 200 with an empty body.
+      markBodiesLostToReattach(preservedNetworkCapture);
       networkCaptures.set(tabId, preservedNetworkCapture);
     } catch {
       // Leave capture cleared rather than arm a half-attached Network domain;
@@ -1178,25 +1246,140 @@ function getOrCreateNetworkCaptureEntry(tabId: number, requestId: string, fallba
   return entry;
 }
 
+/**
+ * Ask Chrome (browser process, not the renderer) whether a debugger is still
+ * attached to the tab. Used only after a health-check probe TIMED OUT, to tell
+ * a busy page from a dead session. Any failure or missing API answers "no",
+ * which keeps the old re-attach behaviour.
+ */
+async function isDebuggerAttachedToTab(tabId: number): Promise<boolean> {
+  const api = chrome.debugger as unknown as {
+    getTargets?: () => Promise<Array<{ tabId?: number; attached?: boolean }>>;
+  };
+  if (typeof api.getTargets !== 'function') return false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const targets = await Promise.race([
+      api.getTargets(),
+      new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), CDP_TARGET_QUERY_TIMEOUT_MS); }),
+    ]);
+    if (!Array.isArray(targets)) return false;
+    return targets.some((target) => target.tabId === tabId && target.attached === true);
+  } catch {
+    return false;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+function markBodyUnavailable(entry: NetworkCaptureEntry, reason: string): void {
+  // Never clobber a body that was already captured.
+  if (entry.responsePreview !== undefined) return;
+  entry.responseBodyUnavailable = true;
+  entry.responseBodyError = reason;
+}
+
+const REATTACH_BODY_LOST_REASON = 'debugger re-attached before this response body was fetched; Chrome discards the previous debugger session\'s response buffers, so Network.getResponseBody can no longer return it';
+const REATTACH_IN_FLIGHT_LOST_REASON = 'debugger re-attached while this request was in flight; its completion and body are not observable from the new debugger session';
+
+function markBodiesLostToReattach(state: NetworkCaptureState): void {
+  for (const entry of state.entries) {
+    if (entry.responsePreview !== undefined || entry.responseBodyUnavailable) continue;
+    // A fetch already running records its own outcome (success, or the CDP error).
+    if (state.bodyFetchesInFlight.has(entry)) continue;
+    markBodyUnavailable(entry, entry.responseStatus === undefined ? REATTACH_IN_FLIGHT_LOST_REASON : REATTACH_BODY_LOST_REASON);
+  }
+}
+
+/**
+ * Fetch and cache one response body right at Network.loadingFinished, while
+ * Chrome still holds it. Never rejects: every failure lands on the entry as
+ * `responseBodyUnavailable` + `responseBodyError`.
+ */
+function captureResponseBody(
+  tabId: number,
+  state: NetworkCaptureState,
+  requestId: string,
+  entry: NetworkCaptureEntry,
+): Promise<void> {
+  const existing = state.bodyFetchesInFlight.get(entry);
+  if (existing) return existing;
+  const generation = state.generation;
+  // Declared before assignment so the IIFE's finally can compare against it
+  // (it only runs after the first await, once the assignment has happened).
+  let fetchPromise: Promise<void> | undefined;
+  fetchPromise = (async () => {
+    try {
+      const result = await sendDebuggerCommand<{ body?: string; base64Encoded?: boolean }>(
+        { tabId }, 'Network.getResponseBody', { requestId }, CDP_BODY_FETCH_TIMEOUT_MS,
+      );
+      if (typeof result?.body !== 'string') {
+        markBodyUnavailable(entry, 'Network.getResponseBody returned no body');
+        return;
+      }
+      const fullSize = result.body.length;
+      const truncated = fullSize > CDP_RESPONSE_BODY_CAPTURE_LIMIT;
+      const stored = truncated ? result.body.slice(0, CDP_RESPONSE_BODY_CAPTURE_LIMIT) : result.body;
+      // A fetch that lands after its entry was drained belongs to a snapshot
+      // that is already gone — it must not eat the current budget.
+      const counted = generation === state.generation;
+      if (counted && state.storedBodyChars + stored.length > CDP_RESPONSE_BODY_TOTAL_BUDGET) {
+        entry.responseBodyFullSize = fullSize;
+        markBodyUnavailable(entry, `capture body budget exceeded: undrained bodies on this tab already hold ${state.storedBodyChars} chars (budget ${CDP_RESPONSE_BODY_TOTAL_BUDGET}); read the capture more often`);
+        return;
+      }
+      entry.responsePreview = result.base64Encoded ? `base64:${stored}` : stored;
+      entry.responseBodyFullSize = fullSize;
+      entry.responseBodyTruncated = truncated;
+      delete entry.responseBodyUnavailable;
+      delete entry.responseBodyError;
+      if (counted) state.storedBodyChars += stored.length;
+    } catch (err) {
+      markBodyUnavailable(entry, `Network.getResponseBody failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      if (state.bodyFetchesInFlight.get(entry) === fetchPromise) state.bodyFetchesInFlight.delete(entry);
+    }
+  })();
+  state.bodyFetchesInFlight.set(entry, fetchPromise);
+  return fetchPromise;
+}
+
 export async function startNetworkCapture(
   tabId: number,
   pattern?: string,
 ): Promise<void> {
   await ensureAttached(tabId);
   await sendDebuggerCommand({ tabId }, 'Network.enable');
-  networkCaptures.set(tabId, {
-    patterns: normalizeCapturePatterns(pattern),
-    entries: [],
-    requestToIndex: new Map(),
-  });
+  networkCaptures.set(tabId, createNetworkCaptureState(normalizeCapturePatterns(pattern)));
 }
 
 export async function readNetworkCapture(tabId: number): Promise<NetworkCaptureEntry[]> {
-  const state = networkCaptures.get(tabId);
+  let state = networkCaptures.get(tabId);
   if (!state) return [];
-  const entries = state.entries.slice();
+  // A body fetch can still be running when the caller reads (busy page, slow
+  // renderer). Draining now would ship the entry without its body and then
+  // drop the late result on the floor — wait a bounded time instead.
+  if (state.bodyFetchesInFlight.size > 0) {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      Promise.all([...state.bodyFetchesInFlight.values()]),
+      new Promise<void>((resolve) => { timer = setTimeout(resolve, CDP_READ_PENDING_BODY_WAIT_MS); }),
+    ]);
+    if (timer !== undefined) clearTimeout(timer);
+    state = networkCaptures.get(tabId);
+    if (!state) return [];
+  }
+  for (const entry of state.bodyFetchesInFlight.keys()) {
+    markBodyUnavailable(entry, `response body fetch still pending after waiting ${CDP_READ_PENDING_BODY_WAIT_MS}ms when the capture was read`);
+  }
+  // Copies: a fetch that lands after this read must not mutate the snapshot
+  // while it is being serialized back to the daemon.
+  const entries = state.entries.map((entry) => ({ ...entry }));
   state.entries = [];
   state.requestToIndex.clear();
+  state.bodyFetchesInFlight.clear();
+  state.storedBodyChars = 0;
+  state.generation += 1;
   return entries;
 }
 
@@ -1381,22 +1564,24 @@ export function registerListeners(): void {
       if (stateEntryIndex === undefined) return;
       const entry = state.entries[stateEntryIndex];
       if (!entry) return;
-      try {
-        const body = await sendDebuggerCommand({ tabId }, 'Network.getResponseBody', { requestId }) as {
-          body?: string;
-          base64Encoded?: boolean;
-        };
-        if (typeof body?.body === 'string') {
-          const fullSize = body.body.length;
-          const truncated = fullSize > CDP_RESPONSE_BODY_CAPTURE_LIMIT;
-          const stored = truncated ? body.body.slice(0, CDP_RESPONSE_BODY_CAPTURE_LIMIT) : body.body;
-          entry.responsePreview = body.base64Encoded ? `base64:${stored}` : stored;
-          entry.responseBodyFullSize = fullSize;
-          entry.responseBodyTruncated = truncated;
-        }
-      } catch {
-        // Optional; bodies are unavailable for some requests (e.g. uploads).
-      }
+      // Fetch now, while Chrome still buffers the body. Failures are recorded
+      // on the entry (responseBodyUnavailable/responseBodyError), not swallowed.
+      await captureResponseBody(tabId, state, requestId, entry);
+      return;
+    }
+
+    if (method === 'Network.loadingFailed') {
+      const requestId = String(eventParams?.requestId || '');
+      const stateEntryIndex = state.requestToIndex.get(requestId);
+      if (stateEntryIndex === undefined) return;
+      const entry = state.entries[stateEntryIndex];
+      if (!entry) return;
+      const errorText = String(eventParams?.errorText || 'unknown error');
+      const detail = [
+        eventParams?.canceled ? 'canceled' : '',
+        eventParams?.blockedReason ? `blocked: ${String(eventParams.blockedReason)}` : '',
+      ].filter(Boolean).join(', ');
+      markBodyUnavailable(entry, `request failed: ${errorText}${detail ? ` (${detail})` : ''}`);
     }
   });
 }

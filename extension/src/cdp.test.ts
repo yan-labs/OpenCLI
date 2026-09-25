@@ -696,3 +696,288 @@ describe('cdp command deadline', () => {
     await assertion;
   });
 });
+
+describe('cdp response body capture', () => {
+  beforeEach(() => {
+    vi.resetModules();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  type CommandHandler = (target: unknown, method: string, params?: any) => unknown;
+  type EventListener = (source: { tabId?: number }, method: string, params: any) => unknown;
+
+  function createBodyCaptureMock(opts: { onCommand?: CommandHandler; debuggerStillAttached?: boolean } = {}) {
+    const onEventListeners: EventListener[] = [];
+    const onDetachListeners: Array<(source: { tabId?: number }) => void> = [];
+    let probeHangs = false;
+    const debuggerApi = {
+      attach: vi.fn(async () => {}),
+      detach: vi.fn(async ({ tabId }: { tabId?: number }) => {
+        for (const fn of onDetachListeners) fn({ tabId });
+      }),
+      getTargets: vi.fn(async () => [{ tabId: 1, attached: opts.debuggerStillAttached ?? true }]),
+      sendCommand: vi.fn(async (target: unknown, method: string, params?: any) => {
+        if (method === 'Runtime.evaluate' && params?.expression === '1') {
+          // A busy renderer: the health-check probe queues behind long tasks.
+          if (probeHangs) return new Promise(() => {});
+          return { result: { value: 1 } };
+        }
+        const handled = await opts.onCommand?.(target, method, params);
+        return handled ?? {};
+      }),
+      onDetach: { addListener: vi.fn((fn: (s: { tabId?: number }) => void) => { onDetachListeners.push(fn); }) },
+      onEvent: { addListener: vi.fn((fn: EventListener) => { onEventListeners.push(fn); }) },
+    };
+    const tabs = {
+      get: vi.fn(async () => ({ id: 1, windowId: 1, url: 'https://www.semrush.com/analytics/overview/' })),
+      onRemoved: { addListener: vi.fn() },
+      onUpdated: { addListener: vi.fn() },
+    };
+    const fire = async (method: string, params: any) => {
+      for (const fn of onEventListeners) await fn({ tabId: 1 }, method, params);
+    };
+    const fireNoWait = (method: string, params: any) => {
+      for (const fn of onEventListeners) void fn({ tabId: 1 }, method, params);
+    };
+    const bodyFetchCount = () => debuggerApi.sendCommand.mock.calls
+      .filter((call) => call[1] === 'Network.getResponseBody').length;
+    return {
+      chrome: { tabs, debugger: debuggerApi, scripting: {}, runtime: { id: 'opencli-test' } },
+      debuggerApi,
+      fire,
+      fireNoWait,
+      bodyFetchCount,
+      hangProbe: () => { probeHangs = true; },
+    };
+  }
+
+  type Mock = ReturnType<typeof createBodyCaptureMock>;
+  const RPC_URL = 'https://www.semrush.com/dpa/rpc';
+
+  async function sendRequest(mock: Mock, requestId: string, stage: 'sent' | 'headers' | 'finished') {
+    await mock.fire('Network.requestWillBeSent', { requestId, request: { url: RPC_URL, method: 'POST' } });
+    if (stage === 'sent') return;
+    await mock.fire('Network.responseReceived', { requestId, response: { url: RPC_URL, status: 200, mimeType: 'application/json' } });
+    if (stage === 'headers') return;
+    await mock.fire('Network.loadingFinished', { requestId });
+  }
+
+  const bodyFor = (method: string, params: any) => (method === 'Network.getResponseBody'
+    ? { body: `body-${params.requestId}` }
+    : undefined);
+
+  it('fetches the body at Network.loadingFinished and serves reads from the cached copy', async () => {
+    const mock = createBodyCaptureMock({
+      onCommand: (_target, method, params) => {
+        if (method !== 'Network.getResponseBody') return undefined;
+        return params.requestId === 'r2' ? { body: 'AAEC', base64Encoded: true } : { body: '{"ok":true}' };
+      },
+    });
+    vi.stubGlobal('chrome', mock.chrome);
+    const mod = await import('./cdp');
+    mod.registerListeners();
+    await mod.startNetworkCapture(1, '/dpa/rpc');
+
+    await sendRequest(mock, 'r1', 'finished');
+    // Fetched the moment loading finished, before anyone read the capture.
+    expect(mock.debuggerApi.sendCommand).toHaveBeenCalledWith({ tabId: 1 }, 'Network.getResponseBody', { requestId: 'r1' });
+    await sendRequest(mock, 'r2', 'finished');
+    const fetchesBeforeRead = mock.bodyFetchCount();
+
+    const entries = await mod.readNetworkCapture(1);
+
+    // The read never goes back to Chrome, whose buffer may be gone by now.
+    expect(mock.bodyFetchCount()).toBe(fetchesBeforeRead);
+    expect(entries).toHaveLength(2);
+    expect(entries[0]).toMatchObject({
+      responseStatus: 200,
+      responsePreview: '{"ok":true}',
+      responseBodyFullSize: 11,
+      responseBodyTruncated: false,
+    });
+    expect(entries[0]).not.toHaveProperty('responseBodyUnavailable');
+    expect(entries[0]).not.toHaveProperty('responseBodyError');
+    expect(entries[1].responsePreview).toBe('base64:AAEC');
+  });
+
+  it('flags a failed body fetch explicitly instead of reporting an empty body', async () => {
+    const mock = createBodyCaptureMock({
+      onCommand: (_target, method) => {
+        if (method === 'Network.getResponseBody') throw new Error('No resource with given identifier found');
+        return undefined;
+      },
+    });
+    vi.stubGlobal('chrome', mock.chrome);
+    const mod = await import('./cdp');
+    mod.registerListeners();
+    await mod.startNetworkCapture(1, '/dpa/rpc');
+
+    await sendRequest(mock, 'r1', 'finished');
+    const [entry] = await mod.readNetworkCapture(1);
+
+    expect(entry.responseStatus).toBe(200);
+    expect(entry.responsePreview).toBeUndefined();
+    expect(entry.responseBodyUnavailable).toBe(true);
+    expect(entry.responseBodyError).toMatch(/Network\.getResponseBody failed: No resource with given identifier found/);
+  });
+
+  it('flags a request that failed to load', async () => {
+    const mock = createBodyCaptureMock({ onCommand: (_target, method, params) => bodyFor(method, params) });
+    vi.stubGlobal('chrome', mock.chrome);
+    const mod = await import('./cdp');
+    mod.registerListeners();
+    await mod.startNetworkCapture(1, '/dpa/rpc');
+
+    await sendRequest(mock, 'r1', 'sent');
+    await mock.fire('Network.loadingFailed', { requestId: 'r1', errorText: 'net::ERR_ABORTED', canceled: true });
+    const [entry] = await mod.readNetworkCapture(1);
+
+    expect(entry.responsePreview).toBeUndefined();
+    expect(entry.responseBodyUnavailable).toBe(true);
+    expect(entry.responseBodyError).toBe('request failed: net::ERR_ABORTED (canceled)');
+  });
+
+  it('waits for a body fetch still in flight when the capture is read', async () => {
+    let release: ((value: unknown) => void) | undefined;
+    const mock = createBodyCaptureMock({
+      onCommand: (_target, method) => (method === 'Network.getResponseBody'
+        ? new Promise((resolve) => { release = resolve; })
+        : undefined),
+    });
+    vi.stubGlobal('chrome', mock.chrome);
+    const mod = await import('./cdp');
+    mod.registerListeners();
+    await mod.startNetworkCapture(1, '/dpa/rpc');
+
+    await sendRequest(mock, 'r1', 'headers');
+    mock.fireNoWait('Network.loadingFinished', { requestId: 'r1' });
+    const reading = mod.readNetworkCapture(1);
+    expect(release).toBeTypeOf('function');
+    release!({ body: 'arrived-during-read' });
+    const [entry] = await reading;
+
+    expect(entry.responsePreview).toBe('arrived-during-read');
+    expect(entry).not.toHaveProperty('responseBodyUnavailable');
+  });
+
+  it('flags a body fetch that is still pending after the bounded read wait', async () => {
+    vi.useFakeTimers();
+    const mock = createBodyCaptureMock({
+      onCommand: (_target, method) => (method === 'Network.getResponseBody' ? new Promise(() => {}) : undefined),
+    });
+    vi.stubGlobal('chrome', mock.chrome);
+    const mod = await import('./cdp');
+    mod.registerListeners();
+    await mod.startNetworkCapture(1, '/dpa/rpc');
+
+    await sendRequest(mock, 'r1', 'headers');
+    mock.fireNoWait('Network.loadingFinished', { requestId: 'r1' });
+    const reading = mod.readNetworkCapture(1);
+    await vi.advanceTimersByTimeAsync(10_000);
+    const [entry] = await reading;
+
+    expect(entry.responsePreview).toBeUndefined();
+    expect(entry.responseBodyUnavailable).toBe(true);
+    expect(entry.responseBodyError).toMatch(/still pending/);
+  });
+
+  it('keeps the debugger session and every body when a health-check probe only times out on a busy page', async () => {
+    vi.useFakeTimers();
+    const mock = createBodyCaptureMock({
+      onCommand: (_target, method, params) => bodyFor(method, params),
+      debuggerStillAttached: true,
+    });
+    vi.stubGlobal('chrome', mock.chrome);
+    const mod = await import('./cdp');
+    mod.registerListeners();
+    await mod.startNetworkCapture(1, '/dpa/rpc');
+
+    await sendRequest(mock, 'r1', 'finished'); // body already cached
+    await sendRequest(mock, 'r2', 'headers');  // headers in, body not yet
+    const detachesBefore = mock.debuggerApi.detach.mock.calls.length;
+
+    mock.hangProbe();
+    const probing = mod.ensureAttached(1);
+    await vi.advanceTimersByTimeAsync(2_000);
+    await probing;
+
+    // No detach/re-attach: Chrome still holds r2's body for this session.
+    expect(mock.debuggerApi.getTargets).toHaveBeenCalled();
+    expect(mock.debuggerApi.detach.mock.calls.length).toBe(detachesBefore);
+    await mock.fire('Network.loadingFinished', { requestId: 'r2' });
+    const entries = await mod.readNetworkCapture(1);
+
+    expect(entries.map((e) => e.responsePreview)).toEqual(['body-r1', 'body-r2']);
+    expect(entries.some((e) => e.responseBodyUnavailable)).toBe(false);
+  });
+
+  it('after a real re-attach keeps cached bodies and flags the ones Chrome can no longer return', async () => {
+    vi.useFakeTimers();
+    const mock = createBodyCaptureMock({
+      onCommand: (_target, method, params) => bodyFor(method, params),
+      debuggerStillAttached: false,
+    });
+    vi.stubGlobal('chrome', mock.chrome);
+    const mod = await import('./cdp');
+    mod.registerListeners();
+    await mod.startNetworkCapture(1, '/dpa/rpc');
+
+    await sendRequest(mock, 'r1', 'finished'); // cached before the re-attach
+    await sendRequest(mock, 'r2', 'headers');  // completed headers, body never fetched
+    await sendRequest(mock, 'r3', 'sent');     // still in flight
+    const detachesBefore = mock.debuggerApi.detach.mock.calls.length;
+
+    mock.hangProbe();
+    const probing = mod.ensureAttached(1);
+    await vi.advanceTimersByTimeAsync(2_000);
+    await probing;
+
+    expect(mock.debuggerApi.detach.mock.calls.length).toBeGreaterThan(detachesBefore);
+    expect(mod.hasActiveNetworkCapture(1)).toBe(true);
+    const entries = await mod.readNetworkCapture(1);
+
+    expect(entries).toHaveLength(3);
+    expect(entries[0].responsePreview).toBe('body-r1');
+    expect(entries[0]).not.toHaveProperty('responseBodyUnavailable');
+
+    expect(entries[1].responseStatus).toBe(200);
+    expect(entries[1].responsePreview).toBeUndefined();
+    expect(entries[1].responseBodyUnavailable).toBe(true);
+    expect(entries[1].responseBodyError).toMatch(/re-attached before this response body was fetched/);
+
+    expect(entries[2].responsePreview).toBeUndefined();
+    expect(entries[2].responseBodyUnavailable).toBe(true);
+    expect(entries[2].responseBodyError).toMatch(/in flight/);
+  });
+
+  it('stops storing bodies past the per-tab budget and flags the overflow', async () => {
+    // Exactly the per-entry cap (not truncated); 8 of them fill the 64 MiB budget.
+    const big = 'x'.repeat(8 * 1024 * 1024);
+    const mock = createBodyCaptureMock({
+      onCommand: (_target, method) => (method === 'Network.getResponseBody' ? { body: big } : undefined),
+    });
+    vi.stubGlobal('chrome', mock.chrome);
+    const mod = await import('./cdp');
+    mod.registerListeners();
+    await mod.startNetworkCapture(1, '/dpa/rpc');
+
+    for (let i = 0; i < 9; i++) await sendRequest(mock, `r${i}`, 'finished');
+    const entries = await mod.readNetworkCapture(1);
+
+    expect(entries).toHaveLength(9);
+    expect(entries.slice(0, 8).every((e) => e.responsePreview === big && !e.responseBodyUnavailable)).toBe(true);
+    expect(entries[8].responsePreview).toBeUndefined();
+    expect(entries[8].responseBodyUnavailable).toBe(true);
+    expect(entries[8].responseBodyFullSize).toBe(big.length);
+    expect(entries[8].responseBodyError).toMatch(/budget exceeded/);
+
+    // Draining the capture frees the budget.
+    await sendRequest(mock, 'r9', 'finished');
+    const [next] = await mod.readNetworkCapture(1);
+    expect(next.responsePreview === big).toBe(true);
+  });
+});

@@ -16,9 +16,32 @@ const tabIframeTargets = /* @__PURE__ */ new Map();
 const tabAttachedEventCounts = /* @__PURE__ */ new Map();
 const CDP_RESPONSE_BODY_CAPTURE_LIMIT = 8 * 1024 * 1024;
 const CDP_REQUEST_BODY_CAPTURE_LIMIT = 1 * 1024 * 1024;
+const CDP_RESPONSE_BODY_TOTAL_BUDGET = 64 * 1024 * 1024;
+const CDP_BODY_FETCH_TIMEOUT_MS = 15e3;
+const CDP_READ_PENDING_BODY_WAIT_MS = 1e4;
+const CDP_TARGET_QUERY_TIMEOUT_MS = 1e3;
+function createNetworkCaptureState(patterns) {
+  return {
+    patterns,
+    entries: [],
+    requestToIndex: /* @__PURE__ */ new Map(),
+    bodyFetchesInFlight: /* @__PURE__ */ new Map(),
+    storedBodyChars: 0,
+    generation: 0
+  };
+}
 const networkCaptures = /* @__PURE__ */ new Map();
 const CDP_COMMAND_TIMEOUT_MS = 6e4;
 const CDP_PROBE_TIMEOUT_MS = 2e3;
+class CdpCommandTimeoutError extends Error {
+  method;
+  timeoutMs;
+  constructor(method, timeoutMs) {
+    super(`CDP command ${method} timed out after ${Math.round(timeoutMs / 1e3)}s — the page may be blocked by a native dialog (alert/confirm/print)`);
+    this.method = method;
+    this.timeoutMs = timeoutMs;
+  }
+}
 async function sendDebuggerCommand(target, method, params, timeoutMs = CDP_COMMAND_TIMEOUT_MS) {
   let timer;
   const commandPromise = params === void 0 ? chrome.debugger.sendCommand(target, method) : chrome.debugger.sendCommand(target, method, params);
@@ -28,9 +51,7 @@ async function sendDebuggerCommand(target, method, params, timeoutMs = CDP_COMMA
     return await Promise.race([
       commandPromise,
       new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error(
-          `CDP command ${method} timed out after ${Math.round(timeoutMs / 1e3)}s — the page may be blocked by a native dialog (alert/confirm/print)`
-        )), timeoutMs);
+        timer = setTimeout(() => reject(new CdpCommandTimeoutError(method, timeoutMs)), timeoutMs);
       })
     ]);
   } finally {
@@ -60,7 +81,11 @@ async function ensureAttached(tabId, aggressiveRetry = false) {
         returnByValue: true
       }, CDP_PROBE_TIMEOUT_MS);
       return;
-    } catch {
+    } catch (err) {
+      if (err instanceof CdpCommandTimeoutError && await isDebuggerAttachedToTab(tabId)) {
+        console.warn(`[opencli] health-check probe for tab ${tabId} timed out after ${CDP_PROBE_TIMEOUT_MS}ms but the debugger is still attached — page busy, keeping the session`);
+        return;
+      }
       attached.delete(tabId);
     }
   }
@@ -115,6 +140,7 @@ async function ensureAttached(tabId, aggressiveRetry = false) {
   if (preservedNetworkCapture) {
     try {
       await sendDebuggerCommand({ tabId }, "Network.enable");
+      markBodiesLostToReattach(preservedNetworkCapture);
       networkCaptures.set(tabId, preservedNetworkCapture);
     } catch {
     }
@@ -722,21 +748,109 @@ function getOrCreateNetworkCaptureEntry(tabId, requestId, fallback) {
   state.requestToIndex.set(requestId, state.entries.length - 1);
   return entry;
 }
+async function isDebuggerAttachedToTab(tabId) {
+  const api = chrome.debugger;
+  if (typeof api.getTargets !== "function") return false;
+  let timer;
+  try {
+    const targets = await Promise.race([
+      api.getTargets(),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(null), CDP_TARGET_QUERY_TIMEOUT_MS);
+      })
+    ]);
+    if (!Array.isArray(targets)) return false;
+    return targets.some((target) => target.tabId === tabId && target.attached === true);
+  } catch {
+    return false;
+  } finally {
+    if (timer !== void 0) clearTimeout(timer);
+  }
+}
+function markBodyUnavailable(entry, reason) {
+  if (entry.responsePreview !== void 0) return;
+  entry.responseBodyUnavailable = true;
+  entry.responseBodyError = reason;
+}
+const REATTACH_BODY_LOST_REASON = "debugger re-attached before this response body was fetched; Chrome discards the previous debugger session's response buffers, so Network.getResponseBody can no longer return it";
+const REATTACH_IN_FLIGHT_LOST_REASON = "debugger re-attached while this request was in flight; its completion and body are not observable from the new debugger session";
+function markBodiesLostToReattach(state) {
+  for (const entry of state.entries) {
+    if (entry.responsePreview !== void 0 || entry.responseBodyUnavailable) continue;
+    if (state.bodyFetchesInFlight.has(entry)) continue;
+    markBodyUnavailable(entry, entry.responseStatus === void 0 ? REATTACH_IN_FLIGHT_LOST_REASON : REATTACH_BODY_LOST_REASON);
+  }
+}
+function captureResponseBody(tabId, state, requestId, entry) {
+  const existing = state.bodyFetchesInFlight.get(entry);
+  if (existing) return existing;
+  const generation = state.generation;
+  let fetchPromise;
+  fetchPromise = (async () => {
+    try {
+      const result = await sendDebuggerCommand(
+        { tabId },
+        "Network.getResponseBody",
+        { requestId },
+        CDP_BODY_FETCH_TIMEOUT_MS
+      );
+      if (typeof result?.body !== "string") {
+        markBodyUnavailable(entry, "Network.getResponseBody returned no body");
+        return;
+      }
+      const fullSize = result.body.length;
+      const truncated = fullSize > CDP_RESPONSE_BODY_CAPTURE_LIMIT;
+      const stored = truncated ? result.body.slice(0, CDP_RESPONSE_BODY_CAPTURE_LIMIT) : result.body;
+      const counted = generation === state.generation;
+      if (counted && state.storedBodyChars + stored.length > CDP_RESPONSE_BODY_TOTAL_BUDGET) {
+        entry.responseBodyFullSize = fullSize;
+        markBodyUnavailable(entry, `capture body budget exceeded: undrained bodies on this tab already hold ${state.storedBodyChars} chars (budget ${CDP_RESPONSE_BODY_TOTAL_BUDGET}); read the capture more often`);
+        return;
+      }
+      entry.responsePreview = result.base64Encoded ? `base64:${stored}` : stored;
+      entry.responseBodyFullSize = fullSize;
+      entry.responseBodyTruncated = truncated;
+      delete entry.responseBodyUnavailable;
+      delete entry.responseBodyError;
+      if (counted) state.storedBodyChars += stored.length;
+    } catch (err) {
+      markBodyUnavailable(entry, `Network.getResponseBody failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      if (state.bodyFetchesInFlight.get(entry) === fetchPromise) state.bodyFetchesInFlight.delete(entry);
+    }
+  })();
+  state.bodyFetchesInFlight.set(entry, fetchPromise);
+  return fetchPromise;
+}
 async function startNetworkCapture(tabId, pattern) {
   await ensureAttached(tabId);
   await sendDebuggerCommand({ tabId }, "Network.enable");
-  networkCaptures.set(tabId, {
-    patterns: normalizeCapturePatterns(pattern),
-    entries: [],
-    requestToIndex: /* @__PURE__ */ new Map()
-  });
+  networkCaptures.set(tabId, createNetworkCaptureState(normalizeCapturePatterns(pattern)));
 }
 async function readNetworkCapture(tabId) {
-  const state = networkCaptures.get(tabId);
+  let state = networkCaptures.get(tabId);
   if (!state) return [];
-  const entries = state.entries.slice();
+  if (state.bodyFetchesInFlight.size > 0) {
+    let timer;
+    await Promise.race([
+      Promise.all([...state.bodyFetchesInFlight.values()]),
+      new Promise((resolve) => {
+        timer = setTimeout(resolve, CDP_READ_PENDING_BODY_WAIT_MS);
+      })
+    ]);
+    if (timer !== void 0) clearTimeout(timer);
+    state = networkCaptures.get(tabId);
+    if (!state) return [];
+  }
+  for (const entry of state.bodyFetchesInFlight.keys()) {
+    markBodyUnavailable(entry, `response body fetch still pending after waiting ${CDP_READ_PENDING_BODY_WAIT_MS}ms when the capture was read`);
+  }
+  const entries = state.entries.map((entry) => ({ ...entry }));
   state.entries = [];
   state.requestToIndex.clear();
+  state.bodyFetchesInFlight.clear();
+  state.storedBodyChars = 0;
+  state.generation += 1;
   return entries;
 }
 function hasActiveNetworkCapture(tabId) {
@@ -881,18 +995,21 @@ function registerListeners() {
       if (stateEntryIndex === void 0) return;
       const entry = state.entries[stateEntryIndex];
       if (!entry) return;
-      try {
-        const body = await sendDebuggerCommand({ tabId }, "Network.getResponseBody", { requestId });
-        if (typeof body?.body === "string") {
-          const fullSize = body.body.length;
-          const truncated = fullSize > CDP_RESPONSE_BODY_CAPTURE_LIMIT;
-          const stored = truncated ? body.body.slice(0, CDP_RESPONSE_BODY_CAPTURE_LIMIT) : body.body;
-          entry.responsePreview = body.base64Encoded ? `base64:${stored}` : stored;
-          entry.responseBodyFullSize = fullSize;
-          entry.responseBodyTruncated = truncated;
-        }
-      } catch {
-      }
+      await captureResponseBody(tabId, state, requestId, entry);
+      return;
+    }
+    if (method === "Network.loadingFailed") {
+      const requestId = String(eventParams?.requestId || "");
+      const stateEntryIndex = state.requestToIndex.get(requestId);
+      if (stateEntryIndex === void 0) return;
+      const entry = state.entries[stateEntryIndex];
+      if (!entry) return;
+      const errorText = String(eventParams?.errorText || "unknown error");
+      const detail = [
+        eventParams?.canceled ? "canceled" : "",
+        eventParams?.blockedReason ? `blocked: ${String(eventParams.blockedReason)}` : ""
+      ].filter(Boolean).join(", ");
+      markBodyUnavailable(entry, `request failed: ${errorText}${detail ? ` (${detail})` : ""}`);
     }
   });
 }
