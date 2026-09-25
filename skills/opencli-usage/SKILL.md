@@ -6,20 +6,19 @@ allowed-tools: Bash(opencli:*), Read
 
 # opencli-usage
 
-OpenCLI turns any website, Electron desktop app, or external CLI into a uniform `opencli <site> <command>` surface that agents can drive without screen-scraping. This skill is the orientation layer — once you know what you want to do, load one of the specialized skills below.
+OpenCLI turns websites and Electron desktop apps into a uniform `opencli <site> <command>` surface that agents can drive without screen-scraping. This skill is the orientation layer — once you know what you want to do, load one of the specialized skills below.
 
-## The three pillars
+## Main capabilities
 
 - **Adapter commands** — `opencli <site> <command> [...]`. Built-in adapters live in `clis/`, user adapters in `~/.opencli/clis/`. Each is backed by a strategy (`PUBLIC | COOKIE | INTERCEPT | UI | LOCAL`) that tells you whether a Chrome session is needed.
 - **Browser driving** — `opencli browser <session> <command>` for ad-hoc interaction when no adapter covers the task. Full subcommand list: `analyze`, `back`, `batch`, `bind`, `check`, `click`, `close`, `console`, `dblclick`, `dialog`, `drag`, `eval`, `extract`, `fill`, `find`, `focus`, `frames`, `get`, `hover`, `init`, `keys`, `network`, `open`, `screenshot`, `scroll`, `select`, `state`, `tab`, `type`, `unbind`, `uncheck`, `upload`, `verify`, `wait`. See `opencli-browser`.
 - **Current-tab binding** — `opencli browser <session> bind` attaches the Chrome tab the user already opened/logged into to that browser session. Follow-up commands use `opencli browser <session> ...`. See `opencli-browser` before using it; bound sessions still block tab mutation.
-- **External CLI passthrough** — `opencli gh`, `opencli docker`, `opencli vercel`, etc. Managed via `opencli external install <name>` (auto-install from `external-clis.yaml`) or `opencli external register <name>` (bring your own).
 
 ## Install
 
 ```bash
 # npm global
-npm install -g @jackwener/opencli          # binary: opencli, requires Node >= 21
+npm install -g @jackwener/opencli          # binary: opencli, requires Node >= 20.18.1
 opencli doctor                              # run before browser-dependent work (see below)
 
 # From source
@@ -28,7 +27,7 @@ cd OpenCLI && npm install
 npx tsx src/main.ts <command>               # same surface, no global install
 ```
 
-`opencli doctor` prints a structured `DoctorReport` — daemon status, extension connection, version checks, and a live browser connectivity probe. Scope is narrow: it diagnoses the **browser bridge** (daemon + extension + Chrome wiring). `PUBLIC` / `LOCAL` adapters, `opencli list`, `validate`, `verify`, plugin commands, and external-CLI passthrough don't need it to be green — only `COOKIE` / `INTERCEPT` / `UI` adapters and the `opencli browser *` subcommands do. Flag: `-v` (verbose).
+`opencli doctor` prints a structured `DoctorReport` — daemon status, extension connection, version checks, and a live browser connectivity probe. Scope is narrow: it diagnoses the **browser bridge** (daemon + extension + Chrome wiring). `PUBLIC` / `LOCAL` adapters, `opencli list`, `validate`, `verify`, and plugin commands don't need it to be green — only `COOKIE` / `INTERCEPT` / `UI` adapters and the `opencli browser *` subcommands do. Flag: `-v` (verbose).
 
 ## Prerequisites by command type
 
@@ -241,25 +240,6 @@ opencli plugin update [name] | --all       # keep current
 opencli plugin uninstall <name>
 opencli plugin create <name>               # scaffold a new plugin
 ```
-
-## External CLI passthrough
-
-Wraps external command-line tools so you can discover + invoke them through the same `opencli …` entrypoint:
-
-```bash
-opencli external install gh    # auto-install via brew/apt/npm per external-clis.yaml
-opencli external register my-tool \
-    --binary my-tool \
-    --install "npm i -g my-tool" \
-    --desc "My internal CLI"
-opencli external list
-opencli gh pr list --limit 5   # passthrough; stdio is inherited, exit code propagated
-opencli docker ps
-```
-
-Built-in entries live in `src/external-clis.yaml`; user overrides and additions in `~/.opencli/external-clis.yaml`. Commonly shipped: `gh`, `docker`, `vercel`, `wrangler`, `lark-cli`, `longbridge`, `dws`, `wecom-cli(企业微信)`, `obsidian`, `ntn(notion)`, `tg(tg-cli)`, `discord(discord-cli)`, `wx(wx-cli)`.
-
-Some official CLIs use shell-script installers instead of a shell-free package-manager command. Entries without an `install` config, such as `ntn`, must be installed manually from their homepage before passthrough use.
 
 ## Shell completion
 

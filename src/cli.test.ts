@@ -63,7 +63,7 @@ vi.mock('node:child_process', async () => {
   };
 });
 
-import { createProgram, findPackageRoot, normalizeVerifyRows, renderVerifyPreview, resolveBrowserVerifyInvocation, resolveSitemapAvailabilityForUrl, selectFreshByTimestamp } from './cli.js';
+import { createProgram, findPackageRoot, normalizeVerifyRows, renderVerifyPreview, resolveBrowserVerifyInvocation, selectFreshByTimestamp } from './cli.js';
 
 describe('createProgram root help descriptions', () => {
   function descriptionFor(program: ReturnType<typeof createProgram>, name: string): string | undefined {
@@ -82,7 +82,7 @@ describe('createProgram root help descriptions', () => {
     expect(descriptionFor(program, 'adapter')).toBe('eject, reset, status');
     expect(descriptionFor(program, 'profile')).toBe('list, rename, use');
     expect(descriptionFor(program, 'daemon')).toBe('logs, restart, status, stop');
-    expect(descriptionFor(program, 'external')).toBe('install, list, register');
+    expect(descriptionFor(program, 'external')).toBeUndefined();
   });
 
   it('renders auth namespace structured help', () => {
@@ -194,7 +194,7 @@ describe('createProgram root help descriptions', () => {
       expect(help).toContain('Site adapters (1):');
       expect(help).toMatch(/Site adapters \(1\):\n {2}bilibili/);
 
-      // App adapters appear before Site adapters (External CLIs are absent here)
+      // App adapters appear before Site adapters.
       expect(help.indexOf('App adapters')).toBeLessThan(help.indexOf('Site adapters'));
     } finally {
       registry.clear();
@@ -254,7 +254,7 @@ describe('createProgram root help descriptions', () => {
       expect(output).toMatch(/App adapters[\s\S]*antigravity[\s\S]*history \[ui\] — Read Antigravity history/);
       expect(output).toMatch(/App adapters[\s\S]*chatwise[\s\S]*ask \[ui\] — Ask Chatwise desktop app/);
       expect(output).toMatch(/Site adapters[\s\S]*bilibili[\s\S]*hot \[public\] — Bilibili hot videos/);
-      expect(output).toContain('3 built-in commands across 2 apps + 1 sites,');
+      expect(output).toContain('3 built-in commands across 2 apps + 1 sites');
     } finally {
       restoreStdoutSpy();
       stdoutSpy.mockClear();
@@ -286,7 +286,7 @@ describe('createProgram root help descriptions', () => {
       const tableOutput = stdoutSpy.mock.calls.flat().join('\n');
       expect(tableOutput).not.toContain('App adapters');
       expect(tableOutput).toContain('Site adapters');
-      expect(tableOutput).toContain('1 built-in commands across 0 apps + 1 sites,');
+      expect(tableOutput).toContain('1 built-in commands across 0 apps + 1 sites');
 
       stdoutSpy.mockClear();
       const jsonProgram = createProgram('', '');
@@ -311,7 +311,7 @@ describe('createProgram root help descriptions', () => {
     }
   });
 
-  it('exposes external_clis / app_adapters / site_adapters in structured help', () => {
+  it('exposes app_adapters / site_adapters in structured help', () => {
     const registry = getRegistry();
     const snapshot = new Map(registry);
     const argv = process.argv;
@@ -344,9 +344,7 @@ describe('createProgram root help descriptions', () => {
       expect(data.app_adapters.apps).toEqual(['chatwise']);
       expect(data.site_adapters.count).toBe(1);
       expect(data.site_adapters.sites).toEqual(['bilibili']);
-      expect(data.external_clis.count).toBeGreaterThanOrEqual(0);
-      expect(Array.isArray(data.external_clis.clis)).toBe(true);
-      expect(Array.isArray(data.external_clis.display)).toBe(true);
+      expect(data).not.toHaveProperty('external_clis');
       // Adapters must NOT leak into the core commands list
       const commandNames = data.commands.map((cmd: any) => cmd.name);
       expect(commandNames).not.toContain('bilibili');
@@ -857,74 +855,6 @@ describe('selectFreshByTimestamp', () => {
     ], first.lastSeenTs);
     expect(rolled.fresh.map((item) => item.text)).toEqual(['c']);
     expect(rolled.lastSeenTs).toBe(3);
-  });
-});
-
-describe('resolveSitemapAvailabilityForUrl', () => {
-  function registryFor(site: string, domain: string): Map<string, any> {
-    return new Map([[`${site}:read`, {
-      site,
-      name: 'read',
-      access: 'read',
-      description: 'read',
-      domain,
-      browser: false,
-      args: [],
-    }]]);
-  }
-
-  it('detects local sitemap overlays using adapter registry domain matches', () => {
-    const homeDir = path.join(os.tmpdir(), 'opencli-sitemap-home');
-    const packageRoot = path.join(os.tmpdir(), 'opencli-sitemap-package');
-    const localSitemap = path.join(homeDir, '.opencli', 'sites', 'hackernews', 'sitemap');
-    const exists = new Set([localSitemap]);
-
-    const report = resolveSitemapAvailabilityForUrl('https://news.ycombinator.com/item?id=1', {
-      homeDir,
-      packageRoot,
-      registry: registryFor('hackernews', 'news.ycombinator.com'),
-      fileExists: (candidate) => exists.has(candidate),
-    });
-
-    expect(report).toMatchObject({
-      site: 'hackernews',
-      available: true,
-      source: 'local',
-      paths: { local: localSitemap },
-    });
-    expect(report?.hint).toContain('opencli-browser-sitemap');
-  });
-
-  it('reports global+local when both sitemap layers exist', () => {
-    const homeDir = path.join(os.tmpdir(), 'opencli-sitemap-home');
-    const packageRoot = path.join(os.tmpdir(), 'opencli-sitemap-package');
-    const localSitemap = path.join(homeDir, '.opencli', 'sites', 'twitter', 'sitemap.md');
-    const globalSitemap = path.join(packageRoot, 'sitemaps', 'twitter');
-    const exists = new Set([localSitemap, globalSitemap]);
-
-    const report = resolveSitemapAvailabilityForUrl('https://x.com/opencli', {
-      homeDir,
-      packageRoot,
-      registry: registryFor('twitter', 'x.com'),
-      fileExists: (candidate) => exists.has(candidate),
-    });
-
-    expect(report).toMatchObject({
-      site: 'twitter',
-      source: 'local+global',
-      paths: { local: localSitemap, global: globalSitemap },
-    });
-  });
-
-  it('returns null when no sitemap layer exists', () => {
-    const report = resolveSitemapAvailabilityForUrl('https://example.com/', {
-      homeDir: path.join(os.tmpdir(), 'opencli-sitemap-home'),
-      packageRoot: path.join(os.tmpdir(), 'opencli-sitemap-package'),
-      registry: new Map(),
-      fileExists: () => false,
-    });
-
-    expect(report).toBeNull();
   });
 });
 
@@ -2460,6 +2390,112 @@ describe('browser network command', () => {
     expect(out.entries[0].key).toBe('POST hw.mail.163.com/js6/s');
     expect(out.entries[0].ct).toBe('text/javascript');
     expect(out.entries[0].shape['$.messages']).toBe('array(1)');
+  });
+
+  it('treats React Server Component responses as API-like traffic', async () => {
+    browserState.page!.readNetworkCapture = vi.fn().mockResolvedValue([
+      {
+        url: 'https://www.linkedin.com/flagship-web/rsc-action/actions/pagination',
+        method: 'POST',
+        responseStatus: 200,
+        responseContentType: 'text/x-component',
+        responsePreview: '1:{"posts":[{"id":"p1"}]}',
+      },
+      {
+        url: 'https://www.linkedin.com/flagship-web/rsc-action/actions/detail',
+        method: 'POST',
+        responseStatus: 200,
+        responseContentType: 'text/html',
+        responsePreview: '<rsc-stream>',
+      },
+    ]);
+    const program = createProgram('', '');
+
+    await program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'network']);
+
+    const out = lastJsonLog();
+    expect(out.count).toBe(2);
+    expect(out.filtered_out).toBe(0);
+    expect(out.entries.map((entry: any) => entry.key)).toEqual([
+      'POST www.linkedin.com/flagship-web/rsc-action/actions/pagination',
+      'POST www.linkedin.com/flagship-web/rsc-action/actions/detail',
+    ]);
+  });
+
+  it('caches the raw drained batch before display filtering so a later --all can recover it', async () => {
+    browserState.page!.readNetworkCapture = vi.fn()
+      .mockResolvedValueOnce([
+        {
+          url: 'https://example.com/page-fragment',
+          method: 'GET',
+          responseStatus: 200,
+          responseContentType: 'text/html',
+          responsePreview: '<main>hidden from default output</main>',
+        },
+      ])
+      .mockResolvedValueOnce([]);
+    const program = createProgram('', '');
+
+    await program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'network']);
+    expect(lastJsonLog()).toMatchObject({ count: 0, filtered_out: 1 });
+
+    consoleLogSpy.mockClear();
+    await program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'network', '--all']);
+
+    const out = lastJsonLog();
+    expect(out.count).toBe(1);
+    expect(out.cache_reused).toBe(true);
+    expect(out.entries[0].key).toBe('GET example.com/page-fragment');
+  });
+
+  it('--detail exposes sanitized request context without credential values', async () => {
+    browserState.page!.readNetworkCapture = vi.fn().mockResolvedValue([
+      {
+        url: 'https://www.linkedin.com/flagship-web/rsc-action/actions/pagination?csrf_token=url-secret',
+        method: 'POST',
+        requestHeaders: {
+          'Content-Type': 'application/json',
+          Cookie: 'li_at=cookie-secret',
+          'X-CSRF-Token': 'header-secret',
+          'X-Trace-Id': 'trace-1',
+        },
+        requestBodyKind: 'string',
+        requestBodyPreview: JSON.stringify({ variables: { cursor: 'next', accessToken: 'body-secret' } }),
+        requestBodyFullSize: 123,
+        requestBodyTruncated: false,
+        responseStatus: 200,
+        responseContentType: 'text/x-component',
+        responsePreview: '1:{"posts":[]}',
+      },
+    ]);
+    const program = createProgram('', '');
+
+    await program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'network']);
+    consoleLogSpy.mockClear();
+    await program.parseAsync([
+      'node', 'opencli', 'browser', '--session', 'test', 'network',
+      '--detail', 'POST www.linkedin.com/flagship-web/rsc-action/actions/pagination',
+    ]);
+
+    const out = lastJsonLog();
+    expect(out.url).toContain('csrf_token=%3Credacted%3E');
+    expect(out.request).toMatchObject({
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: '<redacted>',
+        'X-CSRF-Token': '<redacted>',
+        'X-Trace-Id': 'trace-1',
+      },
+      body_kind: 'json',
+      body: { variables: { cursor: 'next', accessToken: '<redacted>' } },
+      body_full_size: 123,
+      redacted: true,
+    });
+    expect(out.request.body_shape['$.variables.accessToken']).toBe('string');
+    expect(JSON.stringify(out)).not.toContain('url-secret');
+    expect(JSON.stringify(out)).not.toContain('cookie-secret');
+    expect(JSON.stringify(out)).not.toContain('header-secret');
+    expect(JSON.stringify(out)).not.toContain('body-secret');
   });
 
   it('--raw emits full bodies inline for every entry', async () => {
