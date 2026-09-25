@@ -32,6 +32,7 @@ import { parseFilter, shapeMatchesFilter } from './browser/shape-filter.js';
 import { buildHtmlTreeJs, type HtmlTreeResult } from './browser/html-tree.js';
 import { buildExtractHtmlJs, runExtractFromHtml } from './browser/extract.js';
 import { analyzeSite, type PageSignals } from './browser/analyze.js';
+import { runAuto } from './browser/auto/index.js';
 import { registerAuthCommands } from './commands/auth.js';
 import { daemonRestart, daemonStatus, daemonStop } from './commands/daemon.js';
 import { log } from './logger.js';
@@ -2320,6 +2321,92 @@ still usable even when navigation is reported as timed out.
     .action(browserAction(async (page, key) => {
       await page.pressKey(key);
       console.log(`Pressed: ${key}`);
+    }));
+
+  // ── Model-driven (JEV action selection) ──
+  //
+  // Logic lives entirely in src/browser/auto/*.ts (candidates.ts, safety.ts,
+  // field-mapping.ts, run.ts, ...) — this block is intentionally just wiring
+  // so it merges cleanly. See yan-skills/opencli/references/model-driven.md.
+  addBrowserTabOption(browser.command('auto'))
+    .option('--goal <text>', 'Natural-language goal for JEV to pursue, one action per step')
+    .option('--data <file>', 'JSON file of values JEV may map onto form fields (object of key/value pairs)')
+    .option('--max-steps <n>', 'Stop after this many JEV-chosen actions', '20')
+    .option('--min-confidence <n>', 'Stop and hand back to a human below this JEV confidence (0-1)', '0.55')
+    .option('--allow-submit', 'Allow clicking submit/pay/send/delete/confirm-looking buttons', false)
+    .option('--confirm-terms', 'Allow checking terms/consent/privacy-policy checkboxes (blocked by default)', false)
+    .option('--dry-run', 'Preview the single next JEV choice without executing it', false)
+    .option('--json', 'Also print the full structured result as JSON', false)
+    .description('Let JEV (TypeSafe System One) pick actions step by step toward --goal — no agent needed per step')
+    .action(browserAction(async (page, opts) => {
+      const goal = typeof opts.goal === 'string' ? opts.goal.trim() : '';
+      if (!goal) {
+        console.log(JSON.stringify({ error: { code: 'usage_error', message: '--goal is required.' } }, null, 2));
+        process.exitCode = EXIT_CODES.USAGE_ERROR;
+        return;
+      }
+      const maxSteps = Number.parseInt(opts.maxSteps, 10);
+      if (!Number.isFinite(maxSteps) || maxSteps < 1 || maxSteps > 200) {
+        console.log(JSON.stringify({ error: { code: 'usage_error', message: '--max-steps must be an integer between 1 and 200.' } }, null, 2));
+        process.exitCode = EXIT_CODES.USAGE_ERROR;
+        return;
+      }
+      const minConfidence = Number.parseFloat(opts.minConfidence);
+      if (!Number.isFinite(minConfidence) || minConfidence < 0 || minConfidence > 1) {
+        console.log(JSON.stringify({ error: { code: 'usage_error', message: '--min-confidence must be a number between 0 and 1.' } }, null, 2));
+        process.exitCode = EXIT_CODES.USAGE_ERROR;
+        return;
+      }
+      let data: Record<string, unknown> | undefined;
+      if (typeof opts.data === 'string' && opts.data.trim()) {
+        try {
+          const raw = fs.readFileSync(opts.data, 'utf8');
+          const parsed: unknown = JSON.parse(raw);
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            throw new Error('--data must contain a JSON object of key/value pairs.');
+          }
+          data = parsed as Record<string, unknown>;
+        } catch (err) {
+          console.log(JSON.stringify({ error: { code: 'invalid_data_file', message: getErrorMessage(err) } }, null, 2));
+          process.exitCode = EXIT_CODES.USAGE_ERROR;
+          return;
+        }
+      }
+
+      const result = await runAuto(page, {
+        goal,
+        data,
+        maxSteps,
+        minConfidence,
+        allowSubmit: opts.allowSubmit === true,
+        confirmTerms: opts.confirmTerms === true,
+        dryRun: opts.dryRun === true,
+      });
+
+      console.log(`[auto] ${result.status} (${result.stopReason}): ${result.message}`);
+      console.log(`[auto] steps=${result.steps.length} jev_calls=${result.jevCalls} jev_input_tokens=${result.jevTotalInputTokens} jev_ms=${result.jevTotalMs} duration_ms=${result.durationMs}`);
+      console.log(`[auto] final_url=${result.finalUrl}`);
+      if (result.filledFields.length > 0) {
+        console.log(`[auto] filled: ${result.filledFields.map((f) => `${f.label}<-${f.dataKey}`).join(', ')}`);
+      }
+      if (result.skippedFields.length > 0) {
+        console.log(`[auto] skipped: ${result.skippedFields.map((f) => `${f.label}(${f.reason})`).join(', ')}`);
+      }
+      if (result.termsCheckboxesBlocked.length > 0) {
+        console.log(`[auto] terms checkboxes blocked (pass --confirm-terms to allow): ${result.termsCheckboxesBlocked.map((f) => f.label).join(', ')}`);
+      }
+      if (result.outcomeCheck) {
+        console.log(`[auto] submit outcome: ${result.outcomeCheck.state} (positive=[${result.outcomeCheck.positive.join(',')}] negative=[${result.outcomeCheck.negative.join(',')}]${result.outcomeCheck.jevAssist ? ` jev_assist=${result.outcomeCheck.jevAssist.likelySuccess.toFixed(2)}` : ''})`);
+      }
+      if (opts.json === true) {
+        console.log(JSON.stringify(result, null, 2));
+      }
+
+      process.exitCode = result.status === 'completed'
+        ? EXIT_CODES.SUCCESS
+        : result.status === 'error'
+          ? EXIT_CODES.GENERIC_ERROR
+          : EXIT_CODES.TEMPFAIL;
     }));
 
   const browserDialog = browser
