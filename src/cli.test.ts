@@ -1106,6 +1106,12 @@ describe('browser tab targeting commands', () => {
   beforeEach(() => {
     process.exitCode = undefined;
     process.env.OPENCLI_CACHE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'opencli-browser-tab-state-'));
+    // Isolate browser-profiles.json (read via OPENCLI_CONFIG_DIR, see
+    // src/browser/profile.ts) from the real ~/.opencli. Without this, a
+    // machine with a saved default profile leaks its real defaultContextId
+    // into mockBrowserConnect calls as `preferredContextId`, breaking every
+    // exact-match assertion below.
+    process.env.OPENCLI_CONFIG_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'opencli-browser-tab-profile-'));
     consoleLogSpy.mockClear();
     stderrSpy.mockClear();
     mockBrowserConnect.mockClear();
@@ -1157,6 +1163,10 @@ describe('browser tab targeting commands', () => {
       }),
       session: 'test',
     } as unknown as IPage;
+  });
+
+  afterEach(() => {
+    delete process.env.OPENCLI_CONFIG_DIR;
   });
 
   function lastJsonLog(): any {
@@ -1219,10 +1229,9 @@ describe('browser tab targeting commands', () => {
   });
 
   it('OPENCLI_WINDOW overrides the dedicated default but loses to an explicit --window flag', async () => {
-    // Uses objectContaining rather than an exact match: this describe block has
-    // a pre-existing (unrelated) preferredContextId mock mismatch that already
-    // fails several exact-match assertions here — this test only cares about
-    // windowMode precedence, so it shouldn't ride along with that failure.
+    // Uses objectContaining rather than an exact match: this test only cares
+    // about windowMode precedence, so it shouldn't be coupled to the exact
+    // connect() payload the other cases in this block assert on.
     process.env.OPENCLI_WINDOW = 'active';
     try {
       const program = createProgram('', '');
@@ -2506,6 +2515,52 @@ describe('browser network command', () => {
     const out = lastJsonLog();
     expect(out.entries[0].body).toEqual({ data: { user: { rest_id: '42' } } });
     expect(out.entries[0].timestamp).toMatch(/T/);
+  });
+
+  it('surfaces an unavailable response body explicitly in --raw and --detail output', async () => {
+    browserState.page!.readNetworkCapture = vi.fn().mockResolvedValue([
+      {
+        url: 'https://api.example.com/ok',
+        method: 'POST',
+        responseStatus: 200,
+        responseContentType: 'application/json',
+        responsePreview: JSON.stringify({ id: 1 }),
+        timestamp: Date.now(),
+      },
+      {
+        url: 'https://api.example.com/lost',
+        method: 'POST',
+        responseStatus: 200,
+        responseContentType: 'application/json',
+        responseBodyUnavailable: true,
+        responseBodyError: 'debugger re-attached before this response body was fetched',
+        timestamp: Date.now(),
+      },
+    ]);
+    const program = createProgram('', '');
+
+    await program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'network', '--raw']);
+
+    const raw = lastJsonLog();
+    expect(raw.body_unavailable_count).toBe(1);
+    const ok = raw.entries.find((e: any) => e.url.endsWith('/ok'));
+    const lost = raw.entries.find((e: any) => e.url.endsWith('/lost'));
+    // Successful entries keep their exact previous shape.
+    expect(ok.body).toEqual({ id: 1 });
+    expect(ok).not.toHaveProperty('body_unavailable');
+    expect(ok).not.toHaveProperty('body_error');
+    // A lost body is null + flagged, never an empty string posing as success.
+    expect(lost.body).toBeNull();
+    expect(lost.body_unavailable).toBe(true);
+    expect(lost.body_error).toMatch(/re-attached/);
+
+    consoleLogSpy.mockClear();
+    await program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'network', '--detail', lost.key]);
+
+    const detail = lastJsonLog();
+    expect(detail.body).toBeNull();
+    expect(detail.body_unavailable).toBe(true);
+    expect(detail.body_error).toMatch(/re-attached/);
   });
 
   it('--detail <key> returns the full body for the requested entry', async () => {

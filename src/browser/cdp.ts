@@ -201,6 +201,9 @@ class CDPPage extends CDPBasePage {
     responsePreview?: string;
     responseBodyFullSize?: number;
     responseBodyTruncated?: boolean;
+    /** Set with responseBodyError when the body could not be fetched; responsePreview stays absent. */
+    responseBodyUnavailable?: boolean;
+    responseBodyError?: string;
     timestamp: number;
   }> = [];
   private _pendingRequests = new Map<string, number>(); // requestId → index in _networkEntries
@@ -381,19 +384,26 @@ class CDPPage extends CDPBasePage {
       this.bridge.on('Network.loadingFinished', (params: unknown) => {
         const p = params as { requestId: string };
         const idx = this._pendingRequests.get(p.requestId);
-        if (idx !== undefined) {
+        const entry = idx !== undefined ? this._networkEntries[idx] : undefined;
+        if (idx !== undefined && entry) {
           const bodyFetch = this.bridge.send('Network.getResponseBody', { requestId: p.requestId }).then((result: unknown) => {
             const r = result as { body?: string; base64Encoded?: boolean } | undefined;
             if (typeof r?.body === 'string') {
               const fullSize = r.body.length;
               const truncated = fullSize > CDP_RESPONSE_BODY_CAPTURE_LIMIT;
               const body = truncated ? r.body.slice(0, CDP_RESPONSE_BODY_CAPTURE_LIMIT) : r.body;
-              this._networkEntries[idx].responsePreview = r.base64Encoded ? `base64:${body}` : body;
-              this._networkEntries[idx].responseBodyFullSize = fullSize;
-              this._networkEntries[idx].responseBodyTruncated = truncated;
+              entry.responsePreview = r.base64Encoded ? `base64:${body}` : body;
+              entry.responseBodyFullSize = fullSize;
+              entry.responseBodyTruncated = truncated;
+            } else {
+              entry.responseBodyUnavailable = true;
+              entry.responseBodyError = 'Network.getResponseBody returned no body';
             }
           }).catch((err) => {
-            // Body unavailable for some requests (e.g. uploads) — non-fatal
+            // Non-fatal (e.g. uploads have no body), but never silent: flag the
+            // entry so callers cannot mistake a missing body for an empty one.
+            entry.responseBodyUnavailable = true;
+            entry.responseBodyError = `Network.getResponseBody failed: ${err instanceof Error ? err.message : String(err)}`;
             if (process.env.OPENCLI_VERBOSE) {
               // eslint-disable-next-line no-console
               console.error(`[cdp] getResponseBody failed for ${p.requestId}:`, err instanceof Error ? err.message : err);
