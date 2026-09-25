@@ -255,3 +255,153 @@ describe('runAuto — form filling', () => {
     expect(result.skippedFields).toEqual([{ groupKey: 'text:custname:1', label: 'Customer name', reason: 'no_data_file' }]);
   });
 });
+
+describe('runAuto — safety gates (CAPTCHA / login wall / terms checkbox / outcome-check)', () => {
+  it('stops immediately when a CAPTCHA is detected, without ever calling JEV or executing anything', async () => {
+    const pages: Record<string, FakePageSpec> = {
+      start: {
+        url: 'https://example.com/verify', title: 'Verify you are human',
+        snapshotBody: '[1]<a href=#>Continue</a>',
+        gate: { captchaDetected: true, captchaEvidence: 'selector: g-recaptcha', loginWallDetected: false },
+      },
+    };
+    const { page, clickLog } = makeFakePage(pages, 'start');
+    const callJev: CallJevFn = vi.fn(async () => { throw new Error('JEV must never be called once a CAPTCHA is detected'); });
+
+    const result = await runAuto(page, { goal: 'anything', maxSteps: 5, minConfidence: 0.55, allowSubmit: false, dryRun: false, confirmTerms: false }, { callJev });
+
+    expect(result.status).toBe('stopped_for_human');
+    expect(result.stopReason).toBe('captcha_detected');
+    expect(clickLog).toEqual([]);
+    expect(callJev).not.toHaveBeenCalled();
+  });
+
+  it('stops immediately when a login wall is detected, without ever calling JEV or executing anything', async () => {
+    const pages: Record<string, FakePageSpec> = {
+      start: {
+        url: 'https://example.com/account/login', title: 'Log in',
+        snapshotBody: '[1]<input type=password name=pw />',
+        gate: { captchaDetected: false, loginWallDetected: true, loginWallEvidence: 'form has an input[type=password]' },
+      },
+    };
+    const { page, clickLog } = makeFakePage(pages, 'start');
+    const callJev: CallJevFn = vi.fn(async () => { throw new Error('JEV must never be called once a login wall is detected'); });
+
+    const result = await runAuto(page, { goal: 'anything', maxSteps: 5, minConfidence: 0.55, allowSubmit: false, dryRun: false, confirmTerms: false }, { callJev });
+
+    expect(result.status).toBe('stopped_for_human');
+    expect(result.stopReason).toBe('login_wall_detected');
+    expect(clickLog).toEqual([]);
+    expect(callJev).not.toHaveBeenCalled();
+  });
+
+  function termsFormPage(): FakePageSpec {
+    return {
+      url: 'https://example.com/signup', title: 'Sign up',
+      snapshotBody: '[1]<input type=checkbox name=agree_terms />',
+      formState: {
+        forms: [{
+          id: null, name: null, action: '/signup', method: 'POST',
+          fields: [{ tag: 'input', type: 'checkbox', name: 'agree_terms', ref: '1', label: 'I agree to the Terms of Service', value: false, required: true, disabled: false }],
+        }],
+        orphanFields: [],
+      },
+    };
+  }
+
+  it('excludes a terms/consent checkbox from every candidate without --confirm-terms — never mapped, never offered, reported as blocked', async () => {
+    const pages = { form: termsFormPage() };
+    const { page, checkLog, clickLog } = makeFakePage(pages, 'form');
+    // No --data at all, so a lone terms checkbox with nothing else on the
+    // page means candidates are DONE-only either way — but the point of
+    // this test is that the checkbox is blocked (in termsCheckboxesBlocked)
+    // rather than silently absorbed into the ordinary "no data key matched"
+    // path, and that it costs zero JEV calls either way.
+    const callJev: CallJevFn = vi.fn(async () => { throw new Error('a single blocked checkbox with no other candidates must resolve to DONE without calling JEV'); });
+
+    const result = await runAuto(page, { goal: 'sign up', maxSteps: 5, minConfidence: 0.55, allowSubmit: false, dryRun: false, confirmTerms: false }, { callJev });
+
+    expect(checkLog).toEqual([]);
+    expect(clickLog).toEqual([]);
+    expect(result.termsCheckboxesBlocked).toEqual([{ groupKey: 'checkbox:agree_terms', label: 'I agree to the Terms of Service' }]);
+    expect(callJev).not.toHaveBeenCalled();
+  });
+
+  it('allows a terms/consent checkbox back into the candidate menu and lets it be checked when --confirm-terms is passed', async () => {
+    const pages = { form: termsFormPage() };
+    const { page, checkLog } = makeFakePage(pages, 'form');
+    const callJev: CallJevFn = vi.fn(async (_state, questions): Promise<JevCallResult> => {
+      if ('checkbox:agree_terms' in questions) {
+        // "agree" is a substring of the checkbox's own label ("I agree to
+        // the Terms of Service"), which field-mapping.ts's fuzzy option
+        // match accepts — see field-mapping.test.ts for the same pattern.
+        return { answers: { 'checkbox:agree_terms': { type: 'choice', choice: 'consent', probabilities: { consent: 0.9, NONE: 0.1 }, confidence: 0.9 } }, usage: { input_tokens: 100 }, ms: 1 };
+      }
+      const criteria = questions.next.criteria ?? {};
+      const checkId = Object.keys(criteria).find((k) => k.startsWith('CHECK_')) ?? 'DONE';
+      return { answers: { next: { type: 'choice', choice: checkId, probabilities: { [checkId]: 0.9 }, confidence: 0.9 } }, usage: { input_tokens: 100 }, ms: 1 };
+    });
+
+    const result = await runAuto(page, { goal: 'sign up', data: { consent: 'agree' }, maxSteps: 5, minConfidence: 0.55, allowSubmit: false, dryRun: false, confirmTerms: true }, { callJev });
+
+    expect(checkLog).toEqual(['1']);
+    expect(result.termsCheckboxesBlocked).toEqual([]);
+  });
+
+  function submitFormPage(): FakePageSpec {
+    return {
+      url: 'https://directory.example/submit', title: 'Submit your site',
+      snapshotBody: '[1]<button>Submit order</button>', // untyped <button> — safety.ts catches it via the "submit" keyword, same as the real httpbin.org/forms/post button
+      formState: { forms: [], orphanFields: [] },
+    };
+  }
+
+  it('classifies a real submit as "submitted" via dual-evidence outcome-check, rather than trusting a later JEV DONE at face value', async () => {
+    const pages = { form: submitFormPage() };
+    const { page, clickLog } = makeFakePage(pages, 'form', {
+      // title differs from submitFormPage's ("Submit your site") so the
+      // classifier doesn't also see "still-on-the-submit-page" — a real
+      // successful submission usually does redirect or re-render distinctly;
+      // this fixture stands in for that without needing a full page transition.
+      outcomeProbe: { urlInConfirmationRegion: true, title: 'Thank you for your submission', confirmationText: 'Thanks for your submission! Your listing has been added and is pending review.' },
+    });
+    const callJev: CallJevFn = vi.fn(async (_state, questions): Promise<JevCallResult> => {
+      if ('likely_success' in questions) {
+        return { answers: { likely_success: { type: 'noul', noul: 0.9 } }, usage: { input_tokens: 80 }, ms: 1 };
+      }
+      const criteria = questions.next.criteria ?? {};
+      const submitId = Object.keys(criteria).find((k) => k.startsWith('CLICK_')) ?? 'DONE';
+      return { answers: { next: { type: 'choice', choice: submitId, probabilities: { [submitId]: 0.9 }, confidence: 0.9 } }, usage: { input_tokens: 100 }, ms: 1 };
+    });
+
+    const result = await runAuto(page, { goal: 'submit the listing', maxSteps: 5, minConfidence: 0.55, allowSubmit: true, dryRun: false, confirmTerms: false }, { callJev });
+
+    expect(clickLog).toEqual(['1']);
+    expect(result.status).toBe('completed');
+    expect(result.stopReason).toBe('done');
+    expect(result.outcomeCheck?.state).toBe('submitted');
+    expect(result.outcomeCheck?.jevAssist?.likelySuccess).toBe(0.9);
+  });
+
+  it('does NOT report "completed" when outcome-check evidence is inconclusive (form still present, our value echoed back) — the classic silent-rerender failure mode', async () => {
+    const pages = { form: submitFormPage() };
+    const { page, clickLog } = makeFakePage(pages, 'form', {
+      outcomeProbe: { formStillPresent: true, echoedSubmittedValue: true, urlInConfirmationRegion: false, confirmationText: '' },
+    });
+    const callJev: CallJevFn = vi.fn(async (_state, questions): Promise<JevCallResult> => {
+      if ('likely_success' in questions) {
+        return { answers: { likely_success: { type: 'noul', noul: 0.2 } }, usage: { input_tokens: 80 }, ms: 1 };
+      }
+      const criteria = questions.next.criteria ?? {};
+      const submitId = Object.keys(criteria).find((k) => k.startsWith('CLICK_')) ?? 'DONE';
+      return { answers: { next: { type: 'choice', choice: submitId, probabilities: { [submitId]: 0.9 }, confidence: 0.9 } }, usage: { input_tokens: 100 }, ms: 1 };
+    });
+
+    const result = await runAuto(page, { goal: 'submit the listing', maxSteps: 5, minConfidence: 0.55, allowSubmit: true, dryRun: false, confirmTerms: false }, { callJev });
+
+    expect(clickLog).toEqual(['1']);
+    expect(result.status).toBe('stopped_for_human');
+    expect(result.stopReason).toBe('submit_unverified');
+    expect(result.outcomeCheck?.state).not.toBe('submitted');
+  });
+});

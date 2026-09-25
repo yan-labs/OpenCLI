@@ -33,9 +33,16 @@ const TERMS_KEYWORDS_RE = new RegExp(
   'i',
 );
 
-/** True when a checkbox group's label/name looks like a terms/consent/privacy-policy acknowledgement. */
+/**
+ * True when a checkbox group's label/name looks like a terms/consent/
+ * privacy-policy acknowledgement. Underscores/hyphens are normalized to
+ * spaces first so a raw `name` attribute like `agree_to_tos` (no visible
+ * label text) still matches `\bagree\b` — `_` counts as a word character,
+ * so without this normalization "agree_to_tos" is one unbroken regex "word"
+ * and the boundary never matches.
+ */
 export function isTermsLikeGroup(labelOrName: string): boolean {
-  return TERMS_KEYWORDS_RE.test(labelOrName);
+  return TERMS_KEYWORDS_RE.test(labelOrName.replace(/[_-]+/g, ' '));
 }
 
 export { TERMS_KEYWORDS_RE };

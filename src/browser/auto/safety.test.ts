@@ -25,6 +25,13 @@ describe('looksIrreversible', () => {
     expect(looksIrreversible(ref({ text: '确认下单' }))).toBe(true);
   });
 
+  it('flags account-creation keywords — found via real-device testing on a signup form whose untyped "Create account" button slipped past every other keyword', () => {
+    expect(looksIrreversible(ref({ text: 'Create account' }))).toBe(true);
+    expect(looksIrreversible(ref({ text: 'Sign up' }))).toBe(true);
+    expect(looksIrreversible(ref({ text: '创建账号' }))).toBe(true);
+    expect(looksIrreversible(ref({ text: '注册' }))).toBe(true);
+  });
+
   it('matches via aria-label/title/id when visible text is empty (icon buttons)', () => {
     expect(looksIrreversible(ref({ text: '', attrs: { 'aria-label': 'Delete this item' } }))).toBe(true);
     expect(looksIrreversible(ref({ text: '', attrs: { title: 'Confirm purchase' } }))).toBe(true);

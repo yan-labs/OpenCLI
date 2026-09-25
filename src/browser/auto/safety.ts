@@ -29,6 +29,12 @@ const IRREVERSIBLE_KEYWORDS = [
   // delete / remove
   'delete', 'remove', 'destroy', 'unsubscribe', 'cancel account', 'deactivate',
   '删除', '移除', '注销', '销毁', '退订',
+  // account creation — real-device testing on a signup form surfaced this
+  // gap: an untyped "Create account" button matched none of the keywords
+  // above and so was freely clickable without --allow-submit, even though
+  // Claude Code's own top-level rules explicitly prohibit creating accounts.
+  'create account', 'sign up', 'register', 'create your account',
+  '创建账号', '注册', '开户',
 ];
 
 const IRREVERSIBLE_RE = new RegExp(
