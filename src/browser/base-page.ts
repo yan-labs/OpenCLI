@@ -21,6 +21,8 @@ import {
   autoScrollJs,
   networkRequestsJs,
   waitForDomStableJs,
+  clickProbeInstallJs,
+  clickProbeCheckJs,
 } from './dom-helpers.js';
 import {
   resolveTargetJs,
@@ -53,6 +55,16 @@ export interface ResolveSuccess {
    * agents can tell a trusted synthetic click from the untrusted JS fallback.
    */
   click_method?: 'cdp' | 'js' | 'ax';
+  /**
+   * Set only when the trusted CDP click was verified as dropped: the click
+   * command resolved but the page never received a trusted mousedown/click
+   * (observed on real Chrome for windows placed off the visible display — the
+   * `dedicated` window mode's placement — where `Input.dispatchMouseEvent`
+   * succeeds while the input never reaches the renderer). The reported
+   * `click_method` is then `js`: the JS el.click() fallback is what actually
+   * performed the action. Absent in every other case.
+   */
+  native_click_dropped?: boolean;
   /**
    * Result of hit-testing the click point against the resolved element:
    * `target` (the point lands on the element or a descendant — trustworthy),
@@ -324,21 +336,45 @@ export abstract class BasePage implements IPage {
     // or an ancestor (open shadow-DOM host / own wrapper — CDP still reaches the
     // target there). Only an unrelated overlay ('other') forces the el.click()
     // fallback, which dispatches straight on the node. See issues #2076/#2071.
+    //
+    // "The CDP command resolved" is not the same as "the click happened": some
+    // real-Chrome states (windows placed off the visible display — the
+    // `dedicated` window mode's placement) make `Input.dispatchMouseEvent`
+    // succeed while the input is dropped before the page ever sees it, which
+    // used to burn every `auto` step on a click that did nothing. So a native
+    // click here is verified against an in-page probe: if NO trusted
+    // mousedown/click reached the document, fall through to the JS el.click()
+    // path below, which cannot be dropped. The probe only exists around the
+    // native dispatch and is removed by its own check, so no listener leaks;
+    // `isTrusted` filtering keeps pages that re-dispatch synthetic clicks from
+    // masking a real drop. When the probe is unavailable (older backends,
+    // install failure) or reports 'missing' (page navigated away — itself
+    // evidence something happened), behaviour is exactly the legacy one.
+    let nativeDropped = false;
     if (rect?.visible === true && (rect.hit === 'target' || rect.hit === 'ancestor')) {
+      const probeToken = await this.armClickProbe();
       const success = await this.tryNativeClick(rect.x, rect.y);
-      if (success) return { ...resolved, click_method: 'cdp', ...meta };
+      if (success) {
+        nativeDropped = probeToken !== null && (await this.settleClickProbe(probeToken)) === 'dropped';
+        if (!nativeDropped) return { ...resolved, click_method: 'cdp', ...meta };
+      }
     }
 
     // JS fallback: el.click() dispatches straight on __resolved, bypassing the
-    // occluding overlay (also covers older backends / zero-rect targets).
+    // occluding overlay (also covers older backends / zero-rect targets, and
+    // the trusted-input-dropped case detected above).
     const result = await this.evaluate(clickResolvedJs({ skipScroll: nativeScrolled })) as
       | string
       | { status: string; x?: number; y?: number; w?: number; h?: number; error?: string }
       | null;
 
-    if (typeof result === 'string' || result == null) return { ...resolved, click_method: 'js', ...meta };
+    if (typeof result === 'string' || result == null) {
+      return { ...resolved, click_method: 'js', ...(nativeDropped && { native_click_dropped: true }), ...meta };
+    }
 
-    if (result.status === 'clicked') return { ...resolved, click_method: 'js', ...meta };
+    if (result.status === 'clicked') {
+      return { ...resolved, click_method: 'js', ...(nativeDropped && { native_click_dropped: true }), ...meta };
+    }
 
     // JS click failed — try CDP native click if coordinates available
     if (result.x != null && result.y != null) {
@@ -347,6 +383,51 @@ export abstract class BasePage implements IPage {
     }
 
     throw new Error(`Click failed: ${result.error ?? 'JS click and CDP fallback both failed'}`);
+  }
+
+  /**
+   * How long the click probe keeps watching for a trusted event after a CDP
+   * click resolved, in ms. Polls every 25ms in-page and exits early on the
+   * first observed event, so the happy path pays ~25ms and only a genuinely
+   * dropped click pays the full window. Long enough to cover scheduler
+   * jitter between the Input dispatch response and the renderer processing
+   * the event; short enough not to slow an `auto` loop's failed steps down.
+   */
+  static readonly CLICK_PROBE_SETTLE_MS = 180;
+
+  /**
+   * Arm the trusted-click liveness probe (see clickProbeInstallJs). Returns
+   * the probe token, or null when probing is unavailable — null keeps the
+   * legacy behaviour of trusting whatever the CDP click reported.
+   */
+  protected async armClickProbe(): Promise<string | null> {
+    try {
+      const token = await this.evaluate(clickProbeInstallJs());
+      return typeof token === 'string' && token.length > 0 ? token : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Settle the probe armed by armClickProbe. 'dropped' is the only verdict
+   * that changes behaviour (fall back to the JS click); 'observed' and
+   * 'missing' both keep the native click's result, and any check failure
+   * degrades to 'observed' for the same reason.
+   */
+  protected async settleClickProbe(token: string): Promise<'observed' | 'dropped' | 'missing'> {
+    try {
+      const result = await this.evaluate(clickProbeCheckJs(token, BasePage.CLICK_PROBE_SETTLE_MS)) as
+        | { status?: string }
+        | null;
+      if (result?.status === 'dropped') return 'dropped';
+      return 'observed';
+    } catch {
+      // The check evaluate itself failing (navigation tearing down the
+      // context, dialog, transport hiccup) means the page moved on — never
+      // fall back to JS on top of a click that may have worked.
+      return 'observed';
+    }
   }
 
   /** Uses native CDP click support when the concrete page exposes it. */

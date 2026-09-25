@@ -300,28 +300,114 @@ describe('BasePage native input routing', () => {
       .mockResolvedValueOnce({ root: { nodeId: 1 } })
       .mockResolvedValueOnce({ nodeId: 9 })
       .mockResolvedValueOnce({});
-    page.results = [resolveOk, { x: 50, y: 100, w: 200, h: 32, visible: true, hit: 'target' }];
+    page.results = [resolveOk, { x: 50, y: 100, w: 200, h: 32, visible: true, hit: 'target' }, 'probe-token', { status: 'observed' }];
     page.withArgsResults = [{ ok: true, multiple: false, accept: 'application/pdf' }, undefined];
 
     await page.click('#save');
 
     expect(page.cdp).toHaveBeenCalledWith('DOM.scrollIntoViewIfNeeded', { nodeId: 9 });
     // After CDP scroll, boundingRectResolvedJs runs with skipScroll=true.
-    expect(page.scripts.at(-1)).toContain('if (false) el.scrollIntoView');
+    const rectScript = page.scripts.find((s: string) => s.includes('getBoundingClientRect'));
+    expect(rectScript).toContain('if (false) el.scrollIntoView');
   });
 
   it('clicks via CDP Input.dispatchMouseEvent when rect is visible', async () => {
     const page = new ActionPage();
     page.nativeClick = vi.fn().mockResolvedValue(undefined);
-    page.results = [resolveOk, { x: 50, y: 100, w: 200, h: 32, visible: true, hit: 'target' }];
+    page.results = [
+      resolveOk,
+      { x: 50, y: 100, w: 200, h: 32, visible: true, hit: 'target' },
+      'probe-token',
+      { status: 'observed', tag: 'A' },
+    ];
 
-    await page.click('#category');
+    await expect(page.click('#category')).resolves.toEqual({
+      matches_n: 1,
+      match_level: 'exact',
+      click_method: 'cdp',
+      hit: 'target',
+    });
 
     expect(page.nativeClick).toHaveBeenCalledWith(50, 100);
     expect(page.nativeClick).toHaveBeenCalledTimes(1);
-    expect(page.scripts).toHaveLength(2);
+    expect(page.scripts).toHaveLength(4);
     expect(page.scripts[1]).toContain('getBoundingClientRect');
+    // The click is verified against an in-page trusted-event probe before the
+    // CDP result is trusted: install before the dispatch, check after it.
+    expect(page.scripts[2]).toContain('isTrusted');
+    expect(page.scripts[3]).toContain("'observed'");
     expect(page.scripts.join('\n')).not.toContain('el.click()');
+  });
+
+  it('keeps the CDP result when the probe is missing (page navigated between install and check)', async () => {
+    const page = new ActionPage();
+    page.nativeClick = vi.fn().mockResolvedValue(undefined);
+    page.results = [
+      resolveOk,
+      { x: 50, y: 100, w: 200, h: 32, visible: true, hit: 'target' },
+      'probe-token',
+      { status: 'missing' },
+    ];
+
+    await expect(page.click('#category')).resolves.toEqual({
+      matches_n: 1,
+      match_level: 'exact',
+      click_method: 'cdp',
+      hit: 'target',
+    });
+
+    expect(page.nativeClick).toHaveBeenCalledTimes(1);
+    expect(page.scripts).toHaveLength(4);
+    expect(page.scripts.join('\n')).not.toContain('el.click()');
+  });
+
+  it('skips probe verification when the probe cannot be armed', async () => {
+    const page = new ActionPage();
+    page.nativeClick = vi.fn().mockResolvedValue(undefined);
+    // The install evaluate throws (transport hiccup) — armClickProbe degrades
+    // to null and the legacy trust-the-CDP-result behaviour applies.
+    page.results = [
+      resolveOk,
+      { x: 50, y: 100, w: 200, h: 32, visible: true, hit: 'target' },
+      Promise.reject(new Error('transport down')),
+    ];
+
+    await expect(page.click('#category')).resolves.toEqual({
+      matches_n: 1,
+      match_level: 'exact',
+      click_method: 'cdp',
+      hit: 'target',
+    });
+
+    expect(page.nativeClick).toHaveBeenCalledTimes(1);
+    expect(page.scripts).toHaveLength(3);
+    expect(page.scripts.join('\n')).not.toContain('el.click()');
+  });
+
+  it('falls back to JS el.click() when the trusted CDP click was silently dropped', async () => {
+    const page = new ActionPage();
+    page.nativeClick = vi.fn().mockResolvedValue(undefined);
+    page.results = [
+      resolveOk,
+      { x: 50, y: 100, w: 200, h: 32, visible: true, hit: 'target' },
+      'probe-token',
+      // The dedicated-window failure shape: Input.dispatchMouseEvent resolves,
+      // but no trusted mousedown/click ever reached the page.
+      { status: 'dropped' },
+      { status: 'clicked', x: 50, y: 100, w: 200, h: 32 },
+    ];
+
+    await expect(page.click('a.learn-more')).resolves.toEqual({
+      matches_n: 1,
+      match_level: 'exact',
+      click_method: 'js',
+      native_click_dropped: true,
+      hit: 'target',
+    });
+
+    expect(page.nativeClick).toHaveBeenCalledTimes(1);
+    expect(page.scripts).toHaveLength(5);
+    expect(page.scripts[4]).toContain('el.click()');
   });
 
   it('clicks AX snapshot refs through backend node coordinates without DOM resolver', async () => {
@@ -650,7 +736,9 @@ describe('BasePage native input routing', () => {
     page.results = [
       resolveOk,
       { x: 10, y: 20, w: 100, h: 30, visible: true, hit: 'target' },
+      'probe-token',
       { status: 'js_failed', x: 10, y: 20, error: 'click intercepted' },
+      { status: 'observed' },
     ];
 
     await page.click('#flaky');
@@ -723,6 +811,8 @@ describe('BasePage native input routing', () => {
       { ok: true, checked: false, disabled: false, kind: 'checkbox' },
       resolveOk,
       { x: 20, y: 30, w: 40, h: 20, visible: true, hit: 'target' },
+      'probe-token',
+      { status: 'observed' },
       { ok: true, checked: true, disabled: false, kind: 'checkbox' },
     ];
 
