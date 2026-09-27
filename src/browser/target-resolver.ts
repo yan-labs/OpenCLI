@@ -479,6 +479,92 @@ export function typeResolvedJs(text: string): string {
   `;
 }
 
+/**
+ * Generate JS that performs a whole drag by hand when the CDP
+ * Input.dispatchMouseEvent path is unavailable or was verified as dropped.
+ *
+ * Assumes the caller resolved source + target and stored them in
+ * `window.__opencli_drag_source` / `window.__resolved`. Both centres are
+ * re-measured here rather than trusting the coordinates captured earlier —
+ * the element may have scrolled/reflowed between that measurement and this
+ * dispatch. Two independent sequences are synthesized:
+ *
+ *   1. Pointer/mouse press-move-release: pointerdown+mousedown on the source,
+ *      pointermove+mousemove on the document (mid, then end), pointerup+
+ *      mouseup on the document with buttons cleared. PointerEvent construction
+ *      is wrapped per-event because a few old embeds lack the constructor —
+ *      the MouseEvent chain is the guaranteed floor.
+ *   2. The HTML5 native drag-and-drop sequence (dragstart → dragenter →
+ *      dragover → drop → dragend) sharing one DataTransfer, which is what
+ *      draggable=true pages and DnD libraries actually listen for. The whole
+ *      block is wrapped because DragEvent/DataTransfer construction can be
+ *      unavailable; a failure there must not fail the whole drag call.
+ *
+ * Best-effort by design: a page with no drag listeners simply ignores these
+ * events, exactly as it would ignore a real drag it never opted into.
+ */
+export function dragResolvedJs(): string {
+  return `
+    (() => {
+      const sourceEl = window.__opencli_drag_source;
+      const targetEl = window.__resolved;
+      if (!sourceEl) throw new Error('No resolved drag source');
+      if (!targetEl) throw new Error('No resolved drag target');
+
+      const centre = (el) => {
+        const r = el.getBoundingClientRect();
+        return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+      };
+      const from = centre(sourceEl);
+      const to = centre(targetEl);
+      const mid = { x: Math.round((from.x + to.x) / 2), y: Math.round((from.y + to.y) / 2) };
+
+      const dispatchSynthetic = (target, type, Ctor, init) => {
+        try { target.dispatchEvent(new Ctor(type, init)); } catch (e) {}
+      };
+      const mouseInit = (pt, extra) => ({
+        bubbles: true,
+        cancelable: true,
+        view: window,
+        clientX: pt.x,
+        clientY: pt.y,
+        button: 0,
+        ...(extra || {}),
+      });
+
+      // 1) Pointer + mouse press → move → release.
+      dispatchSynthetic(sourceEl, 'pointerdown', PointerEvent, mouseInit(from, { buttons: 1, pointerId: 1, isPrimary: true }));
+      sourceEl.dispatchEvent(new MouseEvent('mousedown', mouseInit(from, { buttons: 1 })));
+      dispatchSynthetic(document, 'pointermove', PointerEvent, mouseInit(mid, { buttons: 1, pointerId: 1, isPrimary: true }));
+      document.dispatchEvent(new MouseEvent('mousemove', mouseInit(mid, { buttons: 1 })));
+      dispatchSynthetic(document, 'pointermove', PointerEvent, mouseInit(to, { buttons: 1, pointerId: 1, isPrimary: true }));
+      document.dispatchEvent(new MouseEvent('mousemove', mouseInit(to, { buttons: 1 })));
+      dispatchSynthetic(document, 'pointerup', PointerEvent, mouseInit(to, { buttons: 0, pointerId: 1, isPrimary: true }));
+      document.dispatchEvent(new MouseEvent('mouseup', mouseInit(to, { buttons: 0 })));
+
+      // 2) HTML5 native drag-and-drop with a single shared DataTransfer.
+      try {
+        const dataTransfer = new DataTransfer();
+        const dragInit = (pt) => ({
+          bubbles: true,
+          cancelable: true,
+          view: window,
+          clientX: pt.x,
+          clientY: pt.y,
+          dataTransfer,
+        });
+        sourceEl.dispatchEvent(new DragEvent('dragstart', dragInit(from)));
+        targetEl.dispatchEvent(new DragEvent('dragenter', dragInit(to)));
+        targetEl.dispatchEvent(new DragEvent('dragover', dragInit(to)));
+        targetEl.dispatchEvent(new DragEvent('drop', dragInit(to)));
+        sourceEl.dispatchEvent(new DragEvent('dragend', dragInit(to)));
+      } catch (e) {}
+
+      return { status: 'dragged', from, to };
+    })()
+  `;
+}
+
 export type FillResolvedResult =
   | { ok: true; actual: string; expected: string; length: number; mode: 'input' | 'textarea' | 'contenteditable' }
   | { ok: false; actual: string; expected: string; length: number; mode: 'input' | 'textarea' | 'contenteditable' }

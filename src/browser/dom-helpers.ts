@@ -172,47 +172,54 @@ export function waitForSelectorJs(selector: string, timeoutMs: number): string {
 }
 
 /**
- * Window key holding the trusted-click liveness probe state. One probe lives
+ * Window key holding the trusted-input liveness probe state. One probe lives
  * per document at a time: installing a new probe removes the previous
- * listener, so a long click loop never accumulates listeners.
+ * listener, so a long action loop never accumulates listeners.
  */
-const CLICK_PROBE_KEY = '__opencliTrustedClickProbe';
+const INPUT_PROBE_KEY = '__opencliTrustedInputProbe';
 
 /**
- * Generate JS to arm a trusted-click liveness probe ahead of a CDP
- * `Input.dispatchMouseEvent` click.
+ * Generate JS to arm a trusted-input liveness probe ahead of a CDP `Input.*`
+ * dispatch (click / hover / double-click / drag / insertText — the BasePage
+ * `armInputProbe` callers all share this single implementation).
  *
- * Why this exists: a trusted CDP click can resolve without any effect when the
+ * Why this exists: a trusted CDP input can resolve without any effect when the
  * browser drops the input before it reaches the renderer — observed on real
  * Chrome with windows placed off the visible display (the `dedicated` window
  * mode's deliberate placement), where `Input.dispatchMouseEvent` reports
- * success while the page never sees mousedown/click at all. In-page
- * `el.click()` bypasses the input pipeline and still works there.
+ * success while the page never sees the event at all. In-page synthetic
+ * dispatches bypass the input pipeline and still work there.
  *
- * The probe is a window-level capture listener that records ONLY
- * `isTrusted === true` mouse events (a page re-dispatching its own synthetic
- * clicks cannot satisfy it — isTrusted is read-only and false for those). It
- * records mousedown as well as click: some frameworks act on mousedown and
- * preventDefault the click, and that still proves the input pipeline
+ * The probe is a window-level capture listener over `eventTypes` that records
+ * ONLY `isTrusted === true` events (a page re-dispatching its own synthetic
+ * events cannot satisfy it — isTrusted is read-only and false for those). Any
+ * one of the listened types counts: e.g. some frameworks act on mousedown and
+ * preventDefault the click, and either still proves the input pipeline
  * delivered our event.
+ *
+ * The installed state remembers its own `eventTypes` so the matching
+ * inputProbeCheckJs() can detach exactly the right listeners without those
+ * being passed again.
  *
  * Returns the probe token ("" on failure); callers treat a non-token result
  * as "probe unavailable" and keep the legacy trust-the-CDP-result behaviour.
  */
-export function clickProbeInstallJs(): string {
+export function inputProbeInstallJs(eventTypes: string[]): string {
   return `
     (() => {
-      const KEY = ${JSON.stringify(CLICK_PROBE_KEY)};
+      const KEY = ${JSON.stringify(INPUT_PROBE_KEY)};
+      const EVENT_TYPES = ${JSON.stringify(eventTypes)};
       const w = window;
       const prev = w[KEY];
       if (prev && prev.handler) {
         try {
-          w.removeEventListener('mousedown', prev.handler, true);
-          w.removeEventListener('click', prev.handler, true);
+          for (const t of (prev.eventTypes || EVENT_TYPES)) {
+            w.removeEventListener(t, prev.handler, true);
+          }
         } catch (e) {}
       }
       const token = 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-      const state = { token: token, observed: false, tag: '' };
+      const state = { token: token, observed: false, tag: '', eventTypes: EVENT_TYPES };
       const handler = (e) => {
         const st = w[KEY];
         if (!st || st.token !== token || st.observed) return;
@@ -222,42 +229,45 @@ export function clickProbeInstallJs(): string {
       };
       state.handler = handler;
       w[KEY] = state;
-      w.addEventListener('mousedown', handler, true);
-      w.addEventListener('click', handler, true);
+      for (const t of EVENT_TYPES) {
+        w.addEventListener(t, handler, true);
+      }
       return token;
     })()
   `;
 }
 
 /**
- * Generate JS to read the probe armed by clickProbeInstallJs() and detach it.
+ * Generate JS to read the probe armed by inputProbeInstallJs() and detach it.
  *
- * Runs after the CDP click returned. Polls in-page (25ms ticks, bounded by
+ * Runs after the CDP input returned. Polls in-page (25ms ticks, bounded by
  * settleMs) so a trusted event that lands a beat after the dispatch response
  * still counts; exits early once the probe has fired. Detaches the listeners
- * on every outcome so the page is left clean.
+ * (the event types the probe itself recorded at install time) on every
+ * outcome so the page is left clean.
  *
  * Statuses:
- *   'observed' — a trusted mousedown/click reached this document: the input
- *                pipeline works, the CDP click result is trustworthy.
+ *   'observed' — a trusted event of a listened type reached this document: the
+ *                input pipeline works, the CDP result is trustworthy.
  *   'dropped'  — the probe never fired within the settle window: the trusted
  *                input was dropped before reaching the page. Callers fall
- *                back to the JS el.click() path, which cannot be dropped.
+ *                back to their JS path, which cannot be dropped.
  *   'missing'  — no probe with the expected token exists (e.g. the page
  *                navigated between install and check — itself proof that
  *                something happened). Callers keep the CDP result.
  */
-export function clickProbeCheckJs(token: string, settleMs: number): string {
+export function inputProbeCheckJs(token: string, settleMs: number): string {
   return `
     (async () => {
-      const KEY = ${JSON.stringify(CLICK_PROBE_KEY)};
+      const KEY = ${JSON.stringify(INPUT_PROBE_KEY)};
       const w = window;
       const st = w[KEY];
       if (!st || st.token !== ${JSON.stringify(token)}) {
         if (st && st.handler) {
           try {
-            w.removeEventListener('mousedown', st.handler, true);
-            w.removeEventListener('click', st.handler, true);
+            for (const t of (st.eventTypes || [])) {
+              w.removeEventListener(t, st.handler, true);
+            }
           } catch (e) {}
           delete w[KEY];
         }
@@ -268,12 +278,26 @@ export function clickProbeCheckJs(token: string, settleMs: number): string {
         await new Promise((r) => setTimeout(r, 25));
       }
       try {
-        w.removeEventListener('mousedown', st.handler, true);
-        w.removeEventListener('click', st.handler, true);
+        for (const t of (st.eventTypes || [])) {
+          w.removeEventListener(t, st.handler, true);
+        }
       } catch (e) {}
       delete w[KEY];
       if (!st.observed) return { status: 'dropped' };
       return { status: 'observed', tag: st.tag };
     })()
   `;
+}
+
+/**
+ * Trusted-click flavour of the generic input probe. Kept as a thin wrapper so
+ * the click() call sites (and their tests) keep working unchanged; the actual
+ * implementation lives only in inputProbeInstallJs/inputProbeCheckJs.
+ */
+export function clickProbeInstallJs(): string {
+  return inputProbeInstallJs(['mousedown', 'click']);
+}
+
+export function clickProbeCheckJs(token: string, settleMs: number): string {
+  return inputProbeCheckJs(token, settleMs);
 }
