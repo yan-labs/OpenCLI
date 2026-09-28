@@ -3373,7 +3373,7 @@ function normalizeUrlForComparison(url) {
     if (parsed.protocol === "https:" && parsed.port === "443" || parsed.protocol === "http:" && parsed.port === "80") {
       parsed.port = "";
     }
-    const pathname = parsed.pathname === "/" ? "" : parsed.pathname.replace(/\/$/, "");
+    const pathname = parsed.pathname === "/" ? "" : parsed.pathname;
     return `${parsed.protocol}//${parsed.host}${pathname}${parsed.search}${parsed.hash}`;
   } catch {
     return url;
