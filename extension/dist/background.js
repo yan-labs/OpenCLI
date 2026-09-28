@@ -3373,7 +3373,7 @@ function normalizeUrlForComparison(url) {
     if (parsed.protocol === "https:" && parsed.port === "443" || parsed.protocol === "http:" && parsed.port === "80") {
       parsed.port = "";
     }
-    const pathname = parsed.pathname === "/" ? "" : parsed.pathname;
+    const pathname = parsed.pathname === "/" ? "" : parsed.pathname.replace(/\/$/, "");
     return `${parsed.protocol}//${parsed.host}${pathname}${parsed.search}${parsed.hash}`;
   } catch {
     return url;
@@ -3733,13 +3733,22 @@ async function handleNavigate(cmd, leaseKey) {
   const beforeTab = resolved.tab ?? await chrome.tabs.get(tabId);
   const beforeNormalized = normalizeUrlForComparison(beforeTab.url);
   const targetUrl = cmd.url;
-  if (beforeTab.status === "complete" && isTargetUrl(beforeTab.url, targetUrl)) {
+  const alreadyAtTarget = isTargetUrl(beforeTab.url, targetUrl);
+  if (alreadyAtTarget && beforeTab.status === "complete") {
     return pageScopedResult(cmd.id, tabId, { title: beforeTab.title, url: beforeTab.url, timedOut: false });
   }
   if (!hasActiveNetworkCapture(tabId)) {
     await detach(tabId);
   }
-  await chrome.tabs.update(tabId, { url: targetUrl });
+  let rejectedNavigation;
+  if (!alreadyAtTarget) {
+    try {
+      await chrome.tabs.update(tabId, { url: targetUrl });
+    } catch (err) {
+      if (!(err instanceof Error) || !err.message.includes("Navigation rejected")) throw err;
+      rejectedNavigation = err;
+    }
+  }
   let timedOut = false;
   await new Promise((resolve) => {
     let settled = false;
@@ -3780,6 +3789,7 @@ async function handleNavigate(cmd, leaseKey) {
     }, navTimeoutMs);
   });
   let tab = await chrome.tabs.get(tabId);
+  if (rejectedNavigation && (tab.status !== "complete" || !isTargetUrl(tab.url, targetUrl))) throw rejectedNavigation;
   const postNavigationSession = automationSessions.get(leaseKey);
   if (postNavigationSession && tab.windowId !== postNavigationSession.windowId) {
     console.warn(`[opencli] Tab ${tabId} drifted to window ${tab.windowId} during navigation, moving back to ${postNavigationSession.windowId}`);

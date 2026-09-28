@@ -3244,7 +3244,7 @@ function normalizeUrlForComparison(url?: string): string {
     if ((parsed.protocol === 'https:' && parsed.port === '443') || (parsed.protocol === 'http:' && parsed.port === '80')) {
       parsed.port = '';
     }
-    const pathname = parsed.pathname === '/' ? '' : parsed.pathname;
+    const pathname = parsed.pathname === '/' ? '' : parsed.pathname.replace(/\/$/, '');
     return `${parsed.protocol}//${parsed.host}${pathname}${parsed.search}${parsed.hash}`;
   } catch {
     return url;
@@ -3724,8 +3724,9 @@ async function handleNavigate(cmd: Command, leaseKey: string): Promise<Result> {
   const beforeNormalized = normalizeUrlForComparison(beforeTab.url);
   const targetUrl = cmd.url;
 
-  // Fast-path: tab is already at the target URL and fully loaded.
-  if (beforeTab.status === 'complete' && isTargetUrl(beforeTab.url, targetUrl)) {
+  // The new window may already be loading this URL; do not navigate it twice.
+  const alreadyAtTarget = isTargetUrl(beforeTab.url, targetUrl);
+  if (alreadyAtTarget && beforeTab.status === 'complete') {
     return pageScopedResult(cmd.id, tabId, { title: beforeTab.title, url: beforeTab.url, timedOut: false });
   }
 
@@ -3741,7 +3742,15 @@ async function handleNavigate(cmd: Command, leaseKey: string): Promise<Result> {
     await executor.detach(tabId);
   }
 
-  await chrome.tabs.update(tabId, { url: targetUrl });
+  let rejectedNavigation: unknown;
+  if (!alreadyAtTarget) {
+    try {
+      await chrome.tabs.update(tabId, { url: targetUrl });
+    } catch (err) {
+      if (!(err instanceof Error) || !err.message.includes('Navigation rejected')) throw err;
+      rejectedNavigation = err;
+    }
+  }
 
   // Wait until navigation completes. Resolve when status is 'complete' AND either:
   // - the URL matches the target (handles same-URL / canonicalized navigations), OR
@@ -3795,6 +3804,7 @@ async function handleNavigate(cmd: Command, leaseKey: string): Promise<Result> {
   });
 
   let tab = await chrome.tabs.get(tabId);
+  if (rejectedNavigation && (tab.status !== 'complete' || !isTargetUrl(tab.url, targetUrl))) throw rejectedNavigation;
 
   // Post-navigation drift detection: if the tab moved to another window
   // during navigation (e.g. a tab-management extension regrouped it),
