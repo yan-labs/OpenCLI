@@ -983,6 +983,25 @@ export async function selectChatGPTTool(page, tool) {
     throw lastError;
 }
 
+// A tool picked from the "+" menu can stay in the persisted composer draft — Deep
+// Research is an inline mention chip that survives page loads and even other
+// windows. If the caller asked for no tool, drop it: otherwise a plain ask would
+// silently go out as a Deep Research message and never match its own prompt.
+export async function clearChatGPTStaleToolChips(page) {
+    const removed = requireBooleanEvaluateResult(unwrapEvaluateResult(await page.evaluate(`(() => {
+        ${buildComposerLocatorScript()}
+        const composer = findComposer();
+        if (!composer || !composer.isContentEditable) return false;
+        if (!composer.querySelector('[app-mention-name], [contenteditable="false"]')) return false;
+        composer.focus();
+        document.execCommand('selectAll', false);
+        document.execCommand('delete', false);
+        return true;
+    })()`)), 'chatgpt stale tool chips');
+    if (removed) await page.wait(0.5);
+    return removed;
+}
+
 export async function clearChatGPTDraft(page) {
     await page.evaluate(`
         (() => {
@@ -1268,9 +1287,10 @@ export async function getVisibleMessages(page, { textOnly = false } = {}) {
         let nodes = Array.from(document.querySelectorAll(${JSON.stringify(CONVERSATION_MESSAGE_SELECTOR)}));
         nodes = nodes.filter((node) => node instanceof HTMLElement && isVisible(node));
 
-        // Inline web-search citation chips ("Node.js +1") are rendered inside the
-        // assistant markdown; they are not part of the reply text.
-        const CITATION_SELECTOR = 'a[data-testid="chatgpt-citation"]';
+        // Inline chips that are not message text: web-search citations ("Node.js +1")
+        // in assistant markdown, and tool mentions (the "深度研究" pill) that Deep
+        // Research prepends to the user's own bubble.
+        const CITATION_SELECTOR = 'a[data-testid="chatgpt-citation"], [data-prompt-link-href]';
         const readWithoutCitations = (contentNode, wantHtml) => {
             const chips = Array.from(contentNode.querySelectorAll(CITATION_SELECTOR));
             if (!wantHtml) {
