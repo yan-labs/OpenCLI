@@ -73,10 +73,14 @@ function debugChatGPTModel(message) {
     }
 }
 
+// labels: how the selected tool shows up in the composer (pill) — matched loosely.
+// menuLabels: how the entry is named in the "+" menu — matched as a text prefix, so
+// the bare word "搜索" can not hit "添加资料库文件 浏览和搜索你的文件".
 const CHATGPT_TOOL_OPTIONS = {
-    'deep-research': { label: 'Deep Research', labels: ['深度研究', 'Deep Research'] },
-    'web-search': { label: 'Web Search', labels: ['网页搜索', '搜索', 'Web Search', 'Search'] },
+    'deep-research': { label: 'Deep Research', labels: ['深度研究', 'Deep Research'], menuLabels: ['深度研究', 'Deep research'] },
+    'web-search': { label: 'Web Search', labels: ['网页搜索', '搜索', 'Web Search', 'Search'], menuLabels: ['网页搜索', 'Web search'] },
 };
+const CHATGPT_PLUS_BUTTON_LABELS = ['添加文件等内容', 'Add files and more', 'Add files & more'];
 export const CHATGPT_TOOL_CHOICES = Object.keys(CHATGPT_TOOL_OPTIONS);
 
 // Selectors
@@ -291,12 +295,19 @@ export async function isOnChatGPT(page) {
 // wait succeeds as soon as any composer flavour mounts (querySelectorAll
 // matches all of them). Tracks the most stable subset of COMPOSER_SELECTORS;
 // we only need to know "the composer is ready", not which variant rendered.
-const COMPOSER_WAIT_SELECTOR = '#prompt-textarea, [data-testid="prompt-textarea"]';
+// Newer chatgpt.com builds dropped #prompt-textarea; the ProseMirror composer is
+// a plain contenteditable textbox, so it has to be part of the wait selector.
+const COMPOSER_WAIT_SELECTOR = '#prompt-textarea, [data-testid="prompt-textarea"], [contenteditable="true"][role="textbox"]';
 const CONVERSATION_LINK_SELECTOR = 'a[href*="/c/"]';
 const PROJECT_LINK_SELECTOR = 'a[href*="/g/g-p-"]';
 // Selector used by detail.js to wait for at least one rendered message bubble
 // after navigating to /c/<id>; mirrors the markup queried by getVisibleMessages.
-export const CONVERSATION_MESSAGE_SELECTOR = '[data-message-author-role], article[data-testid*="conversation-turn"]';
+// Legacy markup: [data-message-author-role] / article conversation-turn.
+// 2026 markup: user bubble = [data-user-message-bubble], assistant message =
+// [data-chatgpt-selection-message-id] (no article, no data-message-author-role).
+const USER_BUBBLE_SELECTOR = '[data-user-message-bubble]';
+const ASSISTANT_MESSAGE_SELECTOR = '[data-chatgpt-selection-message-id]';
+export const CONVERSATION_MESSAGE_SELECTOR = `[data-message-author-role], article[data-testid*="conversation-turn"], ${USER_BUBBLE_SELECTOR}, ${ASSISTANT_MESSAGE_SELECTOR}`;
 
 export async function ensureOnChatGPT(page) {
     if (await isOnChatGPT(page)) return false;
@@ -819,6 +830,131 @@ export async function getCurrentChatGPTTool(page) {
     })()`)), 'chatgpt current tool');
 }
 
+// Finds the composer "+" button and opens the tools menu. mode 'dom' clicks from
+// inside the page; mode 'native' returns coordinates for a CDP mouse click. Dedicated
+// windows can silently drop CDP mouse events, so the DOM click goes first.
+async function openChatGPTToolsMenu(page, mode) {
+    const opened = requireObjectEvaluateResult(unwrapEvaluateResult(await page.evaluate(`(() => {
+        const isVisible = (el) => {
+            if (!(el instanceof HTMLElement)) return false;
+            const style = window.getComputedStyle(el);
+            if (style.display === 'none' || style.visibility === 'hidden') return false;
+            const rect = el.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+        };
+        const menuRootSelector = '[data-composer-overlay-floating-ui], [role="menu"], [role="listbox"], [data-radix-popper-content-wrapper], [data-radix-menu-content]';
+        const menuOpen = Array.from(document.querySelectorAll(menuRootSelector))
+            .some((node) => node instanceof HTMLElement && isVisible(node) && !node.closest('nav, aside, header'));
+        if (menuOpen) return { found: true, alreadyOpen: true };
+        const plusLabels = ${JSON.stringify(CHATGPT_PLUS_BUTTON_LABELS)};
+        const form = Array.from(document.querySelectorAll('form')).find((node) => node instanceof HTMLElement && isVisible(node));
+        const scopes = form ? [form, document] : [document];
+        let button = null;
+        for (const scope of scopes) {
+            button = Array.from(scope.querySelectorAll('button[data-testid="composer-plus-btn"], button[aria-label]'))
+                .find((node) => isVisible(node)
+                    && (node.getAttribute('data-testid') === 'composer-plus-btn' || plusLabels.includes(node.getAttribute('aria-label') || '')));
+            if (button) break;
+        }
+        if (!(button instanceof HTMLElement)) return { found: false };
+        button.scrollIntoView({ block: 'center', inline: 'center' });
+        if (${JSON.stringify(mode)} === 'dom') {
+            button.click();
+            return { found: true, clicked: true };
+        }
+        const rect = button.getBoundingClientRect();
+        return {
+            found: true,
+            x: Math.round(rect.left + rect.width / 2),
+            y: Math.round(rect.top + rect.height / 2),
+        };
+    })()`)), 'chatgpt tools menu button');
+    if (!opened.found) {
+        throw new CommandExecutionError('Could not find the ChatGPT tools menu button in the composer.');
+    }
+    if (!opened.alreadyOpen && !opened.clicked) {
+        await page.nativeClick(Number(opened.x), Number(opened.y));
+    }
+    await page.wait(0.5);
+}
+
+// Looks for the requested entry in the open "+" menu. The menu is a floating
+// overlay (no role=menu); entries are <button data-list-navigation-item> whose
+// text is "<title><description>". If the entry is not rendered yet, scroll the
+// menu's scroll container to bring more entries into the DOM.
+async function findChatGPTToolMenuOption(page, target, { mode, attempt }) {
+    return requireObjectEvaluateResult(unwrapEvaluateResult(await page.evaluate(`(() => {
+        const isVisible = (el) => {
+            if (!(el instanceof HTMLElement)) return false;
+            const style = window.getComputedStyle(el);
+            if (style.display === 'none' || style.visibility === 'hidden') return false;
+            const rect = el.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+        };
+        const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+        const labels = ${JSON.stringify(target.menuLabels || target.labels)}.map(normalize);
+        const rootSelector = '[data-composer-overlay-floating-ui], [role="menu"], [role="listbox"], [data-radix-popper-content-wrapper], [data-radix-menu-content]';
+        const roots = Array.from(document.querySelectorAll(rootSelector))
+            .filter((node) => node instanceof HTMLElement && isVisible(node) && !node.closest('nav, aside, header'));
+        if (!roots.length) return { menuOpen: false, found: false };
+        const optionSelector = 'button[data-list-navigation-item], [role="menuitemradio"], [role="menuitem"], [role="option"], button, div[tabindex="0"]';
+        const options = Array.from(new Set(roots.flatMap((root) => Array.from(root.querySelectorAll(optionSelector)))));
+        const option = options.find((node) => {
+            if (!(node instanceof HTMLElement) || !isVisible(node) || node.closest('nav, aside, header')) return false;
+            return [node.textContent, node.getAttribute('aria-label'), node.getAttribute('title')]
+                .map(normalize)
+                .some((text) => text && labels.some((label) => text === label || text.startsWith(label)));
+        });
+        if (!(option instanceof HTMLElement)) {
+            if (${Number(attempt)} >= 2) {
+                for (const root of roots) {
+                    const scroller = [root, ...root.querySelectorAll('*')].find((node) => node instanceof HTMLElement
+                        && node.scrollHeight > node.clientHeight + 4
+                        && /(auto|scroll)/.test(window.getComputedStyle(node).overflowY));
+                    if (scroller) scroller.scrollTop += Math.max(120, Math.floor(scroller.clientHeight * 0.8));
+                }
+            }
+            return { menuOpen: true, found: false, optionCount: options.length };
+        }
+        const checked = option.getAttribute('aria-checked') === 'true' || option.getAttribute('aria-selected') === 'true';
+        option.scrollIntoView({ block: 'center', inline: 'center' });
+        if (${JSON.stringify(mode)} === 'dom' && !checked) {
+            option.click();
+            return { menuOpen: true, found: true, checked, clicked: true };
+        }
+        const rect = option.getBoundingClientRect();
+        return {
+            menuOpen: true,
+            found: true,
+            checked,
+            x: Math.round(rect.left + rect.width / 2),
+            y: Math.round(rect.top + rect.height / 2),
+        };
+    })()`)), 'chatgpt tool option click');
+}
+
+async function trySelectChatGPTTool(page, target, mode) {
+    await openChatGPTToolsMenu(page, mode);
+    let option = null;
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+        option = await findChatGPTToolMenuOption(page, target, { mode, attempt });
+        if (option.found) break;
+        await page.wait(0.5);
+    }
+    if (!option?.found) {
+        throw new CommandExecutionError(`Could not find the ChatGPT ${target.label} tool option.`);
+    }
+    if (!option.checked && !option.clicked) {
+        await page.nativeClick(Number(option.x), Number(option.y));
+    }
+    await page.wait(0.5);
+    const after = await getCurrentChatGPTTool(page);
+    if (after.tool !== target.key) {
+        throw new CommandExecutionError(`ChatGPT tool did not switch to ${target.label}.`);
+    }
+    return { Status: option.checked ? 'Already selected' : 'Success', Tool: target.label };
+}
+
 export async function selectChatGPTTool(page, tool) {
     const target = requireKnownChatGPTTool(tool);
     if (typeof page.nativeClick !== 'function') {
@@ -832,101 +968,19 @@ export async function selectChatGPTTool(page, tool) {
         return { Status: 'Already selected', Tool: target.label };
     }
 
-    const menuButton = requireObjectEvaluateResult(unwrapEvaluateResult(await page.evaluate(`(() => {
-        const isVisible = (el) => {
-            if (!(el instanceof HTMLElement)) return false;
-            const style = window.getComputedStyle(el);
-            if (style.display === 'none' || style.visibility === 'hidden') return false;
-            const rect = el.getBoundingClientRect();
-            return rect.width > 0 && rect.height > 0;
-        };
-        const button = document.querySelector('button[data-testid="composer-plus-btn"]');
-        if (!(button instanceof HTMLElement) || !isVisible(button)) return { found: false };
-        button.scrollIntoView({ block: 'center', inline: 'center' });
-        const rect = button.getBoundingClientRect();
-        return {
-            found: true,
-            x: Math.round(rect.left + rect.width / 2),
-            y: Math.round(rect.top + rect.height / 2),
-        };
-    })()`)), 'chatgpt tools menu button');
-    if (!menuButton.found) {
-        throw new CommandExecutionError('Could not find the ChatGPT tools menu button in the composer.');
+    let lastError = null;
+    for (const mode of ['dom', 'native']) {
+        try {
+            return await trySelectChatGPTTool(page, target, mode);
+        } catch (error) {
+            lastError = error;
+            const current = await getCurrentChatGPTTool(page).catch(() => null);
+            if (current?.tool === target.key) {
+                return { Status: 'Success', Tool: target.label };
+            }
+        }
     }
-    await page.nativeClick(Number(menuButton.x), Number(menuButton.y));
-    await page.wait(0.5);
-
-    let optionCenter = null;
-    for (let attempt = 0; attempt < 10; attempt += 1) {
-        optionCenter = requireObjectEvaluateResult(unwrapEvaluateResult(await page.evaluate(`(() => {
-            const isVisible = (el) => {
-                if (!(el instanceof HTMLElement)) return false;
-                const style = window.getComputedStyle(el);
-                if (style.display === 'none' || style.visibility === 'hidden') return false;
-                const rect = el.getBoundingClientRect();
-                return rect.width > 0 && rect.height > 0;
-            };
-            const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
-            const compact = (value) => normalize(value).toLowerCase().replace(/[^\\p{L}\\p{N}]+/gu, '');
-            const labels = ${JSON.stringify(target.labels)};
-            const optionSelector = '[role="menuitemradio"], [role="menuitem"], [role="option"], button, div[tabindex="0"]';
-            const matchesLabel = (value) => {
-                const normalized = normalize(value).toLowerCase();
-                const compacted = compact(value);
-                if (!normalized && !compacted) return false;
-                return labels.some((label) => {
-                    const normalizedLabel = normalize(label).toLowerCase();
-                    const compactedLabel = compact(label);
-                    return normalized === normalizedLabel
-                        || normalized.includes(normalizedLabel)
-                        || (compactedLabel && compacted.includes(compactedLabel));
-                });
-            };
-            const rootSelector = '[role="menu"], [role="listbox"], [data-radix-popper-content-wrapper], [data-radix-menu-content], [data-testid*="menu"], [data-testid*="popover"]';
-            const visibleRoots = Array.from(document.querySelectorAll(rootSelector))
-                .filter((node) => node instanceof HTMLElement && isVisible(node) && !node.closest('nav, aside'));
-            const searchRoots = visibleRoots.length ? visibleRoots : [document];
-            const options = Array.from(new Set(searchRoots.flatMap((root) => {
-                const matchesRoot = root instanceof HTMLElement && root.matches(optionSelector) ? [root] : [];
-                return matchesRoot.concat(Array.from(root.querySelectorAll(optionSelector)));
-            })));
-            const option = options.find((node) => {
-                if (!(node instanceof HTMLElement) || !isVisible(node) || node.closest('nav, aside')) return false;
-                const haystacks = [
-                    node.textContent,
-                    node.getAttribute('aria-label'),
-                    node.getAttribute('title'),
-                    node.getAttribute('data-testid'),
-                ];
-                return haystacks.some(matchesLabel);
-            });
-            if (!(option instanceof HTMLElement)) return { found: false };
-            const checked = option.getAttribute('aria-checked') === 'true' || option.getAttribute('aria-selected') === 'true';
-            option.scrollIntoView({ block: 'center', inline: 'center' });
-            const rect = option.getBoundingClientRect();
-            return {
-                found: true,
-                checked,
-                x: Math.round(rect.left + rect.width / 2),
-                y: Math.round(rect.top + rect.height / 2),
-            };
-        })()`)), 'chatgpt tool option click');
-        if (optionCenter.found) break;
-        await page.wait(0.5);
-    }
-    if (!optionCenter?.found) {
-        throw new CommandExecutionError(`Could not find the ChatGPT ${target.label} tool option.`);
-    }
-    if (!optionCenter.checked) {
-        await page.nativeClick(Number(optionCenter.x), Number(optionCenter.y));
-    }
-
-    await page.wait(0.5);
-    const after = await getCurrentChatGPTTool(page);
-    if (after.tool !== target.key) {
-        throw new CommandExecutionError(`ChatGPT tool did not switch to ${target.label}.`);
-    }
-    return { Status: optionCenter.checked ? 'Already selected' : 'Success', Tool: target.label };
+    throw lastError;
 }
 
 export async function clearChatGPTDraft(page) {
@@ -1197,6 +1251,8 @@ export async function getVisibleMessages(page, { textOnly = false } = {}) {
         };
         const normalize = (value) => String(value || '').replace(/\\u00a0/g, ' ').replace(/[ \\t]+\\n/g, '\\n').replace(/\\n{3,}/g, '\\n\\n').trim();
         const roleOf = (node) => {
+            if (node.hasAttribute('data-user-message-bubble')) return 'User';
+            if (node.hasAttribute('data-chatgpt-selection-message-id')) return 'Assistant';
             const attr = node.getAttribute('data-message-author-role') || node.getAttribute('data-author') || '';
             if (/assistant/i.test(attr)) return 'Assistant';
             if (/user/i.test(attr)) return 'User';
@@ -1209,8 +1265,39 @@ export async function getVisibleMessages(page, { textOnly = false } = {}) {
             return '';
         };
 
-        let nodes = Array.from(document.querySelectorAll('[data-message-author-role], article[data-testid*="conversation-turn"]'));
+        let nodes = Array.from(document.querySelectorAll(${JSON.stringify(CONVERSATION_MESSAGE_SELECTOR)}));
         nodes = nodes.filter((node) => node instanceof HTMLElement && isVisible(node));
+
+        // Inline web-search citation chips ("Node.js +1") are rendered inside the
+        // assistant markdown; they are not part of the reply text.
+        const CITATION_SELECTOR = 'a[data-testid="chatgpt-citation"]';
+        const readWithoutCitations = (contentNode, wantHtml) => {
+            const chips = Array.from(contentNode.querySelectorAll(CITATION_SELECTOR));
+            if (!wantHtml) {
+                // Poll-loop path: textContent only, no layout. Drop the chips on a
+                // detached clone so the live page is never touched.
+                if (!chips.length) return { text: contentNode.textContent || '', html: '' };
+                const clone = contentNode.cloneNode(true);
+                clone.querySelectorAll(CITATION_SELECTOR).forEach((chip) => chip.remove());
+                return { text: clone.textContent || '', html: '' };
+            }
+            if (!chips.length) {
+                return { text: contentNode.innerText || contentNode.textContent || '', html: contentNode.innerHTML || '' };
+            }
+            // Hide the chips synchronously (no paint in between) so innerText keeps
+            // its block-level line breaks, then restore the page exactly as it was.
+            const saved = chips.map((chip) => chip.style.display);
+            chips.forEach((chip) => { chip.style.display = 'none'; });
+            let text = '';
+            try {
+                text = contentNode.innerText || contentNode.textContent || '';
+            } finally {
+                chips.forEach((chip, i) => { chip.style.display = saved[i]; });
+            }
+            const clone = contentNode.cloneNode(true);
+            clone.querySelectorAll(CITATION_SELECTOR).forEach((chip) => chip.remove());
+            return { text, html: clone.innerHTML || '' };
+        };
 
         const rows = [];
         const seen = new Set();
@@ -1222,13 +1309,14 @@ export async function getVisibleMessages(page, { textOnly = false } = {}) {
 
             const contentNode = node.querySelector('[data-message-author-role] .markdown')
                 || node.querySelector('.markdown')
+                || node.querySelector('[data-markdown-text-style="assistant-message"]')
                 || node.querySelector('[data-message-author-role]')
                 || node;
-            const html = includeHtml && contentNode instanceof HTMLElement ? (contentNode.innerHTML || '') : '';
-            const rawText = contentNode instanceof HTMLElement
-                ? (includeHtml ? (contentNode.innerText || contentNode.textContent || '') : (contentNode.textContent || ''))
-                : '';
-            const text = normalize(rawText);
+            const read = contentNode instanceof HTMLElement
+                ? readWithoutCitations(contentNode, includeHtml)
+                : { text: '', html: '' };
+            const html = includeHtml ? read.html : '';
+            const text = normalize(read.text);
             if (!text) continue;
             const key = role + '\\n' + text;
             if (seen.has(key)) continue;
@@ -1698,7 +1786,9 @@ async function fetchChatGPTConversationPayload(page, conversationId) {
                     };
                 }
                 errors.push('node fetch returned non-json');
-            } else if (response.status === 401 || response.status === 403) {
+            } else if (response.status === 401 || response.status === 403 || response.status === 404) {
+                // chatgpt.com answers 404 (not 401) to a cookie-only conversation fetch;
+                // the Bearer access token from /api/auth/session is what actually works.
                 errors.push(`node cookie fetch status ${response.status}`);
                 const bearerAuth = await buildChatGPTConversationHeaders(page, { includeAuthorization: true });
                 if (bearerAuth.ok) {
@@ -1738,10 +1828,22 @@ async function fetchChatGPTConversationPayload(page, conversationId) {
     }
 
     const result = unwrapEvaluateResult(await withTimeout(page.evaluate(`(async () => {
-        const response = await fetch('/backend-api/conversation/${conversationId}', {
+        const first = await fetch('/backend-api/conversation/${conversationId}', {
             credentials: 'include',
             headers: { accept: 'application/json' },
         });
+        let response = first;
+        if (!first.ok) {
+            // Same-origin cookie-only reads can 404; retry with the session access token.
+            const session = await fetch('/api/auth/session', { credentials: 'include' });
+            const accessToken = session.ok ? (await session.json())?.accessToken : '';
+            if (accessToken) {
+                response = await fetch('/backend-api/conversation/${conversationId}', {
+                    credentials: 'include',
+                    headers: { accept: 'application/json', authorization: 'Bearer ' + accessToken },
+                });
+            }
+        }
         const text = await response.text();
         return {
             ok: response.ok,
@@ -1756,6 +1858,130 @@ async function fetchChatGPTConversationPayload(page, conversationId) {
     const payload = parseJsonMaybe(result.text);
     if (!payload) return { error: [...errors, 'page fetch returned non-json'].join('; ') };
     return { payload, status: result.status, contentType: result.contentType, transport: 'page-fetch' };
+}
+
+// ChatGPT wraps inline citation markers in private-use characters (U+E200..U+E2FF),
+// e.g. "citeturn0search1". They never belong in returned text.
+const CITATION_MARKER_RE = /[-]/g;
+
+function normalizeCitedUrl(value) {
+    const raw = String(value || '').trim();
+    if (!raw) return '';
+    try {
+        const url = new URL(raw);
+        if (url.searchParams.get('utm_source') === 'chatgpt.com') {
+            url.searchParams.delete('utm_source');
+        }
+        return url.toString();
+    } catch {
+        return raw;
+    }
+}
+
+/**
+ * Pull the web sources of the latest turn out of a /backend-api/conversation payload.
+ * `sources` are the pages the final answer cites (content_references); `searchedCount`
+ * is how many search hits the model looked at for that turn. `finished` tells the
+ * caller whether the final assistant message is complete in the payload yet.
+ */
+export function extractChatGPTSourcesFromPayload(payload) {
+    const mapping = payload && typeof payload === 'object' ? payload.mapping : null;
+    if (!mapping || typeof mapping !== 'object') {
+        return { sources: [], searchedCount: 0, finished: false, model: '' };
+    }
+    // Walk the active branch (current_node -> root) so regenerated/edited branches
+    // and earlier turns of a continued conversation do not leak into this turn.
+    const chain = [];
+    const visited = new Set();
+    let nodeId = payload.current_node;
+    while (nodeId && mapping[nodeId] && !visited.has(nodeId)) {
+        visited.add(nodeId);
+        chain.unshift(mapping[nodeId]);
+        nodeId = mapping[nodeId].parent;
+    }
+    const messages = (chain.length ? chain : Object.values(mapping))
+        .map((node) => node?.message)
+        .filter(Boolean);
+    let lastUser = -1;
+    messages.forEach((message, index) => {
+        if (message?.author?.role === 'user') lastUser = index;
+    });
+    const turn = messages.slice(lastUser + 1);
+    const finals = turn.filter((message) => message?.author?.role === 'assistant'
+        && message?.content?.content_type === 'text'
+        && Array.isArray(message.content.parts)
+        && message.content.parts.join('').replace(CITATION_MARKER_RE, '').trim());
+    const final = finals[finals.length - 1] || null;
+    const entries = turn
+        .flatMap((message) => message?.metadata?.search_result_groups || [])
+        .flatMap((group) => group?.entries || []);
+    const sources = [];
+    const seen = new Set();
+    const addSource = (title, url) => {
+        const normalized = normalizeCitedUrl(url);
+        if (!normalized || seen.has(normalized)) return;
+        seen.add(normalized);
+        sources.push({ title: String(title || '').trim(), url: normalized });
+    };
+    for (const ref of final?.metadata?.content_references || []) {
+        for (const match of String(ref?.matched_text || '').matchAll(/turn\d+([a-z]+)(\d+)/g)) {
+            const entry = entries.find((candidate) => candidate?.ref_id?.ref_type === match[1]
+                && String(candidate?.ref_id?.ref_index) === match[2]);
+            if (entry) addSource(entry.title, entry.url);
+        }
+        for (const item of [...(ref?.items || []), ...(ref?.sources || [])]) {
+            addSource(item?.title, item?.url);
+        }
+        for (const url of ref?.safe_urls || []) addSource('', url);
+    }
+    // Backfill titles for URLs that were only known from safe_urls.
+    for (const source of sources) {
+        if (source.title) continue;
+        const entry = entries.find((candidate) => normalizeCitedUrl(candidate?.url) === source.url);
+        if (entry?.title) source.title = String(entry.title).trim();
+    }
+    return {
+        sources,
+        searchedCount: entries.length,
+        finished: !!final && final.status === 'finished_successfully' && final.end_turn !== false,
+        model: String(payload.default_model_slug || ''),
+    };
+}
+
+/**
+ * Fetch the conversation payload and return the cited web sources of its latest turn.
+ * Never throws: sources are an add-on to the answer, so a failed fetch is reported
+ * through `error` instead of failing the whole command.
+ */
+export async function getChatGPTConversationSources(page, conversationId, { timeoutSeconds = 20 } = {}) {
+    const deadline = Date.now() + timeoutSeconds * 1000;
+    let last = { sources: [], searchedCount: 0, finished: false, model: '' };
+    let error = '';
+    let failures = 0;
+    do {
+        try {
+            const result = await fetchChatGPTConversationPayload(page, conversationId);
+            if (result?.payload) {
+                error = '';
+                failures = 0;
+                last = extractChatGPTSourcesFromPayload(result.payload);
+                if (last.finished) break;
+            } else {
+                error = result?.error || 'conversation payload unavailable';
+                failures += 1;
+            }
+        } catch (caught) {
+            error = String(caught?.message || caught);
+            failures += 1;
+        }
+        if (failures >= 3 || Date.now() >= deadline) break;
+        await page.sleep(2);
+    } while (Date.now() < deadline);
+    return { ...last, error };
+}
+
+export function stripChatGPTCitationMarkers(text) {
+    return String(text || '').replace(CITATION_MARKER_RE, '');
 }
 
 function collectAxText(tree) {
@@ -2228,7 +2454,20 @@ export async function waitForChatGPTResponse(page, baselineCount, prompt, timeou
 
         if (candidate === lastText) {
             stableCount += 1;
-            if (stableCount >= 2) return candidate;
+            if (stableCount >= 2) {
+                // The poll loop reads textContent (no layout), which glues paragraphs
+                // together. Take one layout-aware read so the returned answer keeps
+                // its line breaks; fall back to the polled text if that read differs
+                // in substance or fails.
+                try {
+                    const settled = await getVisibleMessages(page);
+                    const laidOut = findLatestNewAssistantResponse(settled, prompt, baselinePairCounts);
+                    if (laidOut && laidOut.replace(/\s+/g, '') === candidate.replace(/\s+/g, '')) return laidOut;
+                } catch {
+                    // keep the polled candidate
+                }
+                return candidate;
+            }
         } else {
             lastText = candidate;
             stableCount = 0;
@@ -2481,6 +2720,14 @@ export async function isGenerating(page) {
                 if (label.includes('Stop generating')
                     || label.includes('停止生成')
                     || label.includes('正在思考')) return true;
+            }
+            // 2026 markup: the composer's stop control lost data-testid="stop-button"
+            // and is labelled just "停止" / "Stop" (idle state is the voice button).
+            const composerForm = document.querySelector('form');
+            if (composerForm) {
+                for (const button of composerForm.querySelectorAll('button[aria-label]')) {
+                    if (/^(停止|stop)(?![a-z])/i.test((button.getAttribute('aria-label') || '').trim())) return true;
+                }
             }
             // The "正在思考 / Thinking" pill can render as plain text without an
             // aria-label. Scope the text scan to small containers and use

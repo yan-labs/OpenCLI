@@ -200,7 +200,7 @@ describe('chatgpt conversation navigation', () => {
         await expect(openChatGPTConversation(page, 'https://chatgpt.com/c/abc_123-def?model=gpt-5'))
             .resolves.toBe('abc_123-def');
         expect(page.goto).toHaveBeenCalledWith('https://chatgpt.com/c/abc_123-def', { settleMs: 2000 });
-        expect(page.wait).toHaveBeenCalledWith({ selector: '#prompt-textarea, [data-testid="prompt-textarea"]', timeout: 8 });
+        expect(page.wait).toHaveBeenCalledWith({ selector: '#prompt-textarea, [data-testid="prompt-textarea"], [contenteditable="true"][role="textbox"]', timeout: 8 });
     });
 });
 

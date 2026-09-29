@@ -71,6 +71,8 @@ opencli chatgpt image "a tiny watercolor fox" --sd true
 | `--wait` | For `deep-research-result`, wait until a Deep Research report completes or becomes extractable |
 | `--stable` | For `deep-research-result`, seconds the report text must remain unchanged when waiting (default: `6`) |
 | `--new` | Start a new conversation before `ask` / `send` |
+| `--web-search` | For `ask`, turn on ChatGPT Web Search from the composer `+` menu before sending (the model can also search on its own when the prompt asks it to) |
+| `--deep-research` | For `ask`, turn on ChatGPT Deep Research from the composer `+` menu before sending |
 | `--markdown` | Convert assistant message HTML to Markdown for `read` / `detail` |
 | `--limit` | Max visible history conversations to return (default: `20`) |
 | `--image` | Local image path to attach before prompting; comma-separated paths are supported |
@@ -82,6 +84,8 @@ opencli chatgpt image "a tiny watercolor fox" --sd true
 
 - ChatGPT web commands use persistent site sessions by default, so consecutive `ask` / `send` / `read` / `detail` commands continue in the same ChatGPT tab. Use `--site-session ephemeral` for one-shot isolated tabs.
 - `ask` waits for the first stable assistant response after sending. `send` submits only and returns immediately.
+- `ask` also returns `sources` (the web pages the answer cites, as `{title, url}`) and `searchedCount` (how many search hits the model looked at). They are read from the conversation's `/backend-api/conversation/<id>` payload for the latest turn, so they are filled whether or not `--web-search` was passed; a plain answer has an empty `sources`. Inline citation chips are stripped from `response`, `read` and `detail` text.
+- `--web-search` / `--deep-research` click the composer `+` menu with in-page DOM clicks first and fall back to a native mouse click, because dedicated windows can drop CDP mouse events. The menu entry is matched by its visible title prefix (`网页搜索` / `Web search`, `深度研究` / `Deep research`).
 - `history` reads visible `/c/<id>` links from the ChatGPT sidebar; it does not use private backend APIs.
 - `deep-research-result` opens the requested conversation and extracts completed Deep Research output from that conversation's `/backend-api/conversation/<id>` payload, especially `metadata.chatgpt_sdk.widget_state.report_message`. It does not return a success row when no completed report is present.
 - `model` switches the visible ChatGPT web intelligence level. It recognizes the current English labels (`Fast`, `Balanced`, `Advanced`, `Very High`, `Pro`), legacy labels (`Instant`, `Medium`, `High`, `Extra High`), and Chinese labels (`极速`, `均衡`, `高级`, `超高`, `专业`). Advanced and Pro first try ChatGPT's authenticated backend model preference update, then the adapter falls back to the visible picker for UI-only levels. If labels are localized differently, it only falls back to option order after confirming the guarded five-option ChatGPT intelligence picker structure.
