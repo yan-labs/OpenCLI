@@ -4,6 +4,7 @@ import { log } from '@jackwener/opencli/logger';
 import {
     CHATGPT_DOMAIN,
     CHATGPT_URL,
+    clearChatGPTStaleToolChips,
     currentChatGPTUrl,
     ensureChatGPTComposer,
     ensureOnChatGPT,
@@ -100,7 +101,12 @@ export const askCommand = cli({
         // startNewChat / ensureOnChatGPT now wait for the composer selector
         // after navigating, so the previous standalone 2 s settle is redundant.
         await ensureChatGPTComposer(page, 'ChatGPT ask requires a logged-in ChatGPT session with a visible composer.');
-        const selectedTool = tool ? await selectChatGPTTool(page, tool) : null;
+        let selectedTool = null;
+        if (tool) {
+            selectedTool = await selectChatGPTTool(page, tool);
+        } else {
+            await clearChatGPTStaleToolChips(page);
+        }
 
         const settleStart = Date.now();
         while (await isGenerating(page)) {
