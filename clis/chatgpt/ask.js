@@ -1,11 +1,13 @@
 import { cli, Strategy } from '@jackwener/opencli/registry';
 import { ArgumentError, CommandExecutionError } from '@jackwener/opencli/errors';
+import { log } from '@jackwener/opencli/logger';
 import {
     CHATGPT_DOMAIN,
     CHATGPT_URL,
     currentChatGPTUrl,
     ensureChatGPTComposer,
     ensureOnChatGPT,
+    getChatGPTConversationSources,
     getChatGPTResponsePairCounts,
     getVisibleMessages,
     normalizeBooleanFlag,
@@ -39,7 +41,7 @@ export const askCommand = cli({
     site: 'chatgpt',
     name: 'ask',
     access: 'write',
-    description: 'Send a prompt to ChatGPT web and wait for the response',
+    description: 'Send a prompt to ChatGPT web and wait for the response; sources lists the web pages the answer cites',
     domain: CHATGPT_DOMAIN,
     strategy: Strategy.COOKIE,
     browser: true,
@@ -53,9 +55,9 @@ export const askCommand = cli({
         { name: 'project', valueRequired: true, help: 'Start a new chat inside a ChatGPT project ID or /g/g-p-<id> URL' },
         { name: 'wait', type: 'boolean', default: true, help: 'Wait for the assistant response after sending' },
         { name: 'deep-research', type: 'boolean', default: false, help: 'Enable ChatGPT 深度研究 (Deep Research)' },
-        { name: 'web-search', type: 'boolean', default: false, help: 'Enable ChatGPT 网页搜索 (Web Search)' },
+        { name: 'web-search', type: 'boolean', default: false, help: 'Turn on ChatGPT 网页搜索 (Web Search) from the composer + menu before sending. The model can also search on its own when the prompt asks it to' },
     ],
-    columns: ['conversationId', 'conversationUrl', 'tool', 'response'],
+    columns: ['conversationId', 'conversationUrl', 'tool', 'response', 'sources', 'searchedCount'],
     func: async (page, kwargs) => {
         const prompt = requireNonEmptyPrompt(kwargs.prompt, 'chatgpt ask');
         const timeout = requirePositiveInt(
@@ -118,12 +120,24 @@ export const askCommand = cli({
 
         const { conversationId, conversationUrl } = await waitForConversationUrl(page);
         if (!shouldWait) {
-            return [{ conversationId, conversationUrl, tool: selectedTool?.Tool ?? '', response: '' }];
+            return [{ conversationId, conversationUrl, tool: selectedTool?.Tool ?? '', response: '', sources: [], searchedCount: 0 }];
         }
         const response = await waitForChatGPTResponse(page, baseline, prompt, timeout, {
             baselinePairCounts,
             conversationUrl,
         });
-        return [{ conversationId, conversationUrl, tool: selectedTool?.Tool ?? '', response }];
+        // Cited web pages live in the conversation payload, not in the DOM text.
+        const found = await getChatGPTConversationSources(page, conversationId);
+        if (found.error && !found.finished) {
+            log.warn(`ChatGPT sources unavailable for ${conversationId}: ${found.error}`);
+        }
+        return [{
+            conversationId,
+            conversationUrl,
+            tool: selectedTool?.Tool ?? '',
+            response,
+            sources: found.sources,
+            searchedCount: found.searchedCount,
+        }];
     },
 });

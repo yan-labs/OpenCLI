@@ -86,7 +86,7 @@ describe('chatgpt browser command registration', () => {
             expect.objectContaining({ name: 'deep-research', type: 'boolean', default: false }),
             expect.objectContaining({ name: 'web-search', type: 'boolean', default: false }),
         ]));
-        expect(ask.columns).toEqual(['conversationId', 'conversationUrl', 'tool', 'response']);
+        expect(ask.columns).toEqual(['conversationId', 'conversationUrl', 'tool', 'response', 'sources', 'searchedCount']);
     });
 
     it('registers send conversation and project routing options', () => {

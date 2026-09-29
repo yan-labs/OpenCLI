@@ -6210,7 +6210,7 @@
   {
     "site": "chatgpt",
     "name": "ask",
-    "description": "Send a prompt to ChatGPT web and wait for the response",
+    "description": "Send a prompt to ChatGPT web and wait for the response; sources lists the web pages the answer cites",
     "access": "write",
     "domain": "chatgpt.com",
     "strategy": "cookie",
@@ -6270,14 +6270,16 @@
         "type": "boolean",
         "default": false,
         "required": false,
-        "help": "Enable ChatGPT 网页搜索 (Web Search)"
+        "help": "Turn on ChatGPT 网页搜索 (Web Search) from the composer + menu before sending. The model can also search on its own when the prompt asks it to"
       }
     ],
     "columns": [
       "conversationId",
       "conversationUrl",
       "tool",
-      "response"
+      "response",
+      "sources",
+      "searchedCount"
     ],
     "type": "js",
     "modulePath": "chatgpt/ask.js",
