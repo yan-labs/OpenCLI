@@ -1618,11 +1618,10 @@ const DEDICATED_CELL = { width: 1280, height: 900, offsetX: 80, offsetY: 60 };
 /** Tile a window gets when there is room: the size every scraper's DOM was calibrated against. */
 const DEDICATED_PREFERRED_TILE = { width: 1280, height: 900 };
 /**
- * Smallest tile we will hand out. Below this a report page reflows into its narrow
- * layout and the captured DOM stops being comparable with a single-window run, so
- * the honest answer is "no slot free right now", not a window nobody can read.
+ * Smallest tile we will hand out. This fits ten windows on a 1600x900 display.
  */
-const DEDICATED_MIN_TILE = { width: 900, height: 620 };
+const DEDICATED_MIN_TILE = { width: 400, height: 300 };
+const DEDICATED_POOL_CAPACITY = 10;
 /** Pooled window names. `pool-1`, `pool-2`, … — never a caller's session name. */
 const DEDICATED_POOL_PREFIX = 'pool-';
 /**
@@ -1722,6 +1721,7 @@ function pickDisplay(displays: DisplayInfo[] | null, pattern: string | null): Di
  */
 function dedicatedGrid(area: Rect, count: number): { cols: number; rows: number; width: number; height: number } | null {
   const n = Math.max(1, Math.trunc(count));
+  if (n > DEDICATED_POOL_CAPACITY) return null;
   const cols = Math.min(n, Math.max(1, Math.ceil(Math.sqrt(n))));
   const rows = Math.max(1, Math.ceil(n / cols));
   const width = Math.min(DEDICATED_PREFERRED_TILE.width, Math.floor(area.width / cols));

@@ -2078,7 +2078,8 @@ function dedicatedPlaceholderUrl(slot) {
 }
 const DEDICATED_CELL = { width: 1280, height: 900, offsetX: 80, offsetY: 60 };
 const DEDICATED_PREFERRED_TILE = { width: 1280, height: 900 };
-const DEDICATED_MIN_TILE = { width: 900, height: 620 };
+const DEDICATED_MIN_TILE = { width: 400, height: 300 };
+const DEDICATED_POOL_CAPACITY = 10;
 const DEDICATED_POOL_PREFIX = "pool-";
 const DEDICATED_IDLE_TTL_DEFAULT_MS = 15 * 6e4;
 const DEDICATED_REAP_ALARM = "opencli-dedicated-reap";
@@ -2150,6 +2151,7 @@ function pickDisplay(displays, pattern) {
 }
 function dedicatedGrid(area, count) {
   const n = Math.max(1, Math.trunc(count));
+  if (n > DEDICATED_POOL_CAPACITY) return null;
   const cols = Math.min(n, Math.max(1, Math.ceil(Math.sqrt(n))));
   const rows = Math.max(1, Math.ceil(n / cols));
   const width = Math.min(DEDICATED_PREFERRED_TILE.width, Math.floor(area.width / cols));
