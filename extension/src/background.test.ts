@@ -3943,7 +3943,15 @@ describe('dedicated automation window — pool and layout', () => {
     expect(mod.__test__.dedicatedGrid(area, 1)).toMatchObject({ cols: 1, rows: 1, width: 1280, height: 900 });
     const capacity = mod.__test__.dedicatedCapacity(area);
     expect(capacity).toBeGreaterThanOrEqual(2);
-    expect(mod.__test__.dedicatedGrid(area, capacity + 1)).toBeNull();
+    expect({
+      grid: mod.__test__.dedicatedGrid(area, capacity + 1),
+      first: mod.__test__.dedicatedTile(area, 0, capacity + 1),
+      overflow: mod.__test__.dedicatedTile(area, capacity, capacity + 1),
+    }).toEqual({
+      grid: null,
+      first: mod.__test__.dedicatedTile(area, 0, capacity),
+      overflow: { left: area.left + 80, top: area.top + 60, width: 1280, height: 900 },
+    });
     for (let n = 1; n <= capacity; n += 1) {
       const rects = Array.from({ length: n }, (_, i) => mod.__test__.dedicatedTile(area, i, n));
       expect(rects.every((r: any) => r !== null)).toBe(true);
@@ -3962,10 +3970,10 @@ describe('dedicated automation window — pool and layout', () => {
     const mod = await import('./background');
     const internal = { id: '1', name: '', primary: true, internal: true, bounds: { left: 0, top: 0, width: 1512, height: 982 }, workArea: null };
     const virt = { id: '8', name: '', primary: false, internal: false, bounds: { left: -2560, top: -1440, width: 2560, height: 1440 }, workArea: null };
-    expect(mod.__test__.pickAutomationDisplay([internal, virt])?.id).toBe('8');
+    expect(mod.__test__.pickAutomationDisplays([internal, { ...virt, id: '10' }, { ...virt, id: '9', internal: true }, virt]).map(d => d.id)).toEqual(['8', '10', '9']);
     // Lid closed: the virtual screen is the only one left and inherits `primary`.
-    expect(mod.__test__.pickAutomationDisplay([{ ...virt, primary: true }])?.id).toBe('8');
-    expect(mod.__test__.pickAutomationDisplay([])).toBeNull();
+    expect(mod.__test__.pickAutomationDisplays([{ ...virt, primary: true }]).map(d => d.id)).toEqual(['8']);
+    expect(mod.__test__.pickAutomationDisplays([])).toEqual([]);
   });
 
   it('ten one-shot sessions in a row reuse one window instead of opening ten', async () => {
@@ -4018,11 +4026,11 @@ describe('dedicated automation window — pool and layout', () => {
     expect(h.chrome.windows.create).toHaveBeenCalledTimes(3);
   });
 
-  it('refuses to overlap when the display is full and says so instead of stacking silently', async () => {
+  it('cascades beyond natural capacity and refuses the eleventh live window', async () => {
     const h = dedicatedHarness();
     vi.stubGlobal('chrome', h.chrome);
     const mod = await import('./background');
-    const capacity = mod.__test__.dedicatedCapacity({ left: -2560, top: -1440, width: 2560, height: 1440 });
+    const capacity = 10;
     for (let i = 0; i < capacity; i += 1) {
       const key = browserKey(`full-${i}`);
       useDedicated(mod, key);
@@ -4031,7 +4039,7 @@ describe('dedicated automation window — pool and layout', () => {
     const overflow = browserKey('overflow');
     useDedicated(mod, overflow);
     await expect(mod.__test__.resolveTabId(undefined, overflow, 'https://overflow.example/'))
-      .rejects.toThrow(/dedicated-pool-exhausted/);
+      .rejects.toThrow(/dedicated-pool-exhausted: 10 .*capacity 10.*naturalCapacity.*cascaded/);
     expect(h.chrome.windows.create).toHaveBeenCalledTimes(capacity);
     // The failed command holds nothing: its would-be slot is idle, so it is reusable
     // and reapable instead of pinning a window nobody owns.
@@ -4092,8 +4100,8 @@ describe('dedicated automation window — pool and layout', () => {
     await mod.__test__.resolveTabId(undefined, key, 'https://status.example/');
     const res = await mod.__test__.handleDedicatedWindowOp({ id: '1', action: 'sessions', op: 'window-list' });
     expect(res.data.capabilities).toEqual(expect.arrayContaining(['window-pool', 'window-close', 'window-list', 'idle-reap', 'auto-display', 'dynamic-layout']));
-    expect(res.data.pool).toMatchObject({ live: 1, idle: 0 });
-    expect(res.data.pool.capacity).toBeGreaterThanOrEqual(2);
+    expect(res.data.pool).toMatchObject({ live: 1, idle: 0, free: 9, naturalCapacity: res.data.pool.automationDisplays.reduce((sum: number, d: any) => sum + mod.__test__.dedicatedCapacity(d.area), 0), automationDisplays: [expect.objectContaining({ id: res.data.pool.automationDisplay.id, naturalCapacity: mod.__test__.dedicatedCapacity(res.data.pool.automationDisplay.area) })] });
+    expect(res.data.pool.capacity).toBe(10);
     expect(res.data.pool.automationDisplay.primary).toBe(false);
     expect(res.data.windows[0]).toMatchObject({ pooled: true, busy: true, holders: 1 });
   });
