@@ -1620,9 +1620,10 @@ const DEDICATED_PREFERRED_TILE = { width: 1280, height: 900 };
 /**
  * Smallest tile we will hand out. Below this a report page reflows into its narrow
  * layout and the captured DOM stops being comparable with a single-window run, so
- * the honest answer is "no slot free right now", not a window nobody can read.
+ * additional windows use preferred-size cascades instead of smaller grid tiles.
  */
 const DEDICATED_MIN_TILE = { width: 900, height: 620 };
+const DEDICATED_POOL_MAX = 10;
 /** Pooled window names. `pool-1`, `pool-2`, … — never a caller's session name. */
 const DEDICATED_POOL_PREFIX = 'pool-';
 /**
@@ -1712,13 +1713,13 @@ function pickDisplay(displays: DisplayInfo[] | null, pattern: string | null): Di
 /**
  * Grid for `count` windows on one display. Chrome reports a window whose pixels are
  * fully covered by another window as `hidden` whatever its active tab is, so the
- * layout's job is: never overlap. The grid therefore follows the number of windows
+ * grid avoids overlap within the natural capacity. It follows the number of windows
  * actually live right now rather than a fixed cell size — one window gets a full
  * 1280x900, four windows on a 2560x1410 work area get 1280x705 each. Tiles never
  * grow past the preferred size (a scraper reading a 2560-wide viewport would see a
  * different layout than every calibration run) and never shrink past the minimum
  * (same reason, in the other direction) — `null` means this display cannot show
- * that many windows, which is a capacity answer, not a placement.
+ * that many windows without overlap; dedicatedTile then uses a cascade.
  */
 function dedicatedGrid(area: Rect, count: number): { cols: number; rows: number; width: number; height: number } | null {
   const n = Math.max(1, Math.trunc(count));
@@ -1750,16 +1751,21 @@ function dedicatedCellGrid(display: Rect): { width: number; height: number; cols
   return { width, height, cols, rows, offsetX, offsetY };
 }
 
-/**
- * Rectangle of tile `cell` on a display: a grid of non-overlapping 1280x900 cells
- * (clipped to the display). Non-overlap matters — a window fully covered by
- * another one is occluded, and occluded windows report `hidden`. Cells beyond the
- * grid wrap around (and then do overlap); `sessions`/`window status` show the cell.
- */
-/** Rectangle of tile `index` when `count` windows share the display. */
-function dedicatedTile(area: Rect, index: number, count: number): Rect | null {
-  const grid = dedicatedGrid(area, count);
-  if (!grid) return null;
+/** Grid within natural capacity; additional tiles cascade at the preferred size. */
+function dedicatedTile(area: Rect, index: number, count: number): Rect {
+  const naturalCapacity = dedicatedCapacity(area);
+  const grid = dedicatedGrid(area, Math.min(count, naturalCapacity));
+  if (!grid || index >= naturalCapacity) {
+    const width = Math.min(DEDICATED_PREFERRED_TILE.width, area.width);
+    const height = Math.min(DEDICATED_PREFERRED_TILE.height, area.height);
+    const step = index - naturalCapacity + 1;
+    return {
+      left: area.left + (step * DEDICATED_CELL.offsetX) % (area.width - width + 1),
+      top: area.top + (step * DEDICATED_CELL.offsetY) % (area.height - height + 1),
+      width,
+      height,
+    };
+  }
   const capacity = grid.cols * grid.rows;
   const i = ((Math.trunc(index) % capacity) + capacity) % capacity;
   const col = i % grid.cols;
@@ -1774,18 +1780,32 @@ function dedicatedTile(area: Rect, index: number, count: number): Rect | null {
   };
 }
 
-/**
- * The display OpenCLI puts its windows on when nobody named one: a secondary screen
- * if there is one (an external or virtual display is where automation belongs —
- * nobody is looking at it), preferring one the OS does not call internal. With a
- * single screen there is no choice to make; the window still never takes focus.
- */
-function pickAutomationDisplay(displays: DisplayInfo[] | null): DisplayInfo | null {
+/** All secondary screens, external first; only fall back when no secondary exists. */
+function pickAutomationDisplays(displays: DisplayInfo[] | null): DisplayInfo[] {
   const usable = (displays ?? []).filter(d => d.bounds.width > 0 && d.bounds.height > 0);
-  if (!usable.length) return null;
-  const secondary = usable.filter(d => !d.primary);
-  const external = secondary.find(d => d.internal === false);
-  return external ?? secondary[0] ?? usable[0];
+  const secondary = usable.filter(d => !d.primary)
+    .sort((a, b) => Number(a.internal) - Number(b.internal) || a.id.localeCompare(b.id, undefined, { numeric: true }));
+  return secondary.length ? secondary : usable.slice(0, 1);
+}
+
+function pickAutomationDisplay(displays: DisplayInfo[] | null): DisplayInfo | null {
+  return pickAutomationDisplays(displays)[0] ?? null;
+}
+
+/** Fill each screen's natural grid in order; overflow cascades on the last screen. */
+function dedicatedAutomationTile(displays: DisplayInfo[], index: number, count: number): { display: DisplayInfo; target: Rect } {
+  let offset = 0;
+  for (let i = 0; i < displays.length; i += 1) {
+    const display = displays[i];
+    const area = displayArea(display);
+    const capacity = dedicatedCapacity(area);
+    if (index < offset + capacity || i === displays.length - 1) {
+      const localCount = i === displays.length - 1 ? count - offset : Math.min(count - offset, capacity);
+      return { display, target: dedicatedTile(area, index - offset, localCount) };
+    }
+    offset += capacity;
+  }
+  throw new Error('No automation display');
 }
 
 function displayArea(display: DisplayInfo): Rect {
@@ -1816,9 +1836,8 @@ function claimTileIndex(state: DedicatedSlotState): number {
  * and a move never passes `focused` — re-tiling must not raise anything.
  */
 async function retileDedicatedWindows(displays: DisplayInfo[] | null): Promise<void> {
-  const display = pickAutomationDisplay(displays);
-  if (!display) return;
-  const area = displayArea(display);
+  const automationDisplays = pickAutomationDisplays(displays);
+  if (!automationDisplays.length) return;
   const auto = liveDedicatedStates().filter(state => state.placement.source === 'auto');
   if (!auto.length) return;
   const count = auto.length;
@@ -1826,7 +1845,7 @@ async function retileDedicatedWindows(displays: DisplayInfo[] | null): Promise<v
   if (typeof updateWindow !== 'function') return;
   for (let i = 0; i < auto.length; i += 1) {
     const state = auto[i];
-    const target = dedicatedTile(area, i, count);
+    const { display, target } = dedicatedAutomationTile(automationDisplays, i, count);
     if (!target || state.windowId === null) continue;
     state.tileIndex = i;
     state.placement.requestedBounds = target;
@@ -1852,24 +1871,18 @@ async function retileDedicatedWindows(displays: DisplayInfo[] | null): Promise<v
   }
 }
 
-/**
- * Refuse to open a window the display cannot show without overlapping another one.
- * The old behaviour here was to wrap around and stack a new window exactly on top of
- * an existing one, which Chrome then reported as `hidden` while `window status` still
- * claimed `onDisplay: true` — silent, and the caller only found out by getting a page
- * that never rendered. A thrown, named error is the honest form of the same fact:
- * there is no free slot right now, wait and retry.
- */
+/** Enforce the pool limit; windows beyond natural capacity are cascaded. */
 async function assertDedicatedCapacity(state: DedicatedSlotState): Promise<void> {
   if (state.windowId !== null) return;
   const { displays } = await listDisplays();
-  const display = pickAutomationDisplay(displays);
-  if (!display) return; // No display info: Chrome places it, nothing to ration.
-  const capacity = dedicatedCapacity(displayArea(display));
+  const automationDisplays = pickAutomationDisplays(displays);
+  const display = automationDisplays[0];
+  const naturalCapacity = automationDisplays.length ? automationDisplays.reduce((sum, d) => sum + dedicatedCapacity(displayArea(d)), 0) : null;
+  const capacity = DEDICATED_POOL_MAX;
   const live = liveDedicatedStates().length;
-  if (capacity > 0 && live >= capacity) {
-    throw new Error(`dedicated-pool-exhausted: ${live} automation window(s) already fill ${display.name || 'the automation display'} `
-      + `(capacity ${capacity} at ${DEDICATED_MIN_TILE.width}x${DEDICATED_MIN_TILE.height} minimum). `
+  if (live >= capacity) {
+    throw new Error(`dedicated-pool-exhausted: ${live} automation window(s) already fill ${display?.name || 'the automation display'} `
+      + `(capacity ${capacity}). Windows beyond naturalCapacity ${naturalCapacity ?? 'unknown'} are cascaded. `
       + 'Wait for a running task to finish, or close one with `opencli browser <session> window close --slot <name>`.');
   }
 }
@@ -2205,15 +2218,14 @@ async function resolveDedicatedTarget(state: DedicatedSlotState, request: Dedica
   // `opencli browser <session> open <url>` land off the person's screen by itself.
   if (placement.source !== 'display' || !placement.displayPattern) {
     const { displays } = await listDisplays();
-    const display = pickAutomationDisplay(displays);
-    if (!display) {
+    const automationDisplays = pickAutomationDisplays(displays);
+    if (!automationDisplays.length) {
       state.placement = { ...emptyDedicatedPlacement(), source: 'auto' };
       return { target: null, area: null };
     }
-    const area = displayArea(display);
-    const others = liveDedicatedStates().filter(s => s.slot !== state.slot).length;
+    const others = liveDedicatedStates().filter(s => s.slot !== state.slot && s.placement.source === 'auto').length;
     const index = claimTileIndex(state);
-    const target = dedicatedTile(area, index, Math.max(others + 1, index + 1));
+    const { display, target } = dedicatedAutomationTile(automationDisplays, index, Math.max(others + 1, index + 1));
     state.placement = {
       source: 'auto',
       requestedBounds: target,
@@ -2310,7 +2322,7 @@ async function ensureDedicatedWindowUnlocked(
       dedicatedTabCreatesInFlight -= 1;
     }
     console.log(`[opencli] Created dedicated window ${state.windowId} (slot=${state.slot}, placement=${state.placement.source}${state.placement.displayName ? `:${state.placement.displayName}#${state.placement.cell}` : ''})`);
-    // One more window means everyone's tile just got smaller: re-tile before returning,
+    // Re-tile or cascade before returning,
     // so the caller never sees a window that is about to move under it.
     if (state.placement.source === 'auto') {
       const { displays } = await listDisplays();
@@ -2836,9 +2848,11 @@ async function handleDedicatedWindowOp(cmd: Command): Promise<Result> {
     if (filter && state.slot !== filter) continue;
     windows.push(await describeDedicatedSlot(state, displays));
   }
-  const automationDisplay = pickAutomationDisplay(displays);
+  const automationDisplays = pickAutomationDisplays(displays);
+  const automationDisplay = automationDisplays[0] ?? null;
   const area = automationDisplay ? displayArea(automationDisplay) : null;
-  const capacity = area ? dedicatedCapacity(area) : null;
+  const naturalCapacity = automationDisplays.length ? automationDisplays.reduce((sum, d) => sum + dedicatedCapacity(displayArea(d)), 0) : null;
+  const capacity = DEDICATED_POOL_MAX;
   const live = liveDedicatedStates().length;
   return {
     id: cmd.id,
@@ -2851,12 +2865,14 @@ async function handleDedicatedWindowOp(cmd: Command): Promise<Result> {
       ...(displays === null ? { displaysError: error } : {}),
       pool: {
         // What a caller needs to decide "run now or queue": how many windows the
-        // automation display can show without overlap, how many exist, how many are free.
+        // pool allows, its non-overlapping natural capacity, and how many are free.
         automationDisplay: automationDisplay ? { id: automationDisplay.id, name: automationDisplay.name, primary: automationDisplay.primary, internal: automationDisplay.internal, area } : null,
+        automationDisplays: automationDisplays.map(d => ({ id: d.id, name: d.name, area: displayArea(d), naturalCapacity: dedicatedCapacity(displayArea(d)) })),
         capacity,
+        naturalCapacity,
         live,
         idle: [...dedicatedSlots.values()].filter(s => s.holders.size === 0).length,
-        free: capacity === null ? null : Math.max(0, capacity - live) + [...dedicatedSlots.values()].filter(s => s.holders.size === 0 && s.windowId !== null).length,
+        free: Math.max(0, capacity - live) + [...dedicatedSlots.values()].filter(s => s.holders.size === 0 && s.windowId !== null).length,
         idleTtlMs: dedicatedIdleTtlMs,
       },
       windows,
@@ -4514,6 +4530,7 @@ export const __test__ = {
   dedicatedTile,
   dedicatedCapacity,
   pickAutomationDisplay,
+  pickAutomationDisplays,
   reapIdleDedicatedWindows,
   closeDedicatedWindows,
   setDedicatedIdleTtlMs: (ms: number) => { dedicatedIdleTtlMs = ms; },

@@ -2079,6 +2079,7 @@ function dedicatedPlaceholderUrl(slot) {
 const DEDICATED_CELL = { width: 1280, height: 900, offsetX: 80, offsetY: 60 };
 const DEDICATED_PREFERRED_TILE = { width: 1280, height: 900 };
 const DEDICATED_MIN_TILE = { width: 900, height: 620 };
+const DEDICATED_POOL_MAX = 10;
 const DEDICATED_POOL_PREFIX = "pool-";
 const DEDICATED_IDLE_TTL_DEFAULT_MS = 15 * 6e4;
 const DEDICATED_REAP_ALARM = "opencli-dedicated-reap";
@@ -2175,8 +2176,19 @@ function dedicatedCellGrid(display) {
   return { width, height, cols, rows, offsetX, offsetY };
 }
 function dedicatedTile(area, index, count) {
-  const grid = dedicatedGrid(area, count);
-  if (!grid) return null;
+  const naturalCapacity = dedicatedCapacity(area);
+  const grid = dedicatedGrid(area, Math.min(count, naturalCapacity));
+  if (!grid || index >= naturalCapacity) {
+    const width = Math.min(DEDICATED_PREFERRED_TILE.width, area.width);
+    const height = Math.min(DEDICATED_PREFERRED_TILE.height, area.height);
+    const step = index - naturalCapacity + 1;
+    return {
+      left: area.left + step * DEDICATED_CELL.offsetX % (area.width - width + 1),
+      top: area.top + step * DEDICATED_CELL.offsetY % (area.height - height + 1),
+      width,
+      height
+    };
+  }
   const capacity = grid.cols * grid.rows;
   const i = (Math.trunc(index) % capacity + capacity) % capacity;
   const col = i % grid.cols;
@@ -2190,12 +2202,24 @@ function dedicatedTile(area, index, count) {
     height: grid.height
   };
 }
-function pickAutomationDisplay(displays) {
+function pickAutomationDisplays(displays) {
   const usable = (displays ?? []).filter((d) => d.bounds.width > 0 && d.bounds.height > 0);
-  if (!usable.length) return null;
-  const secondary = usable.filter((d) => !d.primary);
-  const external = secondary.find((d) => d.internal === false);
-  return external ?? secondary[0] ?? usable[0];
+  const secondary = usable.filter((d) => !d.primary).sort((a, b) => Number(a.internal) - Number(b.internal) || a.id.localeCompare(b.id, void 0, { numeric: true }));
+  return secondary.length ? secondary : usable.slice(0, 1);
+}
+function dedicatedAutomationTile(displays, index, count) {
+  let offset = 0;
+  for (let i = 0; i < displays.length; i += 1) {
+    const display = displays[i];
+    const area = displayArea(display);
+    const capacity = dedicatedCapacity(area);
+    if (index < offset + capacity || i === displays.length - 1) {
+      const localCount = i === displays.length - 1 ? count - offset : Math.min(count - offset, capacity);
+      return { display, target: dedicatedTile(area, index - offset, localCount) };
+    }
+    offset += capacity;
+  }
+  throw new Error("No automation display");
 }
 function displayArea(display) {
   return display.workArea && display.workArea.width > 0 && display.workArea.height > 0 ? display.workArea : display.bounds;
@@ -2212,9 +2236,8 @@ function claimTileIndex(state) {
   return index;
 }
 async function retileDedicatedWindows(displays) {
-  const display = pickAutomationDisplay(displays);
-  if (!display) return;
-  const area = displayArea(display);
+  const automationDisplays = pickAutomationDisplays(displays);
+  if (!automationDisplays.length) return;
   const auto = liveDedicatedStates().filter((state) => state.placement.source === "auto");
   if (!auto.length) return;
   const count = auto.length;
@@ -2222,7 +2245,7 @@ async function retileDedicatedWindows(displays) {
   if (typeof updateWindow !== "function") return;
   for (let i = 0; i < auto.length; i += 1) {
     const state = auto[i];
-    const target = dedicatedTile(area, i, count);
+    const { display, target } = dedicatedAutomationTile(automationDisplays, i, count);
     if (!target || state.windowId === null) continue;
     state.tileIndex = i;
     state.placement.requestedBounds = target;
@@ -2249,12 +2272,13 @@ async function retileDedicatedWindows(displays) {
 async function assertDedicatedCapacity(state) {
   if (state.windowId !== null) return;
   const { displays } = await listDisplays();
-  const display = pickAutomationDisplay(displays);
-  if (!display) return;
-  const capacity = dedicatedCapacity(displayArea(display));
+  const automationDisplays = pickAutomationDisplays(displays);
+  const display = automationDisplays[0];
+  const naturalCapacity = automationDisplays.length ? automationDisplays.reduce((sum, d) => sum + dedicatedCapacity(displayArea(d)), 0) : null;
+  const capacity = DEDICATED_POOL_MAX;
   const live = liveDedicatedStates().length;
-  if (capacity > 0 && live >= capacity) {
-    throw new Error(`dedicated-pool-exhausted: ${live} automation window(s) already fill ${display.name || "the automation display"} (capacity ${capacity} at ${DEDICATED_MIN_TILE.width}x${DEDICATED_MIN_TILE.height} minimum). Wait for a running task to finish, or close one with \`opencli browser <session> window close --slot <name>\`.`);
+  if (live >= capacity) {
+    throw new Error(`dedicated-pool-exhausted: ${live} automation window(s) already fill ${display?.name || "the automation display"} (capacity ${capacity}). Windows beyond naturalCapacity ${naturalCapacity ?? "unknown"} are cascaded. Wait for a running task to finish, or close one with \`opencli browser <session> window close --slot <name>\`.`);
   }
 }
 async function reapIdleDedicatedWindows(now = Date.now()) {
@@ -2520,15 +2544,14 @@ async function resolveDedicatedTarget(state, request) {
   }
   if (placement.source !== "display" || !placement.displayPattern) {
     const { displays: displays2 } = await listDisplays();
-    const display2 = pickAutomationDisplay(displays2);
-    if (!display2) {
+    const automationDisplays = pickAutomationDisplays(displays2);
+    if (!automationDisplays.length) {
       state.placement = { ...emptyDedicatedPlacement(), source: "auto" };
       return { target: null, area: null };
     }
-    const area = displayArea(display2);
-    const others = liveDedicatedStates().filter((s) => s.slot !== state.slot).length;
+    const others = liveDedicatedStates().filter((s) => s.slot !== state.slot && s.placement.source === "auto").length;
     const index = claimTileIndex(state);
-    const target = dedicatedTile(area, index, Math.max(others + 1, index + 1));
+    const { display: display2, target } = dedicatedAutomationTile(automationDisplays, index, Math.max(others + 1, index + 1));
     state.placement = {
       source: "auto",
       requestedBounds: target,
@@ -3056,9 +3079,11 @@ async function handleDedicatedWindowOp(cmd) {
     if (filter && state.slot !== filter) continue;
     windows.push(await describeDedicatedSlot(state, displays));
   }
-  const automationDisplay = pickAutomationDisplay(displays);
+  const automationDisplays = pickAutomationDisplays(displays);
+  const automationDisplay = automationDisplays[0] ?? null;
   const area = automationDisplay ? displayArea(automationDisplay) : null;
-  const capacity = area ? dedicatedCapacity(area) : null;
+  const naturalCapacity = automationDisplays.length ? automationDisplays.reduce((sum, d) => sum + dedicatedCapacity(displayArea(d)), 0) : null;
+  const capacity = DEDICATED_POOL_MAX;
   const live = liveDedicatedStates().length;
   return {
     id: cmd.id,
@@ -3071,12 +3096,14 @@ async function handleDedicatedWindowOp(cmd) {
       ...displays === null ? { displaysError: error } : {},
       pool: {
         // What a caller needs to decide "run now or queue": how many windows the
-        // automation display can show without overlap, how many exist, how many are free.
+        // pool allows, its non-overlapping natural capacity, and how many are free.
         automationDisplay: automationDisplay ? { id: automationDisplay.id, name: automationDisplay.name, primary: automationDisplay.primary, internal: automationDisplay.internal, area } : null,
+        automationDisplays: automationDisplays.map((d) => ({ id: d.id, name: d.name, area: displayArea(d), naturalCapacity: dedicatedCapacity(displayArea(d)) })),
         capacity,
+        naturalCapacity,
         live,
         idle: [...dedicatedSlots.values()].filter((s) => s.holders.size === 0).length,
-        free: capacity === null ? null : Math.max(0, capacity - live) + [...dedicatedSlots.values()].filter((s) => s.holders.size === 0 && s.windowId !== null).length,
+        free: Math.max(0, capacity - live) + [...dedicatedSlots.values()].filter((s) => s.holders.size === 0 && s.windowId !== null).length,
         idleTtlMs: dedicatedIdleTtlMs
       },
       windows
