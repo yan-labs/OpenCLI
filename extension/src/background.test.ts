@@ -2595,6 +2595,38 @@ describe('background tab isolation', () => {
     expect(mod.__test__.getSession(key)).toEqual(replacement);
   });
 
+  it.each([
+    ['tabs', false], ['tabs', true], ['navigate', false], ['navigate', true],
+  ] as const)('discards late %s tab creation after reclaim (replacement=%s)', async (action, replace) => {
+    const { chrome, tabs } = createChromeMock();
+    vi.useFakeTimers();
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    mod.__test__.setDefaultWindowMode('background');
+    const key = browserKey('late-create');
+    mod.__test__.setAutomationWindowId(key, 1);
+    if (action === 'navigate') chrome.windows.create.mockResolvedValueOnce({ id: 4 });
+    const blocked = deferred<chrome.tabs.Tab>();
+    chrome.tabs.create.mockReturnValueOnce(blocked.promise);
+    const pending = mod.__test__.handleCommand({
+      id: 'late-create', action, op: 'new', session: 'late-create',
+      url: 'https://late.example', idleTimeout: 1, inflightMaxMs: 2000,
+    });
+    await vi.advanceTimersByTimeAsync(2001);
+    expect(chrome.tabs.create).toHaveBeenCalledTimes(1);
+    expect(mod.__test__.getSession(key)).toBeNull();
+    if (replace) mod.__test__.setAutomationWindowId(key, 2);
+    const replacement = mod.__test__.getSession(key);
+    const lateTab = { id: 99, windowId: 1, url: 'https://late.example', groupId: -1 };
+    tabs.push(lateTab);
+    blocked.resolve(lateTab);
+    const result = await pending;
+    expect(mod.__test__.getSession(key)).toEqual(replacement);
+    expect(chrome.tabs.remove).toHaveBeenCalledWith(99);
+    expect(result.ok).toBe(false);
+    expect(result.errorCode).toBe('command_reclaimed');
+  });
+
   it('respects a command timeout longer than the configured in-flight budget', async () => {
     const { chrome } = createChromeMock();
     vi.useFakeTimers();
