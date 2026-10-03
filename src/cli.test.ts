@@ -1989,6 +1989,16 @@ describe('browser window command', () => {
     foreignTabPolicy: 'evict',
   };
 
+  it('relayout routes to the extension and emits machine-readable old/new positions', async () => {
+    const data = { changed: 1, windows: [{ slot: 'pool-1', windowId: 50, displayId: '20', tileIndex: 0,
+      old: { bounds: { left: 0, top: 0, width: 1440, height: 900 }, state: 'maximized' },
+      new: { bounds: { left: -5120, top: 0, width: 1280, height: 950 }, state: 'normal' }, changed: true }] };
+    mockSendCommand.mockResolvedValueOnce(data);
+    await createProgram('', '').parseAsync(['node', 'opencli', 'browser', 'window', 'relayout', '-f', 'json']);
+    expect(mockSendCommand).toHaveBeenCalledWith('sessions', { op: 'window-relayout' });
+    expect(lastJsonLog()).toMatchObject(data);
+  });
+
   describe('status', () => {
     it('routes to sessions op=window-status and prints the data plus cliVersion (json)', async () => {
       mockSendCommand.mockResolvedValueOnce({

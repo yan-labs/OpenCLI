@@ -3573,7 +3573,7 @@ cli({
    * an error, so that shape — not an exception — is the "too old" signal. A
    * thrown error means the daemon/bridge itself could not be reached.
    */
-  async function sendWindowOp(op: 'window-status' | 'window-ensure' | 'window-list' | 'window-close' | 'runtime-reload', params: Record<string, unknown>): Promise<WindowOpOutcome> {
+  async function sendWindowOp(op: 'window-status' | 'window-ensure' | 'window-list' | 'window-close' | 'window-relayout' | 'runtime-reload', params: Record<string, unknown>): Promise<WindowOpOutcome> {
     try {
       const data = await sendCommand('sessions', { op, ...params } as never);
       if (Array.isArray(data)) return { kind: 'unsupported', reason: 'extension-too-old' };
@@ -3826,6 +3826,39 @@ cli({
           console.log(`Remaining: ${remaining.length > 0 ? remaining.join(', ') : 'none'}`);
         }
         if (closed.length === 0 && skipped.length > 0) process.exitCode = EXIT_CODES.GENERIC_ERROR;
+      } catch (err) {
+        log.error(getErrorMessage(err));
+        process.exitCode = EXIT_CODES.USAGE_ERROR;
+      }
+    });
+
+  browserWindow.command('relayout')
+    .description('Reconcile automatic dedicated windows with their fixed display slots (old → new positions)')
+    .option('-f, --format <fmt>', 'Output format: table (default) or json', 'table')
+    .action(async (opts: { format?: string }) => {
+      try {
+        const outcome = await sendWindowOp('window-relayout', {});
+        if (outcome.kind === 'unsupported') {
+          printUnsupportedWindowOp(outcome);
+          return;
+        }
+        const data = outcome.data as unknown as { windows?: Array<{
+          slot: string; windowId: number; displayId: string | null; tileIndex: number | null;
+          old: { bounds: DedicatedWindowBounds | null; state: string | null };
+          new: { bounds: DedicatedWindowBounds | null; state: string | null };
+          changed: boolean; error?: string;
+        }>; changed?: number };
+        if (opts.format === 'json') {
+          console.log(JSON.stringify({ ...data, cliVersion: PKG_VERSION }, null, 2));
+          return;
+        }
+        const windows = data.windows ?? [];
+        if (!windows.length) console.log('No automatically placed dedicated windows to reconcile.');
+        else renderOutput(windows.map(w => ({
+          slot: w.slot, window: w.windowId, display: w.displayId, tile: w.tileIndex,
+          position: `${formatBoundsForTable(w.old.bounds)} (${w.old.state}) → ${formatBoundsForTable(w.new.bounds)} (${w.new.state})`,
+          result: w.error ?? (w.changed ? 'restored' : 'aligned'),
+        })), { fmt: 'table', columns: ['slot', 'window', 'display', 'tile', 'position', 'result'] });
       } catch (err) {
         log.error(getErrorMessage(err));
         process.exitCode = EXIT_CODES.USAGE_ERROR;

@@ -1613,7 +1613,7 @@ function initialTabIsAvailable(tabId: number | undefined): tabId is number {
 type Rect = { left: number; top: number; width: number; height: number };
 type ForeignTabPolicy = 'evict' | 'tolerate';
 type DedicatedPlacement = {
-  /** `auto` = chosen here (automation display + dynamic tile), the default since the pool landed. */
+  /** `auto` = chosen here (automation display + fixed tile), the default since the pool landed. */
   source: 'bounds' | 'display' | 'auto' | 'none';
   requestedBounds: Rect | null;
   displayPattern: string | null;
@@ -1621,6 +1621,7 @@ type DedicatedPlacement = {
   displayFound: boolean | null;
   cell: number | null;
   excludedDisplayBounds?: Rect | null;
+  /** Diagnostic/warning deduplication only; never used to size automatic tiles. */
   relocatedFrom?: Rect;
 };
 type DedicatedEnsureResult = { windowId: number; initialTabId?: number; created: boolean; moved: boolean };
@@ -1641,8 +1642,10 @@ type DedicatedSlotState = {
   holders: Set<string>;
   /** When the last holder left. null while held. */
   idleSince: number | null;
-  /** Tile index on the automation display; decides where the dynamic layout puts it. */
+  /** Tile index on the automation display; local index within displayId. */
   tileIndex: number | null;
+  displayId: string | null;
+  reconciledAt?: number;
 };
 type DisplayInfo = { id: string; name: string; primary: boolean; internal: boolean; bounds: Rect; workArea: Rect | null };
 type DedicatedTabOwner = 'lease' | 'placeholder' | 'automation' | 'foreign';
@@ -1662,9 +1665,10 @@ const DEDICATED_PREFERRED_TILE = { width: 1280, height: 900 };
 /**
  * Smallest tile we will hand out. Below this a report page reflows into its narrow
  * layout and the captured DOM stops being comparable with a single-window run, so
- * additional windows use preferred-size cascades instead of smaller grid tiles.
+ * additional windows cascade instead of shrinking the fixed grid.
  */
 const DEDICATED_MIN_TILE = { width: 900, height: 620 };
+const DEDICATED_MAX_TILE = { width: 1600, height: 1100 };
 const DEDICATED_POOL_MIN = 4;
 /** Pooled window names. `pool-1`, `pool-2`, … — never a caller's session name. */
 const DEDICATED_POOL_PREFIX = 'pool-';
@@ -1674,7 +1678,7 @@ const DEDICATED_REAP_ALARM = 'opencli-dedicated-reap';
 let dedicatedIdleTtlMs = DEDICATED_IDLE_TTL_DEFAULT_MS;
 const DEDICATED_CAPABILITIES = [
   'dedicated-window', 'window-slots', 'window-bounds', 'window-display', 'auto-select', 'foreign-tab-policy',
-  'window-pool', 'window-close', 'window-list', 'idle-reap', 'auto-display', 'dynamic-layout',
+  'window-pool', 'window-close', 'window-list', 'idle-reap', 'auto-display', 'dynamic-layout', 'fixed-layout', 'window-relayout',
 ] as const;
 
 function emptyDedicatedPlacement(): DedicatedPlacement {
@@ -1751,35 +1755,23 @@ function pickDisplay(displays: DisplayInfo[] | null, pattern: string | null): Di
   return displays.length === 1 && usable(displays[0]) ? displays[0] : null;
 }
 
-/**
- * Grid for `count` windows on one display. Chrome reports a window whose pixels are
- * fully covered by another window as `hidden` whatever its active tab is, so the
- * grid avoids overlap within the natural capacity. It follows the number of windows
- * actually live right now rather than a fixed cell size — one window gets a full
- * 1280x900, four windows on a 2560x1410 work area get 1280x705 each. Tiles never
- * grow past the preferred size (a scraper reading a 2560-wide viewport would see a
- * different layout than every calibration run) and never shrink past the minimum
- * (same reason, in the other direction) — `null` means this display cannot show
- * that many windows without overlap; dedicatedTile then uses a cascade.
- */
-function dedicatedGrid(area: Rect, count: number): { cols: number; rows: number; width: number; height: number } | null {
-  const n = Math.max(1, Math.trunc(count));
-  const cols = Math.min(n, Math.max(1, Math.ceil(Math.sqrt(n))));
-  const rows = Math.max(1, Math.ceil(n / cols));
-  const width = Math.min(DEDICATED_PREFERRED_TILE.width, Math.floor(area.width / cols));
-  const height = Math.min(DEDICATED_PREFERRED_TILE.height, Math.floor(area.height / rows));
-  if (width < Math.min(DEDICATED_MIN_TILE.width, area.width) || height < Math.min(DEDICATED_MIN_TILE.height, area.height)) return null;
-  return { cols, rows, width, height };
+/** Resolution alone determines the grid. Count is retained for existing callers. */
+function dedicatedGrid(area: Rect, _count?: number): { cols: number; rows: number; width: number; height: number } {
+  const divisions = (length: number, preferred: number, min: number, max: number): number => {
+    const upper = Math.max(1, Math.floor(length / min));
+    const lower = Math.max(1, Math.ceil(length / max));
+    // Some resolutions cannot satisfy both bounds with equal tiles (e.g. 1700px).
+    // Keep the minimum and full coverage in that case; the maximum is a preference.
+    return Math.min(upper, Math.max(lower, Math.round(length / preferred)));
+  };
+  const cols = divisions(area.width, DEDICATED_PREFERRED_TILE.width, DEDICATED_MIN_TILE.width, DEDICATED_MAX_TILE.width);
+  const rows = divisions(area.height, DEDICATED_PREFERRED_TILE.height, DEDICATED_MIN_TILE.height, DEDICATED_MAX_TILE.height);
+  return { cols, rows, width: Math.floor(area.width / cols), height: Math.floor(area.height / rows) };
 }
 
-/** How many windows this display can show side by side without overlapping. */
 function dedicatedCapacity(area: Rect): number {
-  let capacity = 0;
-  for (let n = 1; n <= 64; n += 1) {
-    if (!dedicatedGrid(area, n)) break;
-    capacity = n;
-  }
-  return capacity;
+  const { cols, rows } = dedicatedGrid(area);
+  return cols * rows;
 }
 
 function dedicatedCellGrid(display: Rect): { width: number; height: number; cols: number; rows: number; offsetX: number; offsetY: number } {
@@ -1792,32 +1784,27 @@ function dedicatedCellGrid(display: Rect): { width: number; height: number; cols
   return { width, height, cols, rows, offsetX, offsetY };
 }
 
-/** Grid within natural capacity; additional tiles cascade at the preferred size. */
-function dedicatedTile(area: Rect, index: number, count: number): Rect {
-  const naturalCapacity = dedicatedCapacity(area);
-  const grid = dedicatedGrid(area, Math.min(count, naturalCapacity));
-  if (!grid || index >= naturalCapacity) {
-    const width = Math.min(DEDICATED_PREFERRED_TILE.width, area.width);
-    const height = Math.min(DEDICATED_PREFERRED_TILE.height, area.height);
-    const step = index - naturalCapacity + 1;
+/** Fixed row-major tiles; only overflow cascades. Remainder pixels go to edge cells. */
+function dedicatedTile(area: Rect, index: number, _count?: number): Rect {
+  const grid = dedicatedGrid(area);
+  const capacity = grid.cols * grid.rows;
+  if (index >= capacity) {
+    const step = index - capacity + 1;
     return {
-      left: area.left + (step * DEDICATED_CELL.offsetX) % (area.width - width + 1),
-      top: area.top + (step * DEDICATED_CELL.offsetY) % (area.height - height + 1),
-      width,
-      height,
+      left: area.left + (step * DEDICATED_CELL.offsetX) % (area.width - grid.width + 1),
+      top: area.top + (step * DEDICATED_CELL.offsetY) % (area.height - grid.height + 1),
+      width: grid.width,
+      height: grid.height,
     };
   }
-  const capacity = grid.cols * grid.rows;
   const i = ((Math.trunc(index) % capacity) + capacity) % capacity;
   const col = i % grid.cols;
   const row = Math.floor(i / grid.cols);
-  const gapX = Math.max(0, Math.floor((area.width - grid.cols * grid.width) / Math.max(1, grid.cols + 1)));
-  const gapY = Math.max(0, Math.floor((area.height - grid.rows * grid.height) / Math.max(1, grid.rows + 1)));
   return {
-    left: area.left + gapX + col * (grid.width + gapX),
-    top: area.top + gapY + row * (grid.height + gapY),
-    width: grid.width,
-    height: grid.height,
+    left: area.left + col * grid.width,
+    top: area.top + row * grid.height,
+    width: col === grid.cols - 1 ? area.width - col * grid.width : grid.width,
+    height: row === grid.rows - 1 ? area.height - row * grid.height : grid.height,
   };
 }
 
@@ -1830,17 +1817,11 @@ function excludedDisplayBounds(displays: DisplayInfo[] | null): Rect | null {
   return excluded && pickAutomationDisplays(displays, dedicatedAvoidDisplayBounds).every(d => d.id !== excluded.id) ? excluded.bounds : null;
 }
 
-/** Exclude the active screen first; otherwise retain the secondary-screen fallback. */
-function pickAutomationDisplays(displays: DisplayInfo[] | null, avoidDisplayBounds?: Rect): DisplayInfo[] {
-  const usable = (displays ?? []).filter(d => d.bounds.width > 0 && d.bounds.height > 0);
-  if (avoidDisplayBounds) {
-    const remaining = usable.filter(d => !sameDisplayBounds(d.bounds, avoidDisplayBounds));
-    if (remaining.length && remaining.length < usable.length) {
-      return remaining.sort((a, b) => Number(a.internal) - Number(b.internal) || a.id.localeCompare(b.id, undefined, { numeric: true }));
-    }
-  }
-  const secondary = usable.filter(d => !d.primary)
+/** Stable automation set: secondary screens only, primary as the sole fallback. */
+function pickAutomationDisplays(displays: DisplayInfo[] | null, _avoidDisplayBounds?: Rect): DisplayInfo[] {
+  const usable = (displays ?? []).filter(d => d.bounds.width > 0 && d.bounds.height > 0)
     .sort((a, b) => Number(a.internal) - Number(b.internal) || a.id.localeCompare(b.id, undefined, { numeric: true }));
+  const secondary = usable.filter(d => !d.primary);
   return secondary.length ? secondary : usable.slice(0, 1);
 }
 
@@ -1848,100 +1829,135 @@ function pickAutomationDisplay(displays: DisplayInfo[] | null): DisplayInfo | nu
   return pickAutomationDisplays(displays)[0] ?? null;
 }
 
-/** Fill each screen's natural grid in order; overflow cascades on the last screen. */
-function dedicatedAutomationTile(displays: DisplayInfo[], index: number, count: number): { display: DisplayInfo; target: Rect } {
-  let offset = 0;
-  for (let i = 0; i < displays.length; i += 1) {
-    const display = displays[i];
-    const area = displayArea(display);
-    const capacity = dedicatedCapacity(area);
-    if (index < offset + capacity || i === displays.length - 1) {
-      const localCount = i === displays.length - 1 ? count - offset : Math.min(count - offset, capacity);
-      return { display, target: dedicatedTile(area, index - offset, localCount) };
-    }
-    offset += capacity;
-  }
-  throw new Error('No automation display');
-}
-
 function displayArea(display: DisplayInfo): Rect {
   return display.workArea && display.workArea.width > 0 && display.workArea.height > 0 ? display.workArea : display.bounds;
 }
 
-function dedicatedBoundsWithSize(tile: Rect, size: Rect, area: Rect): Rect {
-  const width = Math.min(size.width, area.width);
-  const height = Math.min(size.height, area.height);
-  return {
-    left: Math.max(area.left, Math.min(tile.left, area.left + area.width - width)),
-    top: Math.max(area.top, Math.min(tile.top, area.top + area.height - height)),
-    width,
-    height,
-  };
-}
-
-/** Slots with a live window, in tile order. */
+/** Slots with a live window, in allocation order. */
 function liveDedicatedStates(): DedicatedSlotState[] {
   return [...dedicatedSlots.values()]
     .filter(state => state.windowId !== null)
     .sort((a, b) => (a.tileIndex ?? 0) - (b.tileIndex ?? 0) || a.slot.localeCompare(b.slot));
 }
 
-function claimTileIndex(state: DedicatedSlotState): number {
-  if (state.tileIndex !== null) return state.tileIndex;
-  const taken = new Set(liveDedicatedStates().map(s => s.tileIndex).filter((i): i is number => i !== null));
-  let index = 0;
-  while (taken.has(index)) index += 1;
-  state.tileIndex = index;
-  return index;
-}
-
-/**
- * Re-tile every automatically placed window. Called whenever the number of windows
- * changes, because "how many are live" is an input to the layout: the window that
- * had the display to itself has to give half of it back when a second one appears.
- * Windows a caller placed by hand (explicit bounds or display pattern) are left alone,
- * and a move never passes `focused` — re-tiling must not raise anything.
- */
-async function retileDedicatedWindows(displays: DisplayInfo[] | null): Promise<void> {
-  const automationDisplays = pickAutomationDisplays(displays, dedicatedAvoidDisplayBounds);
-  if (!automationDisplays.length) return;
-  const auto = liveDedicatedStates().filter(state => state.placement.source === 'auto');
-  if (!auto.length) return;
-  const count = auto.length;
-  const updateWindow = (chrome.windows as unknown as { update?: (id: number, info: Partial<Rect>) => Promise<unknown> }).update;
-  if (typeof updateWindow !== 'function') return;
-  for (let i = 0; i < auto.length; i += 1) {
-    const state = auto[i];
-    const { display, target: tile } = dedicatedAutomationTile(automationDisplays, i, count);
-    const area = displayArea(display);
-    const size = state.placement.relocatedFrom;
-    const fullBounds = size ? dedicatedBoundsWithSize(tile, size, area) : tile;
-    const target = state.half ? { ...fullBounds, width: Math.floor(fullBounds.width / 2) } : fullBounds;
-    state.fullBounds = fullBounds;
-    if (!target || state.windowId === null) continue;
-    state.tileIndex = i;
-    state.placement.requestedBounds = fullBounds;
-    state.placement.cell = i;
-    state.placement.displayName = display.name;
-    state.placement.displayFound = true;
-    state.placement.excludedDisplayBounds = excludedDisplayBounds(displays);
-    let current: Rect | null = null;
-    try {
-      const win = await chrome.windows.get(state.windowId);
-      if (win.state !== undefined && win.state !== 'normal') continue; // fullscreen/minimised: reported, never resized
-      current = rectFromWindow(win);
-    } catch {
-      forgetDedicatedWindow(state);
-      continue;
-    }
-    if (current && current.left === target.left && current.top === target.top
-      && current.width === target.width && current.height === target.height) continue;
-    try {
-      await updateWindow(state.windowId, target);
-    } catch (err) {
-      console.warn(`[opencli] Failed to re-tile dedicated window ${state.windowId}: ${err instanceof Error ? err.message : String(err)}`);
+/** Reserve a local cell. Mouse preference applies only to a new assignment. */
+function claimTileIndex(state: DedicatedSlotState, displays: DisplayInfo[], avoid?: Rect): DisplayInfo {
+  const taken = (display: DisplayInfo) => new Set([...dedicatedSlots.values()]
+    .filter(s => s !== state && s.placement.source === 'auto' && s.displayId === display.id && s.windowId !== null)
+    .map(s => s.tileIndex));
+  const existing = displays.find(d => d.id === state.displayId);
+  if (existing && state.tileIndex !== null && !taken(existing).has(state.tileIndex)) return existing;
+  // Old registries had no displayId. Adopt the remembered screen rather than
+  // moving all legacy windows to the first display during the initial upgrade.
+  if (state.displayId === null && state.windowId !== null && state.placement.requestedBounds) {
+    const bounds = state.placement.requestedBounds;
+    const display = displays.find(d => rectCenterInside(bounds, displayArea(d)));
+    if (display) {
+      const area = displayArea(display);
+      const grid = dedicatedGrid(area);
+      const col = Math.max(0, Math.min(grid.cols - 1, Math.round((bounds.left - area.left) / grid.width)));
+      const row = Math.max(0, Math.min(grid.rows - 1, Math.round((bounds.top - area.top) / grid.height)));
+      let index = row * grid.cols + col;
+      const used = taken(display);
+      if (used.has(index)) {
+        index = 0;
+        while (used.has(index)) index += 1;
+      }
+      state.displayId = display.id;
+      state.tileIndex = index;
+      return display;
     }
   }
+  const candidates = avoid
+    ? [...displays.filter(d => !sameDisplayBounds(d.bounds, avoid)), ...displays.filter(d => sameDisplayBounds(d.bounds, avoid))]
+    : displays;
+  for (const display of candidates) {
+    const used = taken(display);
+    for (let i = 0; i < dedicatedCapacity(displayArea(display)); i += 1) {
+      if (used.has(i)) continue;
+      state.displayId = display.id;
+      state.tileIndex = i;
+      return display;
+    }
+  }
+  const display = displays[displays.length - 1];
+  const used = taken(display);
+  let index = dedicatedCapacity(displayArea(display));
+  while (used.has(index)) index += 1;
+  state.displayId = display.id;
+  state.tileIndex = index;
+  return display;
+}
+
+type DedicatedRelayoutEntry = {
+  slot: string; windowId: number; displayId: string | null; tileIndex: number | null;
+  old: { bounds: Rect | null; state: string | null };
+  new: { bounds: Rect | null; state: string | null };
+  changed: boolean; error?: string;
+};
+
+/** Runs inside the same queue as creation. Existing screen assignments never use avoid. */
+async function retileDedicatedWindows(displays: DisplayInfo[] | null): Promise<DedicatedRelayoutEntry[]> {
+  const automationDisplays = pickAutomationDisplays(displays);
+  const entries: DedicatedRelayoutEntry[] = [];
+  if (!automationDisplays.length) return entries;
+  let dirty = false;
+  for (const state of liveDedicatedStates().filter(s => s.placement.source === 'auto')) {
+    const windowId = state.windowId!;
+    let win: chrome.windows.Window;
+    try {
+      win = await chrome.windows.get(windowId);
+    } catch {
+      forgetDedicatedWindow(state);
+      dirty = true;
+      continue;
+    }
+    const old = { bounds: rectFromWindow(win), state: win.state ?? null };
+    const display = claimTileIndex(state, automationDisplays);
+    const fullBounds = dedicatedTile(displayArea(display), state.tileIndex!);
+    const target = state.half ? { ...fullBounds, width: Math.floor(fullBounds.width / 2) } : fullBounds;
+    const placementChanged = !state.fullBounds || !sameDisplayBounds(state.fullBounds, fullBounds)
+      || state.placement.displayName !== display.name || state.placement.cell !== state.tileIndex;
+    state.fullBounds = fullBounds;
+    state.placement.requestedBounds = fullBounds;
+    state.placement.cell = state.tileIndex;
+    state.placement.displayName = display.name;
+    state.placement.displayFound = true;
+    const entry: DedicatedRelayoutEntry = { slot: state.slot, windowId, displayId: state.displayId, tileIndex: state.tileIndex, old, new: old, changed: false };
+    try {
+      if (win.state !== undefined && win.state !== 'normal') {
+        win = await chrome.windows.update(windowId, { state: 'normal' });
+        entry.changed = true;
+      }
+      const bounds = rectFromWindow(win);
+      if (!bounds || !sameDisplayBounds(bounds, target)) {
+        win = await chrome.windows.update(windowId, target);
+        entry.changed = true;
+      }
+      entry.new = { bounds: rectFromWindow(win), state: win.state ?? null };
+      if (entry.changed || placementChanged || state.reconciledAt === undefined) {
+        state.reconciledAt = Date.now();
+        dirty = true;
+      }
+    } catch (err) {
+      entry.new = { bounds: rectFromWindow(win), state: win.state ?? null };
+      entry.error = err instanceof Error ? err.message : String(err);
+      dirty = true;
+    }
+    entries.push(entry);
+  }
+  if (dirty) await persistDedicatedState();
+  return entries;
+}
+
+function reconcileDedicatedWindows(): Promise<DedicatedRelayoutEntry[]> {
+  const next = dedicatedEnsureQueue.catch(() => null).then(async () => {
+    if (!liveDedicatedStates().some(s => s.placement.source === 'auto')) return [];
+    const { displays } = await listDisplays();
+    return retileDedicatedWindows(displays);
+  });
+  dedicatedEnsureQueue = next.catch(() => null);
+  return next;
 }
 
 /** Enforce the pool limit; windows beyond natural capacity are cascaded. */
@@ -2006,8 +2022,6 @@ async function reapIdleDedicatedWindows(now = Date.now(), target?: DedicatedSlot
     if (state.pooled) dedicatedSlots.delete(state.slot);
   }
   if (closed) {
-    const { displays } = await listDisplays();
-    await retileDedicatedWindows(displays);
     await persistDedicatedState();
   }
   return closed;
@@ -2080,6 +2094,7 @@ function getDedicatedSlot(slot: string, pooled = false): DedicatedSlotState {
       holders: new Set(),
       idleSince: Date.now(),
       tileIndex: null,
+      displayId: null,
     };
     dedicatedSlots.set(slot, state);
   }
@@ -2161,6 +2176,8 @@ function dedicatedWindowIds(): number[] {
 function forgetDedicatedWindow(state: DedicatedSlotState): void {
   state.windowId = null;
   state.placeholderTabIds.clear();
+  state.tileIndex = null;
+  state.displayId = null;
 }
 
 async function persistDedicatedState(): Promise<void> {
@@ -2178,6 +2195,8 @@ async function persistDedicatedState(): Promise<void> {
       pooled: state.pooled,
       idleSince: state.idleSince,
       tileIndex: state.tileIndex,
+      displayId: state.displayId,
+      reconciledAt: state.reconciledAt,
     };
   }
   try {
@@ -2224,6 +2243,8 @@ async function restoreDedicatedState(): Promise<void> {
     state.evictedTabs = typeof raw.evictedTabs === 'number' ? raw.evictedTabs : 0;
     state.placement = coerceDedicatedPlacement(raw.placement);
     state.tileIndex = typeof raw.tileIndex === 'number' && Number.isInteger(raw.tileIndex) ? raw.tileIndex : null;
+    state.displayId = typeof raw.displayId === 'string' ? raw.displayId : null;
+    state.reconciledAt = typeof raw.reconciledAt === 'number' ? raw.reconciledAt : undefined;
     // Leases do not survive a worker restart, so every restored window starts idle —
     // and its idle clock starts now rather than before the restart, so a window is
     // never reaped for time it spent while nothing could have used it.
@@ -2326,19 +2347,17 @@ async function resolveDedicatedTarget(state: DedicatedSlotState, request: Dedica
       state.placement = { ...emptyDedicatedPlacement(), relocatedFrom: bounds };
       request = { ...request, bounds: undefined };
       if (!alreadyLogged) {
-        console.warn(`[opencli] WARN: 显式 bounds 落在用户当前屏，位置已改到自动宫格，尺寸保留 (slot=${state.slot}, bounds=${JSON.stringify(bounds)})`);
+        console.warn(`[opencli] WARN: 显式 bounds 落在用户当前屏，位置和尺寸已改到自动宫格 (slot=${state.slot}, bounds=${JSON.stringify(bounds)})`);
       }
     }
   }
   const previous = state.placement;
   if (!request.bounds && !request.display && state.windowId !== null && previous.source === 'auto' && previous.requestedBounds) {
-    if (previous.relocatedFrom) {
-      const { displays } = await listDisplays();
-      const display = pickAutomationDisplays(displays, dedicatedAvoidDisplayBounds)
-        .find(display => rectCenterInside(previous.requestedBounds!, displayArea(display)));
-      if (display) return { target: previous.requestedBounds, area: displayArea(display) };
-    }
     return { target: previous.requestedBounds, area: previous.requestedBounds };
+  }
+  if (request.bounds || request.display) {
+    state.tileIndex = null;
+    state.displayId = null;
   }
   if (request.bounds) {
     state.placement = { ...emptyDedicatedPlacement(), source: 'bounds', requestedBounds: normalizeRect(request.bounds), displayPattern: request.display ?? null };
@@ -2350,7 +2369,7 @@ async function resolveDedicatedTarget(state: DedicatedSlotState, request: Dedica
     return { target: placement.requestedBounds, area: placement.requestedBounds };
   }
   // Nobody named a place: put it on the automation display, in its own tile of the
-  // layout for however many windows are live. This is what makes plain
+  // fixed grid calculated from the work area. This is what makes plain
   // `opencli browser <session> open <url>` land off the person's screen by itself.
   if (placement.source !== 'display' || !placement.displayPattern) {
     const { displays } = await listDisplays();
@@ -2359,12 +2378,9 @@ async function resolveDedicatedTarget(state: DedicatedSlotState, request: Dedica
       state.placement = { ...emptyDedicatedPlacement(), source: 'auto', ...(placement.relocatedFrom && { relocatedFrom: placement.relocatedFrom }) };
       return { target: null, area: null };
     }
-    const others = liveDedicatedStates().filter(s => s.slot !== state.slot && s.placement.source === 'auto').length;
-    const index = claimTileIndex(state);
-    const { display, target: tile } = dedicatedAutomationTile(automationDisplays, index, Math.max(others + 1, index + 1));
-    const area = displayArea(display);
-    const size = placement.relocatedFrom;
-    const target = size ? dedicatedBoundsWithSize(tile, size, area) : tile;
+    const display = claimTileIndex(state, automationDisplays, request.avoidDisplayBounds);
+    const index = state.tileIndex!;
+    const target = dedicatedTile(displayArea(display), index);
     state.placement = {
       source: 'auto',
       requestedBounds: target,
@@ -2375,7 +2391,7 @@ async function resolveDedicatedTarget(state: DedicatedSlotState, request: Dedica
       excludedDisplayBounds: excludedDisplayBounds(displays),
       ...(placement.relocatedFrom && { relocatedFrom: placement.relocatedFrom }),
     };
-    return { target, area: size ? area : target };
+    return { target, area: target };
   }
 
   const { displays } = await listDisplays();
@@ -2425,6 +2441,11 @@ async function ensureDedicatedWindowUnlocked(
 ): Promise<DedicatedEnsureResult> {
   dedicatedAvoidDisplayBounds = request.avoidDisplayBounds;
   await reapIdleDedicatedWindows();
+  let preflightMoved = false;
+  if (liveDedicatedStates().some(s => s.placement.source === 'auto')) {
+    const { displays } = await listDisplays();
+    preflightMoved = (await retileDedicatedWindows(displays)).some(entry => entry.slot === state.slot && entry.changed);
+  }
   let win: chrome.windows.Window | null = null;
   if (state.windowId !== null) {
     try {
@@ -2444,7 +2465,7 @@ async function ensureDedicatedWindowUnlocked(
   state.fullBounds = fullTarget ?? state.fullBounds ?? { left: win?.left ?? 0, top: win?.top ?? 0, width: DEDICATED_CELL.width, height: DEDICATED_CELL.height };
   const target = state.half ? { ...state.fullBounds, width: Math.floor(state.fullBounds.width / 2) } : fullTarget ?? (halfChanged ? state.fullBounds : null);
   let created = false;
-  let moved = false;
+  let moved = preflightMoved;
   let createdTabId: number | undefined;
   if (!win || state.windowId === null) {
     const startUrl = request.initialUrl && isSafeNavigationUrl(request.initialUrl) ? request.initialUrl : dedicatedPlaceholderUrl(state.slot);
@@ -2469,25 +2490,16 @@ async function ensureDedicatedWindowUnlocked(
       dedicatedTabCreatesInFlight -= 1;
     }
     console.log(`[opencli] Created dedicated window ${state.windowId} (slot=${state.slot}, placement=${state.placement.source}${state.placement.displayName ? `:${state.placement.displayName}#${state.placement.cell}` : ''})`);
-    // Re-tile or cascade before returning,
-    // so the caller never sees a window that is about to move under it.
-    if (state.placement.source === 'auto') {
-      const { displays } = await listDisplays();
-      await retileDedicatedWindows(displays);
-    }
   } else if ((halfChanged || (request.reposition && area)) && target && (win.state === undefined || win.state === 'normal')) {
-    // Minimized / maximized / fullscreen windows are reported, not moved: resizing one
-    // would leave fullscreen (a Space switch on macOS) or un-minimize it.
+    // Automatic placements were normalized by preflight. Explicit placements
+    // retain the previous policy for minimized/maximized/fullscreen windows.
     const current = rectFromWindow(win);
-    if (halfChanged || (state.half && current?.width !== target.width) || (state.placement.relocatedFrom && (current?.width !== target.width || current?.height !== target.height)) || !current || !rectCenterInside(current, area ?? state.fullBounds)) {
+    if (halfChanged || (state.half && current?.width !== target.width) || (state.placement.source === 'auto' && (!current || !sameDisplayBounds(current, target))) || !current || !rectCenterInside(current, area ?? state.fullBounds)) {
       // No `focused` here: moving the window must never raise it.
       const updateWindow = (chrome.windows as unknown as { update?: (id: number, info: Partial<Rect>) => Promise<unknown> }).update;
       if (typeof updateWindow === 'function') {
         try {
-          const update = state.placement.relocatedFrom && !halfChanged && current && rectCenterInside(current, area ?? state.fullBounds)
-            ? { width: target.width, height: target.height }
-            : target;
-          await updateWindow(state.windowId, update);
+          await updateWindow(state.windowId, target);
           moved = true;
         } catch (err) {
           console.warn(`[opencli] Failed to move dedicated window ${state.windowId}: ${err instanceof Error ? err.message : String(err)}`);
@@ -2856,6 +2868,8 @@ type DedicatedWindowInfo = {
   busy: boolean;
   idleMs: number | null;
   tileIndex: number | null;
+  displayId: string | null;
+  reconciledAt?: number;
   windowId: number | null;
   exists: boolean;
   state: string | null;
@@ -2919,6 +2933,8 @@ async function describeDedicatedSlot(state: DedicatedSlotState, displays: Displa
     busy: state.holders.size > 0,
     idleMs: state.idleSince === null ? null : Math.max(0, Date.now() - state.idleSince),
     tileIndex: state.tileIndex,
+    displayId: state.displayId,
+    reconciledAt: state.reconciledAt,
     windowId: win ? state.windowId : null,
     exists: !!win,
     state: win?.state ?? null,
@@ -2966,8 +2982,6 @@ async function closeDedicatedWindows(target: { slot?: string | null; all?: boole
     closed.push(state.slot);
   }
   if (closed.length) {
-    const { displays } = await listDisplays();
-    await retileDedicatedWindows(displays);
     await persistDedicatedState();
   }
   return { closed, skipped };
@@ -2980,6 +2994,11 @@ async function handleDedicatedWindowOp(cmd: Command): Promise<Result> {
     setTimeout(() => { try { chrome.runtime.reload(); } catch { /* nothing left to do */ } }, 150);
     return { id: cmd.id, ok: true, data: { reloading: true, note: 'extension reloading; leases and dedicated windows are dropped' } };
   }
+  if (cmd.op === 'window-relayout') {
+    const windows = await reconcileDedicatedWindows();
+    return { id: cmd.id, ok: true, data: { windows, changed: windows.filter(w => w.changed).length } };
+  }
+  if (cmd.op === 'window-status' || cmd.op === 'window-list') await reconcileDedicatedWindows();
   if (cmd.op === 'window-close') {
     const all = cmd.windowSlot === undefined || cmd.windowSlot === null || cmd.windowSlot === '';
     const { closed, skipped } = await closeDedicatedWindows({
@@ -3029,7 +3048,10 @@ async function handleDedicatedWindowOp(cmd: Command): Promise<Result> {
         // What a caller needs to decide "run now or queue": how many windows the
         // pool allows, its non-overlapping natural capacity, and how many are free.
         automationDisplay: automationDisplay ? { id: automationDisplay.id, name: automationDisplay.name, primary: automationDisplay.primary, internal: automationDisplay.internal, area } : null,
-        automationDisplays: automationDisplays.map(d => ({ id: d.id, name: d.name, area: displayArea(d), naturalCapacity: dedicatedCapacity(displayArea(d)) })),
+        automationDisplays: automationDisplays.map(d => {
+          const grid = dedicatedGrid(displayArea(d));
+          return { id: d.id, name: d.name, area: displayArea(d), naturalCapacity: grid.cols * grid.rows, cols: grid.cols, rows: grid.rows, tile: { width: grid.width, height: grid.height } };
+        }),
         capacity,
         naturalCapacity,
         live,
@@ -3271,12 +3293,19 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   await workerReady;
   if (alarm.name === 'keepalive') void connect();
   if (alarm.name === DEDICATED_REAP_ALARM) {
+    await reconcileDedicatedWindows().catch(() => []);
     await reapIdleDedicatedWindows().catch(() => 0);
     return;
   }
   const leaseKey = leaseKeyFromAlarmName(alarm.name);
   if (!leaseKey) return;
   await handleIdleExpiry(leaseKey, 'idle alarm');
+});
+
+chrome.system?.display?.onDisplayChanged?.addListener(async () => {
+  await workerReady.then(() => reconcileDedicatedWindows()).catch(err => {
+    console.warn(`[opencli] Display reconciliation failed: ${err instanceof Error ? err.message : String(err)}`);
+  });
 });
 
 // ─── Popup status API ───────────────────────────────────────────────
@@ -3324,6 +3353,8 @@ async function fetchDaemonVersion(): Promise<string | null> {
 // ─── Command dispatcher ─────────────────────────────────────────────
 
 async function handleCommand(cmd: Command): Promise<Result> {
+  // Reconcile before acquiring/using any window. Relayout must capture its own before snapshot.
+  if (cmd.action !== 'sessions') await reconcileDedicatedWindows();
   // Session-independent actions — handle before session resolution.
   if (cmd.action === 'sessions') return handleSessions(cmd);
 
@@ -4267,7 +4298,7 @@ function stripOpenCliFrameRoutingParams(params: Record<string, unknown>, stripFr
 }
 
 async function handleSessions(cmd: Command): Promise<Result> {
-  if (cmd.op === 'window-status' || cmd.op === 'window-ensure' || cmd.op === 'window-list' || cmd.op === 'window-close' || cmd.op === 'runtime-reload') return handleDedicatedWindowOp(cmd);
+  if (cmd.op === 'window-relayout' || cmd.op === 'window-status' || cmd.op === 'window-ensure' || cmd.op === 'window-list' || cmd.op === 'window-close' || cmd.op === 'runtime-reload') return handleDedicatedWindowOp(cmd);
   if (cmd.op === 'cleanup') {
     const keys = [...automationSessions.keys()];
     for (const key of keys) await releaseLease(key, 'cleanup');
@@ -4719,6 +4750,7 @@ export const __test__ = {
   resetDefaultWindowMode: () => { defaultWindowMode = DEFAULT_WINDOW_MODE; },
   // Pool / layout / reaper surface.
   dedicatedSlotNames: () => [...dedicatedSlots.keys()],
+  reconcileDedicatedWindows,
   dedicatedGrid,
   dedicatedTile,
   dedicatedCapacity,
@@ -4740,6 +4772,8 @@ export const __test__ = {
       holders: [...state.holders],
       idleSince: state.idleSince,
       tileIndex: state.tileIndex,
+      displayId: state.displayId,
+      reconciledAt: state.reconciledAt,
       windowId: state.windowId,
       placeholderTabIds: [...state.placeholderTabIds],
       placement: { ...state.placement },

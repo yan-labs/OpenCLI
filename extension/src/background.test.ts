@@ -3546,7 +3546,7 @@ function dedicatedHarness(opts: { withDisplayApi?: boolean } = {}) {
     { id: 'virt', name: '虚拟 16:9', isPrimary: false, isInternal: false, bounds: { left: -2560, top: -1440, width: 2560, height: 1440 }, workArea: { left: -2560, top: -1440, width: 2560, height: 1440 } },
   ];
   if (opts.withDisplayApi !== false) {
-    chrome.system = { display: { getInfo: vi.fn(async (cb?: (d: unknown[]) => void) => { cb?.(displays); return displays; }) } };
+    chrome.system = { display: { onDisplayChanged: { addListener: vi.fn() }, getInfo: vi.fn(async (cb?: (d: unknown[]) => void) => { cb?.(displays); return displays; }) } };
   }
   chrome.tabs.onCreated = { addListener: vi.fn() };
   chrome.tabs.onAttached = { addListener: vi.fn() };
@@ -3554,6 +3554,7 @@ function dedicatedHarness(opts: { withDisplayApi?: boolean } = {}) {
     ...mock,
     chrome,
     windows,
+    displays,
     setLastFocused: (id: number) => { lastFocused = id; },
     closeWindow: async (id: number) => {
       windows.delete(id);
@@ -3625,12 +3626,8 @@ describe('dedicated automation window', () => {
     expect(result.ok).toBe(true);
     let state = mod.__test__.getDedicatedSlot('bounds-check')!;
     if (relocated) {
-      const area = avoid?.left === -2560
-        ? { left: 0, top: 25, width: 1512, height: 957 }
-        : { left: -2560, top: -1440, width: 2560, height: 1440 };
-      const target = { ...mod.__test__.dedicatedTile(area, 0, 1), width: Math.min(bounds.width, area.width), height: Math.min(bounds.height, area.height) };
-      target.left = Math.max(area.left, Math.min(target.left, area.left + area.width - target.width));
-      target.top = Math.max(area.top, Math.min(target.top, area.top + area.height - target.height));
+      const area = { left: -2560, top: -1440, width: 2560, height: 1440 };
+      const target = mod.__test__.dedicatedTile(area, 0, 1);
       expect(state).toMatchObject({ tileIndex: 0, placement: { source: 'auto', cell: 0, requestedBounds: target, relocatedFrom: bounds } });
       const placed = state.placement.requestedBounds!;
       expect(state.tileIndex).not.toBeNull();
@@ -3641,18 +3638,16 @@ describe('dedicated automation window', () => {
       expect(placed.left + placed.width).toBeLessThanOrEqual(area.left + area.width);
       expect(placed.top + placed.height).toBeLessThanOrEqual(area.top + area.height);
       expect(h.chrome.windows.create).toHaveBeenCalledWith(expect.objectContaining(target));
-      expect(warn).toHaveBeenCalledWith(expect.stringContaining('显式 bounds 落在用户当前屏，位置已改到自动宫格，尺寸保留'));
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('显式 bounds 落在用户当前屏，位置和尺寸已改到自动宫格'));
       const status = await mod.__test__.handleSessions({ id: 's', action: 'sessions', op: 'window-status' } as never);
       expect((status.data as any).windows[0].placement.relocatedFrom).toEqual(bounds);
       await mod.__test__.restoreDedicatedState();
       state = mod.__test__.getDedicatedSlot('bounds-check')!;
       expect(state.placement.relocatedFrom).toEqual(bounds);
-      // Adding another window retiles the slot without replacing its requested size.
+      // Adding a window leaves the fixed slot and tile size unchanged.
       await mod.__test__.ensureDedicatedWindow('neighbor', { avoidDisplayBounds: avoid });
       state = mod.__test__.getDedicatedSlot('bounds-check')!;
-      const retiledTarget = { ...mod.__test__.dedicatedTile(area, 0, 2), width: target.width, height: target.height };
-      retiledTarget.left = Math.max(area.left, Math.min(retiledTarget.left, area.left + area.width - retiledTarget.width));
-      retiledTarget.top = Math.max(area.top, Math.min(retiledTarget.top, area.top + area.height - retiledTarget.height));
+      const retiledTarget = target;
       expect(state.placement.requestedBounds).toEqual(retiledTarget);
       expect(h.windows.get(state.windowId!)).toMatchObject(retiledTarget);
       h.chrome.windows.remove = vi.fn(async (id: number) => { await h.closeWindow(id); });
@@ -3696,49 +3691,42 @@ describe('dedicated automation window', () => {
     }
   });
 
-  it('syncs relocated bounds size on slot reuse and leaves matching-size nudges alone', async () => {
+  it('uses grid size for relocated bounds on reuse and restores nudges', async () => {
     const h = dedicatedHarness();
     vi.stubGlobal('chrome', h.chrome);
     const mod = await import('./background');
-    const avoidDisplayBounds = { left: 0, top: 0, width: 1512, height: 982 };
+    const avoidDisplayBounds = h.displays[0].bounds;
     await mod.__test__.ensureDedicatedWindow('reuse-bounds', { avoidDisplayBounds, reposition: true });
-    expect(h.windows.get(50)).toMatchObject({ width: 1280, height: 900 });
+    const target = mod.__test__.getDedicatedSlot('reuse-bounds')!.placement.requestedBounds!;
+    expect(target).toMatchObject({ width: 1280, height: 720 });
     h.chrome.windows.update.mockClear();
-
     const request = { bounds: { left: 0, top: 0, width: 1360, height: 900 }, avoidDisplayBounds, reposition: true };
-    const resized = await mod.__test__.ensureDedicatedWindow('reuse-bounds', request);
-    expect(resized).toMatchObject({ windowId: 50, created: false, moved: true });
-    expect(h.chrome.windows.update).toHaveBeenCalledWith(50, expect.objectContaining({ width: 1360, height: 900 }));
-    expect(h.windows.get(50)).toMatchObject({ width: 1360, height: 900 });
-
-    Object.assign(h.windows.get(50)!, { left: -2400, top: -1300 });
-    h.chrome.windows.update.mockClear();
-    expect(await mod.__test__.ensureDedicatedWindow('reuse-bounds', request)).toMatchObject({ moved: false });
+    expect(await mod.__test__.ensureDedicatedWindow('reuse-bounds', request)).toMatchObject({ windowId: 50, created: false, moved: false });
     expect(h.chrome.windows.update).not.toHaveBeenCalled();
-    expect(h.windows.get(50)).toMatchObject({ left: -2400, top: -1300, width: 1360, height: 900 });
+    Object.assign(h.windows.get(50)!, { left: -2400, top: -1300 });
+    expect(await mod.__test__.ensureDedicatedWindow('reuse-bounds', request)).toMatchObject({ moved: true });
+    expect(h.chrome.windows.update).toHaveBeenCalledExactlyOnceWith(50, target);
+    expect(h.windows.get(50)).toMatchObject(target);
   });
 
-  it('only resizes relocated reused windows nudged within the target display', async () => {
+  it('restores relocated reused windows to their exact slot within or outside the display', async () => {
     const h = dedicatedHarness();
     vi.stubGlobal('chrome', h.chrome);
     const mod = await import('./background');
-    const avoidDisplayBounds = { left: 0, top: 0, width: 1512, height: 982 };
+    const avoidDisplayBounds = h.displays[0].bounds;
     await mod.__test__.ensureDedicatedWindow('nudged-bounds', { avoidDisplayBounds, reposition: true });
-    Object.assign(h.windows.get(50)!, { left: -2560, top: -1440 });
-    h.chrome.windows.update.mockClear();
-
+    const target = mod.__test__.getDedicatedSlot('nudged-bounds')!.placement.requestedBounds!;
     const request = { bounds: { left: 0, top: 0, width: 1400, height: 1300 }, avoidDisplayBounds, reposition: true };
-    expect(await mod.__test__.ensureDedicatedWindow('nudged-bounds', request)).toMatchObject({ moved: true });
-    expect(h.chrome.windows.update).toHaveBeenCalledExactlyOnceWith(50, { width: 1400, height: 1300 });
-    expect(h.windows.get(50)).toMatchObject({ left: -2560, top: -1440, width: 1400, height: 1300 });
-
-    Object.assign(h.windows.get(50)!, { left: 0, top: 25 });
-    h.chrome.windows.update.mockClear();
-    expect(await mod.__test__.ensureDedicatedWindow('nudged-bounds', request)).toMatchObject({ moved: true });
-    expect(h.chrome.windows.update).toHaveBeenCalledExactlyOnceWith(50, mod.__test__.getDedicatedSlot('nudged-bounds')!.placement.requestedBounds);
+    for (const position of [{ left: -2500, top: -1400 }, { left: 0, top: 25 }]) {
+      Object.assign(h.windows.get(50)!, position);
+      h.chrome.windows.update.mockClear();
+      expect(await mod.__test__.ensureDedicatedWindow('nudged-bounds', request)).toMatchObject({ moved: true });
+      expect(h.chrome.windows.update).toHaveBeenCalledExactlyOnceWith(50, target);
+      expect(h.windows.get(50)).toMatchObject(target);
+    }
   });
 
-  it('clamps preserved large sizes from lower-right grid origins inside the work area', async () => {
+  it('uses the fixed lower-right grid tile for relocated oversized bounds', async () => {
     const h = dedicatedHarness();
     vi.stubGlobal('chrome', h.chrome);
     const mod = await import('./background');
@@ -3751,7 +3739,7 @@ describe('dedicated automation window', () => {
     });
     const state = mod.__test__.getDedicatedSlot('large-bounds')!;
     expect(state.tileIndex).toBe(3);
-    const expected = { left: -1400, top: -1300, width: 1400, height: 1300 };
+    const expected = { left: -1280, top: -720, width: 1280, height: 720 };
     expect(h.chrome.windows.create).toHaveBeenLastCalledWith(expect.objectContaining(expected));
     expect(state.placement.requestedBounds).toEqual(expected);
     expect(h.windows.get(state.windowId!)).toMatchObject(expected);
@@ -4239,11 +4227,31 @@ describe('dedicated automation window — pool and layout', () => {
   const overlaps = (a: any, b: any) => a.left < b.left + b.width && b.left < a.left + a.width
     && a.top < b.top + b.height && b.top < a.top + a.height;
 
+  it.each([
+    [5120, 2850, 4, 3], [3840, 2160, 3, 2], [2560, 1440, 2, 2],
+    [1920, 1080, 2, 1], [1512, 949, 1, 1], [1024, 700, 1, 1], [3440, 1441, 3, 2],
+  ])('resolution %i×%i has a fixed %i×%i grid that fills the work area', async (width, height, cols, rows) => {
+    vi.stubGlobal('chrome', dedicatedHarness().chrome);
+    const mod = await import('./background');
+    const area = { left: -width, top: 25, width, height };
+    const grid = mod.__test__.dedicatedGrid(area, 1)!;
+    expect(grid).toMatchObject({ cols, rows });
+    expect(mod.__test__.dedicatedGrid(area, 100)).toEqual(grid);
+    const tiles = Array.from({ length: cols * rows }, (_, i) => mod.__test__.dedicatedTile(area, i, 1));
+    expect(tiles.reduce((sum, t) => sum + t.width * t.height, 0)).toBe(width * height);
+    for (const [i, tile] of tiles.entries()) {
+      expect(tile.width).toBeGreaterThanOrEqual(Math.min(900, width));
+      expect(tile.height).toBeGreaterThanOrEqual(Math.min(620, height));
+      expect(tile).toEqual(mod.__test__.dedicatedTile(area, i, 100));
+      for (const other of tiles.slice(i + 1)) expect(overlaps(tile, other)).toBe(false);
+    }
+  });
+
   it('grid/tile/capacity: tiles never overlap, never shrink past the minimum, and capacity is honest', async () => {
     vi.stubGlobal('chrome', dedicatedHarness().chrome);
     const mod = await import('./background');
     const area = { left: -2560, top: -1440, width: 2560, height: 1440 };
-    expect(mod.__test__.dedicatedGrid(area, 1)).toMatchObject({ cols: 1, rows: 1, width: 1280, height: 900 });
+    expect(mod.__test__.dedicatedGrid(area, 1)).toMatchObject({ cols: 2, rows: 2, width: 1280, height: 720 });
     const capacity = mod.__test__.dedicatedCapacity(area);
     expect(capacity).toBeGreaterThanOrEqual(2);
     expect({
@@ -4251,9 +4259,9 @@ describe('dedicated automation window — pool and layout', () => {
       first: mod.__test__.dedicatedTile(area, 0, capacity + 1),
       overflow: mod.__test__.dedicatedTile(area, capacity, capacity + 1),
     }).toEqual({
-      grid: null,
+      grid: mod.__test__.dedicatedGrid(area),
       first: mod.__test__.dedicatedTile(area, 0, capacity),
-      overflow: { left: area.left + 80, top: area.top + 60, width: 1280, height: 900 },
+      overflow: { left: area.left + 80, top: area.top + 60, width: 1280, height: 720 },
     });
     for (let n = 1; n <= capacity; n += 1) {
       const rects = Array.from({ length: n }, (_, i) => mod.__test__.dedicatedTile(area, i, n));
@@ -4277,6 +4285,190 @@ describe('dedicated automation window — pool and layout', () => {
     // Lid closed: the virtual screen is the only one left and inherits `primary`.
     expect(mod.__test__.pickAutomationDisplays([{ ...virt, primary: true }]).map(d => d.id)).toEqual(['8']);
     expect(mod.__test__.pickAutomationDisplays([])).toEqual([]);
+  });
+
+  it('mouse screen changes affect only new assignments, with mouse-screen fallback when other grids fill', async () => {
+    const h = dedicatedHarness();
+    h.displays[1].id = '20';
+    h.displays.push({ ...h.displays[1], id: '21', name: 'Virtual B', bounds: { left: 1512, top: 0, width: 2560, height: 1440 }, workArea: { left: 1512, top: 0, width: 2560, height: 1440 } });
+    vi.stubGlobal('chrome', h.chrome);
+    const mod = await import('./background');
+    await mod.__test__.ensureDedicatedWindow('a', { avoidDisplayBounds: h.displays[1].bounds });
+    expect(mod.__test__.getDedicatedSlot('a')!.displayId).toBe('21');
+    const old = { ...h.windows.get(50)! };
+    await mod.__test__.ensureDedicatedWindow('a', { avoidDisplayBounds: h.displays[2].bounds });
+    expect(h.windows.get(50)).toEqual(old);
+    for (const slot of ['b', 'c', 'd', 'e']) {
+      await mod.__test__.ensureDedicatedWindow(slot, { avoidDisplayBounds: h.displays[2].bounds });
+      expect(mod.__test__.getDedicatedSlot(slot)!.displayId).toBe('20');
+    }
+    await mod.__test__.ensureDedicatedWindow('f', { avoidDisplayBounds: h.displays[2].bounds });
+    expect(mod.__test__.getDedicatedSlot('f')).toMatchObject({ displayId: '21', tileIndex: 1 });
+    expect(h.windows.get(50)).toEqual(old);
+    h.chrome.windows.update.mockClear();
+    await mod.__test__.reconcileDedicatedWindows();
+    expect(h.chrome.windows.update).not.toHaveBeenCalled();
+  });
+
+  it('opening/closing windows leaves other bounds unchanged and reuses the smallest free cell', async () => {
+    const h = dedicatedHarness();
+    h.chrome.windows.remove = vi.fn(h.closeWindow);
+    vi.stubGlobal('chrome', h.chrome);
+    const mod = await import('./background');
+    await mod.__test__.ensureDedicatedWindow('a');
+    const first = { ...h.windows.get(50)! };
+    await mod.__test__.ensureDedicatedWindow('b');
+    await mod.__test__.ensureDedicatedWindow('c');
+    const third = { ...h.windows.get(52)! };
+    h.chrome.windows.update.mockClear();
+    await mod.__test__.closeDedicatedWindows({ slot: 'b' });
+    await mod.__test__.ensureDedicatedWindow('d');
+    expect(mod.__test__.getDedicatedSlot('d')!.tileIndex).toBe(1);
+    expect(h.windows.get(50)).toEqual(first);
+    expect(h.windows.get(52)).toEqual(third);
+    expect(h.chrome.windows.update).not.toHaveBeenCalled();
+  });
+
+  it.each(['maximized', 'fullscreen', 'minimized', 'normal'])('reconciles a displaced %s window without focusing and is idempotent', async state => {
+    const h = dedicatedHarness();
+    vi.stubGlobal('chrome', h.chrome);
+    const mod = await import('./background');
+    await mod.__test__.ensureDedicatedWindow('heal');
+    const target = mod.__test__.getDedicatedSlot('heal')!.placement.requestedBounds!;
+    Object.assign(h.windows.get(50)!, { state, left: 10, top: 20, width: 1440, height: 900 });
+    h.chrome.windows.update.mockClear();
+    const result = await mod.__test__.handleSessions({ id: 'r', action: 'sessions', op: 'window-relayout' });
+    expect(result.data).toMatchObject({ changed: 1, windows: [{ slot: 'heal', displayId: 'virt', tileIndex: 0, changed: true,
+      old: { bounds: { left: 10, top: 20, width: 1440, height: 900 }, state }, new: { bounds: target, state: 'normal' } }] });
+    expect(h.windows.get(50)).toMatchObject({ ...target, state: 'normal', focused: false });
+    if (state !== 'normal') expect(h.chrome.windows.update.mock.calls[0]).toEqual([50, { state: 'normal' }]);
+    for (const call of h.chrome.windows.update.mock.calls) expect(call[1]).not.toHaveProperty('focused');
+    expect(mod.__test__.getDedicatedSlot('heal')!.reconciledAt).toEqual(expect.any(Number));
+    h.chrome.windows.update.mockClear();
+    h.chrome.storage.session.set.mockClear();
+    await mod.__test__.reconcileDedicatedWindows();
+    expect(h.chrome.windows.update).not.toHaveBeenCalled();
+    expect(h.chrome.storage.session.set).not.toHaveBeenCalled();
+  });
+
+  it('display-change events heal moved bounds, resize grids and move only windows whose display disappeared', async () => {
+    const h = dedicatedHarness();
+    h.displays[1].id = '20';
+    h.displays.push({ ...h.displays[1], id: '21', name: 'Virtual B', bounds: { left: 1512, top: 0, width: 2560, height: 1440 }, workArea: { left: 1512, top: 0, width: 2560, height: 1440 } });
+    vi.stubGlobal('chrome', h.chrome);
+    const mod = await import('./background');
+    await mod.__test__.ensureDedicatedWindow('a');
+    await mod.__test__.ensureDedicatedWindow('b', { avoidDisplayBounds: h.displays[1].bounds });
+    const b = { ...h.windows.get(51)! };
+    const event = h.chrome.system.display.onDisplayChanged.addListener.mock.calls[0][0];
+    Object.assign(h.windows.get(50)!, { left: 0, state: 'maximized' });
+    await event();
+    expect(h.windows.get(50)).toMatchObject({ left: -2560, state: 'normal' });
+    h.displays[1].workArea.width = 1920;
+    await event();
+    expect(h.windows.get(50)!.width).toBe(960);
+    expect(h.windows.get(51)).toEqual(b);
+    h.displays.splice(1, 1);
+    await event();
+    expect(mod.__test__.getDedicatedSlot('a')).toMatchObject({ displayId: '21', tileIndex: 1 });
+    expect(h.windows.get(51)).toEqual(b);
+  });
+
+  it('reuses the 30-second alarm for reconciliation and preserves half width', async () => {
+    const h = dedicatedHarness();
+    vi.stubGlobal('chrome', h.chrome);
+    const mod = await import('./background');
+    mod.__test__.setDedicatedIdleTtlMs(60_000);
+    await mod.__test__.ensureDedicatedWindow('half', { half: true });
+    Object.assign(h.windows.get(50)!, { left: 0, width: 1440, state: 'minimized' });
+    const alarm = h.chrome.alarms.onAlarm.addListener.mock.calls[0][0];
+    await alarm({ name: 'opencli-dedicated-reap' });
+    expect(h.windows.get(50)).toMatchObject({ left: -2560, width: 640, height: 720, state: 'normal' });
+    expect(h.chrome.alarms.create).toHaveBeenCalledWith('opencli-dedicated-reap', { periodInMinutes: 0.5 });
+  });
+
+  it('command preflight heals windows but leaves explicit bounds/display placements alone', async () => {
+    const h = dedicatedHarness();
+    vi.stubGlobal('chrome', h.chrome);
+    const mod = await import('./background');
+    await mod.__test__.ensureDedicatedWindow('auto');
+    await mod.__test__.ensureDedicatedWindow('explicit', { bounds: { left: -2000, top: -1000, width: 1000, height: 800 } });
+    await mod.__test__.ensureDedicatedWindow('display', { display: '虚拟' });
+    for (const id of [50, 51, 52]) Object.assign(h.windows.get(id)!, { left: 10, state: 'maximized' });
+    await mod.__test__.handleCommand({ id: 'command', action: 'unknown', session: 'layout-check' } as never);
+    expect(h.windows.get(50)).toMatchObject({ left: -2560, state: 'normal' });
+    expect(h.windows.get(51)).toMatchObject({ left: 10, state: 'maximized' });
+    expect(h.windows.get(52)).toMatchObject({ left: 10, state: 'maximized' });
+  });
+
+  it('persists fixed assignments across worker restore and forgets vanished windows', async () => {
+    const h = dedicatedHarness();
+    vi.stubGlobal('chrome', h.chrome);
+    const mod = await import('./background');
+    await mod.__test__.ensureDedicatedWindow('a');
+    await mod.__test__.ensureDedicatedWindow('b');
+    const old = { ...h.windows.get(51)! };
+    await mod.__test__.restoreDedicatedState();
+    expect(mod.__test__.getDedicatedSlot('b')).toMatchObject({ displayId: 'virt', tileIndex: 1 });
+    h.windows.delete(50);
+    await mod.__test__.reconcileDedicatedWindows();
+    expect(mod.__test__.getDedicatedSlot('a')).toMatchObject({ windowId: null, displayId: null, tileIndex: null });
+    expect(h.windows.get(51)).toEqual(old);
+  });
+
+  it('adopts a legacy registry on its original screen when displayId is absent', async () => {
+    const h = dedicatedHarness();
+    h.displays[1].id = '20';
+    h.displays.push({ ...h.displays[1], id: '21', name: 'Virtual B', bounds: { left: 1512, top: 0, width: 2560, height: 1440 }, workArea: { left: 1512, top: 0, width: 2560, height: 1440 } });
+    vi.stubGlobal('chrome', h.chrome);
+    const mod = await import('./background');
+    await mod.__test__.ensureDedicatedWindow('legacy', { avoidDisplayBounds: h.displays[1].bounds });
+    const snapshot = { ...h.windows.get(50)! };
+    const storage = await h.chrome.storage.session.get('opencli_dedicated_windows_v1');
+    delete storage.opencli_dedicated_windows_v1.slots.legacy.displayId;
+    await h.chrome.storage.session.set(storage);
+    await mod.__test__.restoreDedicatedState();
+    await mod.__test__.reconcileDedicatedWindows();
+    expect(mod.__test__.getDedicatedSlot('legacy')).toMatchObject({ displayId: '21', tileIndex: 0 });
+    expect(h.windows.get(50)).toEqual(snapshot);
+  });
+
+  it('a failed creation cannot retain a cell later occupied by another window, and creation/reconcile serialize', async () => {
+    const h = dedicatedHarness();
+    vi.stubGlobal('chrome', h.chrome);
+    const mod = await import('./background');
+    h.chrome.windows.create.mockRejectedValueOnce(new Error('mock creation failed'));
+    await expect(mod.__test__.ensureDedicatedWindow('retry')).rejects.toThrow('mock creation failed');
+    await mod.__test__.ensureDedicatedWindow('a');
+    const old = { ...h.windows.get(50)! };
+    await Promise.all([
+      mod.__test__.ensureDedicatedWindow('retry'),
+      mod.__test__.reconcileDedicatedWindows(),
+      mod.__test__.ensureDedicatedWindow('b'),
+    ]);
+    expect(mod.__test__.getDedicatedSlot('a')!.tileIndex).toBe(0);
+    expect(mod.__test__.getDedicatedSlot('retry')!.tileIndex).toBe(1);
+    expect(mod.__test__.getDedicatedSlot('b')!.tileIndex).toBe(2);
+    expect(h.windows.get(50)).toEqual(old);
+  });
+
+  it('status exposes each screen grid and never includes primary while secondary screens exist', async () => {
+    const h = dedicatedHarness();
+    h.displays[1].bounds = { left: -5120, top: 0, width: 5120, height: 2880 };
+    h.displays[1].workArea = { left: -5120, top: 0, width: 5120, height: 2850 };
+    h.displays.push({ ...h.displays[1], id: '21', name: 'Virtual B', bounds: { left: 1512, top: 0, width: 5120, height: 2880 }, workArea: { left: 1512, top: 0, width: 5120, height: 2850 } });
+    vi.stubGlobal('chrome', h.chrome);
+    const mod = await import('./background');
+    await mod.__test__.ensureDedicatedWindow('a', { avoidDisplayBounds: h.displays[1].bounds });
+    const status = (await mod.__test__.handleDedicatedWindowOp({ id: 's', action: 'sessions', op: 'window-status' })).data as any;
+    expect(status.pool).toMatchObject({ naturalCapacity: 24, capacity: 24 });
+    expect(status.pool.automationDisplays).toHaveLength(2);
+    for (const d of status.pool.automationDisplays) expect(d).toMatchObject({ cols: 4, rows: 3, tile: { width: 1280, height: 950 }, naturalCapacity: 12 });
+    expect(status.windows[0]).toMatchObject({ displayId: '21', tileIndex: 0, reconciledAt: expect.any(Number) });
+    h.displays.splice(1);
+    const fallback = (await mod.__test__.handleDedicatedWindowOp({ id: 's2', action: 'sessions', op: 'window-status' })).data as any;
+    expect(fallback.pool.automationDisplays).toMatchObject([{ id: 'main', cols: 1, rows: 1 }]);
+    expect(fallback.windows[0].displayId).toBe('main');
   });
 
   it('ten one-shot sessions in a row reuse one window instead of opening ten', async () => {
