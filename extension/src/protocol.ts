@@ -92,6 +92,7 @@ export interface Command {
   windowBounds?: { left: number; top: number; width: number; height: number };
   /** `dedicated` only: display-name pattern ('/re/flags' or case-insensitive substring) to place the window on. */
   windowDisplay?: string;
+  half?: boolean;
   avoidDisplayBounds?: { left: number; top: number; width: number; height: number };
   /** `dedicated` only: make the session tab the active tab of its dedicated window before each command (default true). */
   autoSelect?: boolean;

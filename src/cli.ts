@@ -886,6 +886,7 @@ export function createProgram(BUILTIN_CLIS: string, USER_CLIS: string): Command 
     .option('--window <mode>', 'Window mode: dedicated (default — an OpenCLI-owned window, created unfocused and placed off your screen when a second display exists; the tab itself renders visible), background (hidden tab in your current window, never steals focus), active (selects the tab within its window only, no OS focus steal), foreground (raise + select), isolated (background in its own window)')
     .option('--window-slot <name>', 'Pin this session to a named dedicated window (only used with --window dedicated). Omit it and the session borrows an idle window from the pool and hands it back when its lease ends')
     .option('--window-bounds <x,y,w,h>', 'Dedicated window explicit placement: left,top,width,height (only used with --window dedicated)')
+    .option('--half', 'Dedicated only: occupy one full grid cell at half its width, aligned left, for mobile/H5 layouts; do not resize the window width manually')
     .option('--window-display <pattern>', 'Dedicated window display pattern: name substring or /regex/flags (only used with --window dedicated; ignored when --window-bounds is set)')
     .description('Browser control — navigate, click, type, extract, wait (no LLM needed)')
     .usage('<session> <command> [options]')
@@ -1049,6 +1050,7 @@ still usable even when navigation is reported as timed out.
         const windowBoundsRaw = getCommandOption(command, 'windowBounds');
         const windowDisplayRaw = getCommandOption(command, 'windowDisplay');
         setDaemonWindowPlacement({
+          half: getCommandOption(command, 'half') === true,
           ...(typeof windowSlotRaw === 'string' && windowSlotRaw.trim() ? { slot: windowSlotRaw.trim() } : {}),
           ...(typeof windowBoundsRaw === 'string' && windowBoundsRaw.trim()
             ? { bounds: parseWindowBounds(windowBoundsRaw.trim(), '--window-bounds') }
@@ -3488,6 +3490,7 @@ cli({
   type DedicatedWindowTabs = { total?: number; leases?: number; placeholders?: number; automation?: number; foreign?: number };
   interface DedicatedWindowInfo {
     slot: string;
+    half?: boolean;
     windowId: number | null;
     exists: boolean;
     bounds: DedicatedWindowBounds | null;
@@ -3594,6 +3597,7 @@ cli({
       slot: info.slot,
       window: info.windowId === null || info.windowId === undefined ? '-' : `win${info.windowId}`,
       exists: info.exists ? 'yes' : 'no',
+      half: String(info.half === true),
     };
     if (info.created !== undefined) row.created = info.created ? 'yes' : 'no';
     if (info.moved !== undefined) row.moved = info.moved ? 'yes' : 'no';
@@ -3620,6 +3624,7 @@ cli({
       slot: info.slot,
       window: info.windowId === null || info.windowId === undefined ? '-' : `win${info.windowId}`,
       state: info.busy ? 'busy' : 'idle',
+      half: String(info.half === true),
       idle: info.busy ? '-' : formatIdleMsForTable(info.idleMs),
       tile: info.tileIndex === null || info.tileIndex === undefined ? '-' : String(info.tileIndex),
       bounds: formatBoundsForTable(info.bounds),
@@ -3688,7 +3693,7 @@ cli({
         } else {
           renderOutput(windows.map(dedicatedWindowRow), {
             fmt: 'table',
-            columns: ['slot', 'window', 'exists', 'bounds', 'display', 'active_tab', 'tabs', 'foreign'],
+            columns: ['slot', 'window', 'exists', 'half', 'bounds', 'display', 'active_tab', 'tabs', 'foreign'],
           });
         }
         printDisplaysSection(data);
@@ -3705,9 +3710,13 @@ cli({
     .option('--display <pattern>', 'Display name pattern: substring or /regex/flags')
     .option('--foreign-tabs <policy>', 'Foreign tab policy: evict (default) or tolerate')
     .option('-f, --format <fmt>', 'Output format: table (default) or json', 'table')
-    .action(async (opts: { slot?: string; bounds?: string; display?: string; foreignTabs?: string; format?: string }) => {
+    .action(async (opts: { slot?: string; bounds?: string; display?: string; foreignTabs?: string; format?: string }, command: Command) => {
       try {
         const params: Record<string, unknown> = {};
+        if (getCommandOption(command, 'half') === true && getBrowserWindowMode(command, 'dedicated') === 'dedicated') {
+          params.half = true;
+          params.windowMode = 'dedicated';
+        }
         if (typeof opts.slot === 'string' && opts.slot.trim()) params.windowSlot = opts.slot.trim();
         if (typeof opts.bounds === 'string' && opts.bounds.trim()) {
           params.windowBounds = parseWindowBounds(opts.bounds.trim(), '--bounds');
@@ -3762,7 +3771,7 @@ cli({
         } else {
           renderOutput(windows.map(dedicatedWindowListRow), {
             fmt: 'table',
-            columns: ['slot', 'window', 'state', 'idle', 'tile', 'bounds', 'tabs'],
+            columns: ['slot', 'window', 'state', 'half', 'idle', 'tile', 'bounds', 'tabs'],
           });
         }
         printPoolSummary(data.pool);

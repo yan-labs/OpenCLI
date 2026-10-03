@@ -10,6 +10,8 @@ Default browser window placement changes from `background` to `dedicated`, and `
 
 ### Features
 
+* **browser window** — add `--half` for mobile/H5 layouts: dedicated windows keep a full grid slot but use its left half, restore full width when returned to the pool, and report `half` in window status/list.
+
 * **browser window** — on macOS, dedicated windows avoid the display under the mouse (falling back to the front application focused window); single-display and helper-unavailable setups retain the existing placement fallback.
 
 * **browser window** — raise the dedicated pool limit to 40; reap idle windows after 15 seconds by default using a lease-release timeout, the existing alarm, and checks before window acquisition/creation. A full pool reclaims its oldest idle windows first and reports `dedicated-pool-exhausted` only when every window has an active lease. `OPENCLI_DEDICATED_IDLE_MS` still overrides the TTL.

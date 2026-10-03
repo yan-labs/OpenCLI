@@ -265,6 +265,7 @@ export interface DaemonCommand {
   windowBounds?: { left: number; top: number; width: number; height: number };
   /** Dedicated-window display-name pattern ('/re/flags' or case-insensitive substring). Used when windowBounds is absent. */
   windowDisplay?: string;
+  half?: boolean;
   avoidDisplayBounds?: { left: number; top: number; width: number; height: number };
   /** Auto-select the session's tab in its dedicated window before every page-scoped command. Default true when dedicated (applied by the extension when omitted). */
   autoSelect?: boolean;
@@ -419,6 +420,7 @@ async function sendCommandRaw(
   const avoidDisplayBounds = windowMode === 'dedicated' && !windowBounds && !windowDisplay
     ? params.avoidDisplayBounds ?? await activeDisplayBounds()
     : undefined;
+  const half = windowMode === 'dedicated' ? params.half ?? placement.half : undefined;
   const autoSelect = params.autoSelect ?? placement.autoSelect;
   const foreignTabPolicy = params.foreignTabPolicy ?? placement.foreignTabPolicy;
   const dedicatedIdleMs = params.dedicatedIdleMs ?? placement.dedicatedIdleMs;
@@ -469,6 +471,7 @@ async function sendCommandRaw(
       ...(windowBounds !== undefined && { windowBounds }),
       ...(windowDisplay !== undefined && { windowDisplay }),
       ...(avoidDisplayBounds !== undefined && { avoidDisplayBounds }),
+      ...(half !== undefined && { half }),
       ...(autoSelect !== undefined && { autoSelect }),
       ...(foreignTabPolicy !== undefined && { foreignTabPolicy }),
       ...(dedicatedIdleMs !== undefined && { dedicatedIdleMs }),

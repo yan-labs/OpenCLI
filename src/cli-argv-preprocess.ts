@@ -137,7 +137,7 @@ export function rewriteBrowserArgv(argv: readonly string[]): string[] {
  * `.option(...)` calls on the `browser` command in cli.ts.
  */
 const HOISTABLE_WINDOW_OPTIONS: ReadonlySet<string> = new Set([
-  '--window', '--window-slot', '--window-bounds', '--window-display',
+  '--window', '--window-slot', '--window-bounds', '--window-display', '--half',
 ]);
 
 /**
@@ -164,7 +164,7 @@ function hoistBrowserWindowOptions(argv: string[], fromIndex: number): void {
       i += 1;
       continue;
     }
-    if (eq !== -1) {
+    if (key === '--half' || eq !== -1) {
       hoisted.push(...argv.splice(i, 1));
       continue; // argv shrank in place; re-check the same index
     }

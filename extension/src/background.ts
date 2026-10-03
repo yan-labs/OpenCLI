@@ -480,6 +480,7 @@ type SessionOverrides = {
   windowSlot?: string;
   windowBounds?: { left: number; top: number; width: number; height: number };
   windowDisplay?: string;
+  half?: boolean;
   avoidDisplayBounds?: Rect;
   autoSelect?: boolean;
 };
@@ -1594,6 +1595,8 @@ type DedicatedSlotState = {
   windowId: number | null;
   placeholderTabIds: Set<number>;
   placement: DedicatedPlacement;
+  half: boolean;
+  fullBounds: Rect | null;
   autoSelect: boolean;
   foreignTabPolicy: ForeignTabPolicy;
   evictedTabs: number;
@@ -1607,7 +1610,7 @@ type DedicatedSlotState = {
 };
 type DisplayInfo = { id: string; name: string; primary: boolean; internal: boolean; bounds: Rect; workArea: Rect | null };
 type DedicatedTabOwner = 'lease' | 'placeholder' | 'automation' | 'foreign';
-type DedicatedPlacementRequest = { bounds?: Rect; display?: string; avoidDisplayBounds?: Rect };
+type DedicatedPlacementRequest = { half?: boolean; bounds?: Rect; display?: string; avoidDisplayBounds?: Rect };
 let dedicatedAvoidDisplayBounds: Rect | undefined;
 
 const DEDICATED_SLOT_PATTERN = /^[A-Za-z0-9_.-]{1,40}$/;
@@ -1857,10 +1860,12 @@ async function retileDedicatedWindows(displays: DisplayInfo[] | null): Promise<v
   if (typeof updateWindow !== 'function') return;
   for (let i = 0; i < auto.length; i += 1) {
     const state = auto[i];
-    const { display, target } = dedicatedAutomationTile(automationDisplays, i, count);
+    const { display, target: fullBounds } = dedicatedAutomationTile(automationDisplays, i, count);
+    const target = state.half ? { ...fullBounds, width: Math.floor(fullBounds.width / 2) } : fullBounds;
+    state.fullBounds = fullBounds;
     if (!target || state.windowId === null) continue;
     state.tileIndex = i;
-    state.placement.requestedBounds = target;
+    state.placement.requestedBounds = fullBounds;
     state.placement.cell = i;
     state.placement.displayName = display.name;
     state.placement.displayFound = true;
@@ -2011,6 +2016,8 @@ function getDedicatedSlot(slot: string, pooled = false): DedicatedSlotState {
       windowId: null,
       placeholderTabIds: new Set(),
       placement: emptyDedicatedPlacement(),
+      half: false,
+      fullBounds: null,
       autoSelect: true,
       foreignTabPolicy: 'evict',
       evictedTabs: 0,
@@ -2059,10 +2066,16 @@ function holdDedicatedSlot(state: DedicatedSlotState, leaseKey: string): void {
 }
 
 /** The lease let go: the window becomes reusable now and reapable later. */
-function releaseDedicatedHolder(leaseKey: string): void {
+async function releaseDedicatedHolder(leaseKey: string): Promise<void> {
   for (const state of dedicatedSlots.values()) {
     if (!state.holders.delete(leaseKey)) continue;
     if (state.holders.size === 0) {
+      if (state.half) {
+        state.half = false;
+        if (state.windowId !== null && state.fullBounds) {
+          await chrome.windows.update(state.windowId, state.fullBounds).catch(() => {});
+        }
+      }
       state.idleSince = Date.now();
       const idleSince = state.idleSince;
       setTimeout(() => {
@@ -2102,6 +2115,8 @@ async function persistDedicatedState(): Promise<void> {
       windowId: state.windowId,
       placeholderTabIds: [...state.placeholderTabIds],
       placement: state.placement,
+      half: state.half,
+      fullBounds: state.fullBounds,
       autoSelect: state.autoSelect,
       foreignTabPolicy: state.foreignTabPolicy,
       evictedTabs: state.evictedTabs,
@@ -2165,6 +2180,10 @@ async function restoreDedicatedState(): Promise<void> {
       continue;
     }
     state.windowId = raw.windowId;
+    state.fullBounds = (raw.fullBounds as Rect | null) ?? null;
+    if (raw.half === true && state.fullBounds) {
+      await chrome.windows.update(state.windowId, state.fullBounds).catch(() => {});
+    }
     for (const tabId of Array.isArray(raw.placeholderTabIds) ? raw.placeholderTabIds : []) {
       if (typeof tabId !== 'number') continue;
       try {
@@ -2180,6 +2199,7 @@ async function restoreDedicatedState(): Promise<void> {
 function dedicatedPlacementRequest(leaseKey: string): DedicatedPlacementRequest {
   const overrides = sessionOverrides.get(leaseKey);
   return {
+    half: overrides?.half === true,
     ...(overrides?.windowBounds ? { bounds: overrides.windowBounds } : {}),
     ...(overrides?.windowDisplay ? { display: overrides.windowDisplay } : {}),
     ...(overrides?.avoidDisplayBounds ? { avoidDisplayBounds: overrides.avoidDisplayBounds } : {}),
@@ -2210,7 +2230,7 @@ function applyDedicatedCommandFields(leaseKey: string, cmd: Command): void {
   const pinnedSlot = typeof cmd.windowSlot === 'string' && DEDICATED_SLOT_PATTERN.test(cmd.windowSlot) ? cmd.windowSlot : null;
   const slot = pinnedSlot ?? dedicatedSlotNameFor(leaseKey);
   dedicatedAvoidDisplayBounds = cmd.avoidDisplayBounds;
-  const patch: SessionOverrides = { avoidDisplayBounds: cmd.avoidDisplayBounds, autoSelect: cmd.autoSelect !== false, ...(pinnedSlot ? { windowSlot: pinnedSlot } : {}) };
+  const patch: SessionOverrides = { half: cmd.half === true, avoidDisplayBounds: cmd.avoidDisplayBounds, autoSelect: cmd.autoSelect !== false, ...(pinnedSlot ? { windowSlot: pinnedSlot } : {}) };
   // Placement is replaced as a whole: bounds and a display pattern never linger from an earlier command.
   if (isRect(cmd.windowBounds)) {
     patch.windowBounds = normalizeRect(cmd.windowBounds);
@@ -2337,7 +2357,11 @@ async function ensureDedicatedWindowUnlocked(
     if (adopted) win = adopted;
   }
   if (!win || state.windowId === null) await assertDedicatedCapacity(state);
-  const { target, area } = await resolveDedicatedTarget(state, request);
+  const halfChanged = state.half !== (request.half === true);
+  state.half = request.half === true;
+  const { target: fullTarget, area } = await resolveDedicatedTarget(state, request);
+  state.fullBounds = fullTarget ?? state.fullBounds ?? { left: win?.left ?? 0, top: win?.top ?? 0, width: DEDICATED_CELL.width, height: DEDICATED_CELL.height };
+  const target = state.half ? { ...state.fullBounds, width: Math.floor(state.fullBounds.width / 2) } : fullTarget ?? (halfChanged ? state.fullBounds : null);
   let created = false;
   let moved = false;
   let createdTabId: number | undefined;
@@ -2370,11 +2394,11 @@ async function ensureDedicatedWindowUnlocked(
       const { displays } = await listDisplays();
       await retileDedicatedWindows(displays);
     }
-  } else if (request.reposition && target && area && (win.state === undefined || win.state === 'normal')) {
+  } else if ((halfChanged || (request.reposition && area)) && target && (win.state === undefined || win.state === 'normal')) {
     // Minimized / maximized / fullscreen windows are reported, not moved: resizing one
     // would leave fullscreen (a Space switch on macOS) or un-minimize it.
     const current = rectFromWindow(win);
-    if (!current || !rectCenterInside(current, area)) {
+    if (halfChanged || (state.half && current?.width !== target.width) || !current || !rectCenterInside(current, area ?? state.fullBounds)) {
       // No `focused` here: moving the window must never raise it.
       const updateWindow = (chrome.windows as unknown as { update?: (id: number, info: Partial<Rect>) => Promise<unknown> }).update;
       if (typeof updateWindow === 'function') {
@@ -2604,7 +2628,7 @@ async function createDedicatedTabLease(leaseKey: string, targetUrl: string): Pro
     // No lease was created, so nothing will release the window later: hand it back
     // now, or a failed command (a full pool, a closed window) would leak a holder and
     // keep a window out of the pool for the rest of the browser session.
-    releaseDedicatedHolder(leaseKey);
+    await releaseDedicatedHolder(leaseKey);
     throw err;
   }
 }
@@ -2737,6 +2761,7 @@ async function releaseDedicatedLeaseTabUnlocked(state: DedicatedSlotState, tabId
 type DedicatedWindowInfo = {
   slot: string;
   pooled: boolean;
+  half: boolean;
   holders: number;
   busy: boolean;
   idleMs: number | null;
@@ -2799,6 +2824,7 @@ async function describeDedicatedSlot(state: DedicatedSlotState, displays: Displa
   return {
     slot: state.slot,
     pooled: state.pooled,
+    half: state.half,
     holders: state.holders.size,
     busy: state.holders.size > 0,
     idleMs: state.idleSince === null ? null : Math.max(0, Date.now() - state.idleSince),
@@ -2878,6 +2904,7 @@ async function handleDedicatedWindowOp(cmd: Command): Promise<Result> {
     if (cmd.foreignTabPolicy === 'evict' || cmd.foreignTabPolicy === 'tolerate') state.foreignTabPolicy = cmd.foreignTabPolicy;
     if (typeof cmd.autoSelect === 'boolean') state.autoSelect = cmd.autoSelect;
     const result = await ensureDedicatedWindow(slot, {
+      half: cmd.half === true,
       ...(cmd.avoidDisplayBounds ? { avoidDisplayBounds: cmd.avoidDisplayBounds } : {}),
       ...(isRect(cmd.windowBounds) ? { bounds: normalizeRect(cmd.windowBounds) } : {}),
       ...(typeof cmd.windowDisplay === 'string' && cmd.windowDisplay.trim() ? { display: cmd.windowDisplay.trim() } : {}),
@@ -4364,7 +4391,7 @@ async function releaseLease(leaseKey: string, reason: string = 'released'): Prom
       const dedicatedSlot = dedicatedSlotForWindow(session.windowId);
       // Whatever happens to the tab, the window goes back to the pool for the next
       // caller and starts its idle clock.
-      releaseDedicatedHolder(leaseKey);
+      await releaseDedicatedHolder(leaseKey);
       if (dedicatedSlot) {
         // Dedicated windows outlive their leases: the last tab stays as a placeholder.
         const outcome = await releaseDedicatedLeaseTab(dedicatedSlot, tabId);

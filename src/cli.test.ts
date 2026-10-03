@@ -620,7 +620,7 @@ describe('createProgram root help descriptions', () => {
       });
       // session is now a hidden internal option (consumed from the <session> positional).
       // namespace_options should only list user-facing options.
-      expect(data.namespace_options.map((option: any) => option.name)).toEqual(['window', 'windowSlot', 'windowBounds', 'windowDisplay']);
+      expect(data.namespace_options.map((option: any) => option.name)).toEqual(['window', 'windowSlot', 'windowBounds', 'half', 'windowDisplay']);
       expect(data.structured_help).toMatchObject({
         usage: 'opencli browser <session> tab --help -f yaml',
       });
@@ -652,7 +652,7 @@ describe('createProgram root help descriptions', () => {
       });
       expect(data.command_options.map((option: any) => option.name)).toEqual(['role', 'name', 'label', 'text', 'testid', 'nth', 'tab']);
       // session is hidden; `window` and its dedicated-mode placement siblings surface as namespace options.
-      expect(data.namespace_options.map((option: any) => option.name)).toEqual(['window', 'windowSlot', 'windowBounds', 'windowDisplay']);
+      expect(data.namespace_options.map((option: any) => option.name)).toEqual(['window', 'windowSlot', 'windowBounds', 'half', 'windowDisplay']);
       expect(data.global_options.map((option: any) => option.name)).toContain('profile');
     } finally {
       process.argv = argv;

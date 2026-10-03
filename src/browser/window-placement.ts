@@ -55,6 +55,7 @@ export type ForeignTabPolicy = 'evict' | 'tolerate';
 
 /** In-process override set once per CLI invocation from --window-slot/--window-bounds/--window-display/--foreign-tabs. */
 export interface DedicatedWindowPlacementOverride {
+  half?: boolean;
   slot?: string;
   bounds?: WindowBounds;
   display?: string;
@@ -64,6 +65,7 @@ export interface DedicatedWindowPlacementOverride {
 
 /** Resolved fields ready to attach onto a DaemonCommand (only when dedicated / a window op). */
 export interface ResolvedDedicatedPlacement {
+  half?: boolean;
   windowSlot?: string;
   windowBounds?: WindowBounds;
   windowDisplay?: string;
@@ -137,6 +139,7 @@ export function resolveDedicatedPlacement(
   overrides?: DedicatedWindowPlacementOverride | null,
 ): ResolvedDedicatedPlacement {
   const result: ResolvedDedicatedPlacement = {};
+  if (overrides?.half !== undefined) result.half = overrides.half;
 
   const slot = overrides?.slot ?? nonEmpty(env.OPENCLI_WINDOW_SLOT);
   if (slot !== undefined) result.windowSlot = slot;
