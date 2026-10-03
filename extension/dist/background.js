@@ -2608,9 +2608,13 @@ async function resolveDedicatedTarget(state, request) {
     const userDisplayBounds = dedicatedAvoidDisplayBounds ?? displays2?.find((d) => d.primary)?.bounds;
     const bounds = normalizeRect(request.bounds);
     if (userDisplayBounds && rectsOverlap(bounds, userDisplayBounds)) {
+      const relocatedFrom = state.placement.relocatedFrom;
+      const alreadyLogged = relocatedFrom?.left === bounds.left && relocatedFrom.top === bounds.top && relocatedFrom.width === bounds.width && relocatedFrom.height === bounds.height;
       state.placement = { ...emptyDedicatedPlacement(), relocatedFrom: bounds };
       request = { ...request, bounds: void 0 };
-      console.warn(`[opencli] WARN: 显式 bounds 落在用户当前屏，位置已改到自动宫格，尺寸保留 (slot=${state.slot}, bounds=${JSON.stringify(bounds)})`);
+      if (!alreadyLogged) {
+        console.warn(`[opencli] WARN: 显式 bounds 落在用户当前屏，位置已改到自动宫格，尺寸保留 (slot=${state.slot}, bounds=${JSON.stringify(bounds)})`);
+      }
     }
   }
   const previous = state.placement;

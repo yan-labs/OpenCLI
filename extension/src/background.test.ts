@@ -3527,6 +3527,27 @@ describe('dedicated automation window', () => {
     warn.mockRestore();
   });
 
+  it('warns once for identical relocated bounds in a slot and again when the rectangle changes', async () => {
+    const h = dedicatedHarness();
+    vi.stubGlobal('chrome', h.chrome);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const mod = await import('./background');
+      const bounds = { left: 0, top: 0, width: 500, height: 900 };
+      await mod.__test__.ensureDedicatedWindow('warn-dedupe', { bounds });
+      await mod.__test__.ensureDedicatedWindow('warn-dedupe', { bounds: { ...bounds } });
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenLastCalledWith(expect.stringContaining('显式 bounds 落在用户当前屏'));
+
+      const changedBounds = { ...bounds, left: 10 };
+      await mod.__test__.ensureDedicatedWindow('warn-dedupe', { bounds: changedBounds });
+      expect(warn).toHaveBeenCalledTimes(2);
+      expect(mod.__test__.getDedicatedSlot('warn-dedupe')!.placement.relocatedFrom).toEqual(changedBounds);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it('syncs relocated bounds size on slot reuse and leaves matching-size nudges alone', async () => {
     const h = dedicatedHarness();
     vi.stubGlobal('chrome', h.chrome);

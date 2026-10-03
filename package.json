@@ -1,6 +1,6 @@
 {
   "name": "@jackwener/opencli",
-  "version": "1.13.6",
+  "version": "1.13.7",
   "publishConfig": {
     "access": "public"
   },
