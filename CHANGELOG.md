@@ -28,7 +28,7 @@ Default browser window placement changes from `background` to `dedicated`, and `
 
 ### Bug Fixes
 
-* **browser window** — relocate explicit bounds centered on the current user display (primary fallback) to the automatic grid, preserve caller width/height up to the automation display work area, and report `placement.relocatedFrom` with a warning; dedicated CLI requests now detect the current display even with bounds. Reused windows synchronize their size with relocated bounds.
+* **browser window** — relocate explicit bounds centered on the current user display (primary fallback) to the automatic grid, preserve caller width/height up to the automation display work area, and report `placement.relocatedFrom` with a warning; dedicated CLI requests now detect the current display even with bounds. Reused windows synchronize their size with relocated bounds. Preserved-size positions are clamped within the automation display; reused windows only synchronize dimensions while their center remains on that display.
 
 * **browser window** — a `dedicated` command that would overlap another window on the automation display now fails closed with a `dedicated-pool-exhausted:` error telling the caller to wait or free a slot, instead of stacking a window nobody can see while `window status` still reported `onDisplay: true`.
 

@@ -1828,6 +1828,17 @@ function displayArea(display: DisplayInfo): Rect {
   return display.workArea && display.workArea.width > 0 && display.workArea.height > 0 ? display.workArea : display.bounds;
 }
 
+function dedicatedBoundsWithSize(tile: Rect, size: Rect, area: Rect): Rect {
+  const width = Math.min(size.width, area.width);
+  const height = Math.min(size.height, area.height);
+  return {
+    left: Math.max(area.left, Math.min(tile.left, area.left + area.width - width)),
+    top: Math.max(area.top, Math.min(tile.top, area.top + area.height - height)),
+    width,
+    height,
+  };
+}
+
 /** Slots with a live window, in tile order. */
 function liveDedicatedStates(): DedicatedSlotState[] {
   return [...dedicatedSlots.values()]
@@ -1864,7 +1875,7 @@ async function retileDedicatedWindows(displays: DisplayInfo[] | null): Promise<v
     const { display, target: tile } = dedicatedAutomationTile(automationDisplays, i, count);
     const area = displayArea(display);
     const size = state.placement.relocatedFrom;
-    const fullBounds = size ? { ...tile, width: Math.min(size.width, area.width), height: Math.min(size.height, area.height) } : tile;
+    const fullBounds = size ? dedicatedBoundsWithSize(tile, size, area) : tile;
     const target = state.half ? { ...fullBounds, width: Math.floor(fullBounds.width / 2) } : fullBounds;
     state.fullBounds = fullBounds;
     if (!target || state.windowId === null) continue;
@@ -2276,6 +2287,12 @@ async function resolveDedicatedTarget(state: DedicatedSlotState, request: Dedica
   }
   const previous = state.placement;
   if (!request.bounds && !request.display && state.windowId !== null && previous.source === 'auto' && previous.requestedBounds) {
+    if (previous.relocatedFrom) {
+      const { displays } = await listDisplays();
+      const display = pickAutomationDisplays(displays, dedicatedAvoidDisplayBounds)
+        .find(display => rectCenterInside(previous.requestedBounds!, displayArea(display)));
+      if (display) return { target: previous.requestedBounds, area: displayArea(display) };
+    }
     return { target: previous.requestedBounds, area: previous.requestedBounds };
   }
   if (request.bounds) {
@@ -2302,7 +2319,7 @@ async function resolveDedicatedTarget(state: DedicatedSlotState, request: Dedica
     const { display, target: tile } = dedicatedAutomationTile(automationDisplays, index, Math.max(others + 1, index + 1));
     const area = displayArea(display);
     const size = placement.relocatedFrom;
-    const target = size ? { ...tile, width: Math.min(size.width, area.width), height: Math.min(size.height, area.height) } : tile;
+    const target = size ? dedicatedBoundsWithSize(tile, size, area) : tile;
     state.placement = {
       source: 'auto',
       requestedBounds: target,
@@ -2313,7 +2330,7 @@ async function resolveDedicatedTarget(state: DedicatedSlotState, request: Dedica
       excludedDisplayBounds: excludedDisplayBounds(displays),
       ...(placement.relocatedFrom && { relocatedFrom: placement.relocatedFrom }),
     };
-    return { target, area: target };
+    return { target, area: size ? area : target };
   }
 
   const { displays } = await listDisplays();
@@ -2422,7 +2439,10 @@ async function ensureDedicatedWindowUnlocked(
       const updateWindow = (chrome.windows as unknown as { update?: (id: number, info: Partial<Rect>) => Promise<unknown> }).update;
       if (typeof updateWindow === 'function') {
         try {
-          await updateWindow(state.windowId, target);
+          const update = state.placement.relocatedFrom && !halfChanged && current && rectCenterInside(current, area ?? state.fullBounds)
+            ? { width: target.width, height: target.height }
+            : target;
+          await updateWindow(state.windowId, update);
           moved = true;
         } catch (err) {
           console.warn(`[opencli] Failed to move dedicated window ${state.windowId}: ${err instanceof Error ? err.message : String(err)}`);

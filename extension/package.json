@@ -1,6 +1,6 @@
 {
   "name": "opencli-extension",
-  "version": "1.5.4",
+  "version": "1.5.5",
   "private": true,
   "opencli": {
     "compatRange": ">=1.7.0"
