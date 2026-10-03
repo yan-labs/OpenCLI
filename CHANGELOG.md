@@ -10,6 +10,8 @@ Default browser window placement changes from `background` to `dedicated`, and `
 
 ### Features
 
+* **browser window** — adapt the dedicated pool limit to the sum of all automation displays’ natural capacities, with a minimum of 4, replacing the fixed limit of 40. Capacity is recalculated from current displays for acquisition and window status/list.
+
 * **browser window** — add `--half` for mobile/H5 layouts: dedicated windows keep a full grid slot but use its left half, restore full width when returned to the pool, and report `half` in window status/list.
 
 * **browser window** — on macOS, dedicated windows avoid the display under the mouse (falling back to the front application focused window); single-display and helper-unavailable setups retain the existing placement fallback.

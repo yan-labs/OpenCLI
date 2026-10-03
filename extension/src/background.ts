@@ -1629,7 +1629,7 @@ const DEDICATED_PREFERRED_TILE = { width: 1280, height: 900 };
  * additional windows use preferred-size cascades instead of smaller grid tiles.
  */
 const DEDICATED_MIN_TILE = { width: 900, height: 620 };
-const DEDICATED_POOL_MAX = 40;
+const DEDICATED_POOL_MIN = 4;
 /** Pooled window names. `pool-1`, `pool-2`, … — never a caller's session name. */
 const DEDICATED_POOL_PREFIX = 'pool-';
 /** Idle windows live for 15 seconds; OPENCLI_DEDICATED_IDLE_MS overrides it. */
@@ -1896,7 +1896,7 @@ async function assertDedicatedCapacity(state: DedicatedSlotState): Promise<void>
   const automationDisplays = pickAutomationDisplays(displays, dedicatedAvoidDisplayBounds);
   const display = automationDisplays[0];
   const naturalCapacity = automationDisplays.length ? automationDisplays.reduce((sum, d) => sum + dedicatedCapacity(displayArea(d)), 0) : null;
-  const capacity = DEDICATED_POOL_MAX;
+  const capacity = Math.max(DEDICATED_POOL_MIN, naturalCapacity ?? DEDICATED_POOL_MIN);
   let live = liveDedicatedStates().length;
   if (live >= capacity) {
     const idle = liveDedicatedStates()
@@ -2924,7 +2924,7 @@ async function handleDedicatedWindowOp(cmd: Command): Promise<Result> {
   const automationDisplay = automationDisplays[0] ?? null;
   const area = automationDisplay ? displayArea(automationDisplay) : null;
   const naturalCapacity = automationDisplays.length ? automationDisplays.reduce((sum, d) => sum + dedicatedCapacity(displayArea(d)), 0) : null;
-  const capacity = DEDICATED_POOL_MAX;
+  const capacity = Math.max(DEDICATED_POOL_MIN, naturalCapacity ?? DEDICATED_POOL_MIN);
   const live = liveDedicatedStates().length;
   return {
     id: cmd.id,

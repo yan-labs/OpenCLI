@@ -2080,7 +2080,7 @@ function dedicatedPlaceholderUrl(slot) {
 const DEDICATED_CELL = { width: 1280, height: 900, offsetX: 80, offsetY: 60 };
 const DEDICATED_PREFERRED_TILE = { width: 1280, height: 900 };
 const DEDICATED_MIN_TILE = { width: 900, height: 620 };
-const DEDICATED_POOL_MAX = 40;
+const DEDICATED_POOL_MIN = 4;
 const DEDICATED_POOL_PREFIX = "pool-";
 const DEDICATED_IDLE_TTL_DEFAULT_MS = 15e3;
 const DEDICATED_REAP_ALARM = "opencli-dedicated-reap";
@@ -2292,7 +2292,7 @@ async function assertDedicatedCapacity(state) {
   const automationDisplays = pickAutomationDisplays(displays, dedicatedAvoidDisplayBounds);
   const display = automationDisplays[0];
   const naturalCapacity = automationDisplays.length ? automationDisplays.reduce((sum, d) => sum + dedicatedCapacity(displayArea(d)), 0) : null;
-  const capacity = DEDICATED_POOL_MAX;
+  const capacity = Math.max(DEDICATED_POOL_MIN, naturalCapacity ?? DEDICATED_POOL_MIN);
   let live = liveDedicatedStates().length;
   if (live >= capacity) {
     const idle = liveDedicatedStates().filter((candidate) => candidate.holders.size === 0 && candidate.idleSince !== null).sort((a, b) => a.idleSince - b.idleSince);
@@ -3152,7 +3152,7 @@ async function handleDedicatedWindowOp(cmd) {
   const automationDisplay = automationDisplays[0] ?? null;
   const area = automationDisplay ? displayArea(automationDisplay) : null;
   const naturalCapacity = automationDisplays.length ? automationDisplays.reduce((sum, d) => sum + dedicatedCapacity(displayArea(d)), 0) : null;
-  const capacity = DEDICATED_POOL_MAX;
+  const capacity = Math.max(DEDICATED_POOL_MIN, naturalCapacity ?? DEDICATED_POOL_MIN);
   const live = liveDedicatedStates().length;
   return {
     id: cmd.id,

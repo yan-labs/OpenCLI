@@ -4026,11 +4026,12 @@ describe('dedicated automation window — pool and layout', () => {
     expect(h.chrome.windows.create).toHaveBeenCalledTimes(3);
   });
 
-  it('cascades beyond natural capacity and refuses the forty-first live window', async () => {
+  it('refuses a live window beyond the adaptive pool capacity', async () => {
     const h = dedicatedHarness();
     vi.stubGlobal('chrome', h.chrome);
     const mod = await import('./background');
-    const capacity = 40;
+    const status = await mod.__test__.handleDedicatedWindowOp({ id: 'capacity', action: 'sessions', op: 'window-list' });
+    const capacity = Math.max(4, (status.data as any).pool.naturalCapacity ?? 4);
     for (let i = 0; i < capacity; i += 1) {
       const key = browserKey(`full-${i}`);
       useDedicated(mod, key);
@@ -4039,7 +4040,7 @@ describe('dedicated automation window — pool and layout', () => {
     const overflow = browserKey('overflow');
     useDedicated(mod, overflow);
     await expect(mod.__test__.resolveTabId(undefined, overflow, 'https://overflow.example/'))
-      .rejects.toThrow(/dedicated-pool-exhausted: 40 .*capacity 40.*naturalCapacity.*cascaded/);
+      .rejects.toThrow(new RegExp(`dedicated-pool-exhausted: ${capacity} .*capacity ${capacity}.*naturalCapacity.*cascaded`));
     expect(h.chrome.windows.create).toHaveBeenCalledTimes(capacity);
     // The failed command holds nothing: its would-be slot is idle, so it is reusable
     // and reapable instead of pinning a window nobody owns.
@@ -4100,8 +4101,8 @@ describe('dedicated automation window — pool and layout', () => {
     await mod.__test__.resolveTabId(undefined, key, 'https://status.example/');
     const res = await mod.__test__.handleDedicatedWindowOp({ id: '1', action: 'sessions', op: 'window-list' });
     expect(res.data.capabilities).toEqual(expect.arrayContaining(['window-pool', 'window-close', 'window-list', 'idle-reap', 'auto-display', 'dynamic-layout']));
-    expect(res.data.pool).toMatchObject({ live: 1, idle: 0, free: 39, naturalCapacity: res.data.pool.automationDisplays.reduce((sum: number, d: any) => sum + mod.__test__.dedicatedCapacity(d.area), 0), automationDisplays: [expect.objectContaining({ id: res.data.pool.automationDisplay.id, naturalCapacity: mod.__test__.dedicatedCapacity(res.data.pool.automationDisplay.area) })] });
-    expect(res.data.pool.capacity).toBe(40);
+    expect(res.data.pool).toMatchObject({ live: 1, idle: 0, free: Math.max(4, (res.data as any).pool.naturalCapacity ?? 4) - 1, naturalCapacity: res.data.pool.automationDisplays.reduce((sum: number, d: any) => sum + mod.__test__.dedicatedCapacity(d.area), 0), automationDisplays: [expect.objectContaining({ id: res.data.pool.automationDisplay.id, naturalCapacity: mod.__test__.dedicatedCapacity(res.data.pool.automationDisplay.area) })] });
+    expect(res.data.pool.capacity).toBe(Math.max(4, (res.data as any).pool.naturalCapacity ?? 4));
     expect(res.data.pool.automationDisplay.primary).toBe(false);
     expect(res.data.windows[0]).toMatchObject({ pooled: true, busy: true, holders: 1 });
   });
