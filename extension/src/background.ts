@@ -1675,6 +1675,11 @@ function rectFromWindow(win: chrome.windows.Window | null | undefined): Rect | n
   return { left: left!, top: top!, width: width!, height: height! };
 }
 
+function rectsOverlap(rect: Rect, area: Rect): boolean {
+  return Math.max(rect.left, area.left) < Math.min(rect.left + rect.width, area.left + area.width)
+    && Math.max(rect.top, area.top) < Math.min(rect.top + rect.height, area.top + area.height);
+}
+
 function rectCenterInside(rect: Rect, area: Rect): boolean {
   const cx = rect.left + rect.width / 2;
   const cy = rect.top + rect.height / 2;
@@ -2279,7 +2284,7 @@ async function resolveDedicatedTarget(state: DedicatedSlotState, request: Dedica
     const { displays } = await listDisplays();
     const userDisplayBounds = dedicatedAvoidDisplayBounds ?? displays?.find(d => d.primary)?.bounds;
     const bounds = normalizeRect(request.bounds);
-    if (userDisplayBounds && rectCenterInside(bounds, userDisplayBounds)) {
+    if (userDisplayBounds && rectsOverlap(bounds, userDisplayBounds)) {
       state.placement = { ...emptyDedicatedPlacement(), relocatedFrom: bounds };
       request = { ...request, bounds: undefined };
       console.warn(`[opencli] WARN: 显式 bounds 落在用户当前屏，位置已改到自动宫格，尺寸保留 (slot=${state.slot}, bounds=${JSON.stringify(bounds)})`);

@@ -3461,6 +3461,9 @@ describe('dedicated automation window', () => {
     { name: 'current primary screen with narrow size', bounds: { left: 0, top: 0, width: 500, height: 900 }, avoid: { left: 0, top: 0, width: 1512, height: 982 }, relocated: true },
     { name: 'primary fallback with wide size', bounds: { left: 0, top: 0, width: 1360, height: 900 }, avoid: undefined, relocated: true },
     { name: 'current virtual screen with oversized size', bounds: { left: -2480, top: -1380, width: 3000, height: 2000 }, avoid: { left: -2560, top: -1440, width: 2560, height: 1440 }, relocated: true },
+    { name: 'current primary screen with 3200x1800 size', bounds: { left: 0, top: 0, width: 3200, height: 1800 }, avoid: { left: 0, top: 0, width: 1512, height: 982 }, relocated: true },
+    { name: 'primary fallback with 6000x3000 size', bounds: { left: 0, top: 0, width: 6000, height: 3000 }, avoid: undefined, relocated: true },
+    { name: 'non-overlapping screen edge', bounds: { left: -2560, top: 0, width: 2560, height: 1440 }, avoid: { left: 0, top: 0, width: 1512, height: 982 }, relocated: false },
     { name: 'other screen', bounds: { left: -2480, top: -1380, width: 500, height: 900 }, avoid: { left: 0, top: 0, width: 1512, height: 982 }, relocated: false },
   ])('handles explicit bounds on $name', async ({ bounds, avoid, relocated }) => {
     const h = dedicatedHarness();
@@ -3481,6 +3484,14 @@ describe('dedicated automation window', () => {
       target.left = Math.max(area.left, Math.min(target.left, area.left + area.width - target.width));
       target.top = Math.max(area.top, Math.min(target.top, area.top + area.height - target.height));
       expect(state).toMatchObject({ tileIndex: 0, placement: { source: 'auto', cell: 0, requestedBounds: target, relocatedFrom: bounds } });
+      const placed = state.placement.requestedBounds!;
+      expect(state.tileIndex).not.toBeNull();
+      expect(placed.width).toBeLessThanOrEqual(area.width);
+      expect(placed.height).toBeLessThanOrEqual(area.height);
+      expect(placed.left).toBeGreaterThanOrEqual(area.left);
+      expect(placed.top).toBeGreaterThanOrEqual(area.top);
+      expect(placed.left + placed.width).toBeLessThanOrEqual(area.left + area.width);
+      expect(placed.top + placed.height).toBeLessThanOrEqual(area.top + area.height);
       expect(h.chrome.windows.create).toHaveBeenCalledWith(expect.objectContaining(target));
       expect(warn).toHaveBeenCalledWith(expect.stringContaining('显式 bounds 落在用户当前屏，位置已改到自动宫格，尺寸保留'));
       const status = await mod.__test__.handleSessions({ id: 's', action: 'sessions', op: 'window-status' } as never);
