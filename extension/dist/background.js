@@ -2259,7 +2259,10 @@ async function retileDedicatedWindows(displays) {
   if (typeof updateWindow !== "function") return;
   for (let i = 0; i < auto.length; i += 1) {
     const state = auto[i];
-    const { display, target: fullBounds } = dedicatedAutomationTile(automationDisplays, i, count);
+    const { display, target: tile } = dedicatedAutomationTile(automationDisplays, i, count);
+    const area = displayArea(display);
+    const size = state.placement.relocatedFrom;
+    const fullBounds = size ? { ...tile, width: Math.min(size.width, area.width), height: Math.min(size.height, area.height) } : tile;
     const target = state.half ? { ...fullBounds, width: Math.floor(fullBounds.width / 2) } : fullBounds;
     state.fullBounds = fullBounds;
     if (!target || state.windowId === null) continue;
@@ -2495,7 +2498,7 @@ function coerceDedicatedPlacement(raw) {
     displayName: typeof p.displayName === "string" ? p.displayName : null,
     displayFound: typeof p.displayFound === "boolean" ? p.displayFound : null,
     ...p.excludedDisplayBounds !== void 0 ? { excludedDisplayBounds: p.excludedDisplayBounds } : {},
-    ...isRect(p.ignoredBounds) ? { ignoredBounds: normalizeRect(p.ignoredBounds) } : {},
+    ...isRect(p.relocatedFrom) ? { relocatedFrom: normalizeRect(p.relocatedFrom) } : {},
     cell: typeof p.cell === "number" && Number.isInteger(p.cell) ? p.cell : null
   };
 }
@@ -2592,9 +2595,9 @@ async function resolveDedicatedTarget(state, request) {
     const userDisplayBounds = dedicatedAvoidDisplayBounds ?? displays2?.find((d) => d.primary)?.bounds;
     const bounds = normalizeRect(request.bounds);
     if (userDisplayBounds && rectCenterInside(bounds, userDisplayBounds)) {
-      state.placement = { ...emptyDedicatedPlacement(), ignoredBounds: bounds };
+      state.placement = { ...emptyDedicatedPlacement(), relocatedFrom: bounds };
       request = { ...request, bounds: void 0 };
-      console.warn(`[opencli] WARN: 显式 bounds 落在用户当前屏，已改用自动宫格 (slot=${state.slot}, bounds=${JSON.stringify(bounds)})`);
+      console.warn(`[opencli] WARN: 显式 bounds 落在用户当前屏，位置已改到自动宫格，尺寸保留 (slot=${state.slot}, bounds=${JSON.stringify(bounds)})`);
     }
   }
   const previous = state.placement;
@@ -2614,12 +2617,15 @@ async function resolveDedicatedTarget(state, request) {
     const { displays: displays2 } = await listDisplays();
     const automationDisplays = pickAutomationDisplays(displays2, dedicatedAvoidDisplayBounds);
     if (!automationDisplays.length) {
-      state.placement = { ...emptyDedicatedPlacement(), source: "auto", ...placement.ignoredBounds && { ignoredBounds: placement.ignoredBounds } };
+      state.placement = { ...emptyDedicatedPlacement(), source: "auto", ...placement.relocatedFrom && { relocatedFrom: placement.relocatedFrom } };
       return { target: null, area: null };
     }
     const others = liveDedicatedStates().filter((s) => s.slot !== state.slot && s.placement.source === "auto").length;
     const index = claimTileIndex(state);
-    const { display: display2, target } = dedicatedAutomationTile(automationDisplays, index, Math.max(others + 1, index + 1));
+    const { display: display2, target: tile } = dedicatedAutomationTile(automationDisplays, index, Math.max(others + 1, index + 1));
+    const area = displayArea(display2);
+    const size = placement.relocatedFrom;
+    const target = size ? { ...tile, width: Math.min(size.width, area.width), height: Math.min(size.height, area.height) } : tile;
     state.placement = {
       source: "auto",
       requestedBounds: target,
@@ -2628,7 +2634,7 @@ async function resolveDedicatedTarget(state, request) {
       displayFound: true,
       cell: target ? index : null,
       excludedDisplayBounds: excludedDisplayBounds(displays2),
-      ...placement.ignoredBounds && { ignoredBounds: placement.ignoredBounds }
+      ...placement.relocatedFrom && { relocatedFrom: placement.relocatedFrom }
     };
     return { target, area: target };
   }
