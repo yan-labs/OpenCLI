@@ -45,7 +45,7 @@
     "dev": "tsx src/main.ts",
     "dev:bun": "bun src/main.ts",
     "build": "npm run clean-dist && npm run build-manifest",
-    "prebuild-manifest": "tsc --build && node -e \"require('fs').chmodSync('dist/src/main.js', 0o755)\"",
+    "prebuild-manifest": "tsc --build && node -e \"require('fs').cpSync('src/browser/native', 'dist/src/browser/native', {recursive:true}); require('fs').chmodSync('dist/src/main.js', 0o755)\"",
     "build-manifest": "tsx src/build-manifest.ts",
     "clean-dist": "node scripts/clean-dist.cjs",
     "start": "node dist/src/main.js",

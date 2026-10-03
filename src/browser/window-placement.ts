@@ -15,6 +15,35 @@
  * inlining the BrowserWindowMode literal union at each use site.
  */
 
+import { execFile } from 'node:child_process';
+import { mkdir, stat } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
+
+const runFile = promisify(execFile);
+
+/** Native CoreGraphics coordinates match chrome.system.display bounds. */
+export async function activeDisplayBounds(): Promise<WindowBounds | undefined> {
+  if (process.platform !== 'darwin') return undefined;
+  try {
+    const source = fileURLToPath(new URL('./native/active-display.swift', import.meta.url));
+    const directory = join(homedir(), '.opencli', 'bin');
+    const binary = join(directory, 'active-display');
+    const sourceStat = await stat(source);
+    const binaryStat = await stat(binary).catch(() => null);
+    if (!binaryStat || binaryStat.mtimeMs < sourceStat.mtimeMs) {
+      await mkdir(directory, { recursive: true });
+      await runFile('swiftc', ['-O', source, '-o', binary]);
+    }
+    const { stdout } = await runFile(binary, []);
+    return JSON.parse(stdout) as WindowBounds;
+  } catch {
+    return undefined;
+  }
+}
+
 export interface WindowBounds {
   left: number;
   top: number;

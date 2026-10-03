@@ -480,6 +480,7 @@ type SessionOverrides = {
   windowSlot?: string;
   windowBounds?: { left: number; top: number; width: number; height: number };
   windowDisplay?: string;
+  avoidDisplayBounds?: Rect;
   autoSelect?: boolean;
 };
 const sessionOverrides = new Map<string, SessionOverrides>();
@@ -1583,6 +1584,7 @@ type DedicatedPlacement = {
   displayName: string | null;
   displayFound: boolean | null;
   cell: number | null;
+  excludedDisplayBounds?: Rect | null;
 };
 type DedicatedEnsureResult = { windowId: number; initialTabId?: number; created: boolean; moved: boolean };
 type DedicatedSlotState = {
@@ -1605,7 +1607,8 @@ type DedicatedSlotState = {
 };
 type DisplayInfo = { id: string; name: string; primary: boolean; internal: boolean; bounds: Rect; workArea: Rect | null };
 type DedicatedTabOwner = 'lease' | 'placeholder' | 'automation' | 'foreign';
-type DedicatedPlacementRequest = { bounds?: Rect; display?: string };
+type DedicatedPlacementRequest = { bounds?: Rect; display?: string; avoidDisplayBounds?: Rect };
+let dedicatedAvoidDisplayBounds: Rect | undefined;
 
 const DEDICATED_SLOT_PATTERN = /^[A-Za-z0-9_.-]{1,40}$/;
 // Placeholder URL carries the slot, so a window orphaned by an extension reload (which
@@ -1774,9 +1777,24 @@ function dedicatedTile(area: Rect, index: number, count: number): Rect {
   };
 }
 
-/** All secondary screens, external first; only fall back when no secondary exists. */
-function pickAutomationDisplays(displays: DisplayInfo[] | null): DisplayInfo[] {
+function sameDisplayBounds(a: Rect, b: Rect): boolean {
+  return a.left === b.left && a.top === b.top && a.width === b.width && a.height === b.height;
+}
+
+function excludedDisplayBounds(displays: DisplayInfo[] | null): Rect | null {
+  const excluded = displays?.find(d => dedicatedAvoidDisplayBounds && sameDisplayBounds(d.bounds, dedicatedAvoidDisplayBounds));
+  return excluded && pickAutomationDisplays(displays, dedicatedAvoidDisplayBounds).every(d => d.id !== excluded.id) ? excluded.bounds : null;
+}
+
+/** Exclude the active screen first; otherwise retain the secondary-screen fallback. */
+function pickAutomationDisplays(displays: DisplayInfo[] | null, avoidDisplayBounds?: Rect): DisplayInfo[] {
   const usable = (displays ?? []).filter(d => d.bounds.width > 0 && d.bounds.height > 0);
+  if (avoidDisplayBounds) {
+    const remaining = usable.filter(d => !sameDisplayBounds(d.bounds, avoidDisplayBounds));
+    if (remaining.length && remaining.length < usable.length) {
+      return remaining.sort((a, b) => Number(a.internal) - Number(b.internal) || a.id.localeCompare(b.id, undefined, { numeric: true }));
+    }
+  }
   const secondary = usable.filter(d => !d.primary)
     .sort((a, b) => Number(a.internal) - Number(b.internal) || a.id.localeCompare(b.id, undefined, { numeric: true }));
   return secondary.length ? secondary : usable.slice(0, 1);
@@ -1830,7 +1848,7 @@ function claimTileIndex(state: DedicatedSlotState): number {
  * and a move never passes `focused` — re-tiling must not raise anything.
  */
 async function retileDedicatedWindows(displays: DisplayInfo[] | null): Promise<void> {
-  const automationDisplays = pickAutomationDisplays(displays);
+  const automationDisplays = pickAutomationDisplays(displays, dedicatedAvoidDisplayBounds);
   if (!automationDisplays.length) return;
   const auto = liveDedicatedStates().filter(state => state.placement.source === 'auto');
   if (!auto.length) return;
@@ -1846,6 +1864,7 @@ async function retileDedicatedWindows(displays: DisplayInfo[] | null): Promise<v
     state.placement.cell = i;
     state.placement.displayName = display.name;
     state.placement.displayFound = true;
+    state.placement.excludedDisplayBounds = excludedDisplayBounds(displays);
     let current: Rect | null = null;
     try {
       const win = await chrome.windows.get(state.windowId);
@@ -1869,7 +1888,7 @@ async function retileDedicatedWindows(displays: DisplayInfo[] | null): Promise<v
 async function assertDedicatedCapacity(state: DedicatedSlotState): Promise<void> {
   if (state.windowId !== null) return;
   const { displays } = await listDisplays();
-  const automationDisplays = pickAutomationDisplays(displays);
+  const automationDisplays = pickAutomationDisplays(displays, dedicatedAvoidDisplayBounds);
   const display = automationDisplays[0];
   const naturalCapacity = automationDisplays.length ? automationDisplays.reduce((sum, d) => sum + dedicatedCapacity(displayArea(d)), 0) : null;
   const capacity = DEDICATED_POOL_MAX;
@@ -2107,6 +2126,7 @@ function coerceDedicatedPlacement(raw: unknown): DedicatedPlacement {
     displayPattern: typeof p.displayPattern === 'string' ? p.displayPattern : null,
     displayName: typeof p.displayName === 'string' ? p.displayName : null,
     displayFound: typeof p.displayFound === 'boolean' ? p.displayFound : null,
+    ...(p.excludedDisplayBounds !== undefined ? { excludedDisplayBounds: p.excludedDisplayBounds as Rect | null } : {}),
     cell: typeof p.cell === 'number' && Number.isInteger(p.cell) ? p.cell : null,
   };
 }
@@ -2162,6 +2182,7 @@ function dedicatedPlacementRequest(leaseKey: string): DedicatedPlacementRequest 
   return {
     ...(overrides?.windowBounds ? { bounds: overrides.windowBounds } : {}),
     ...(overrides?.windowDisplay ? { display: overrides.windowDisplay } : {}),
+    ...(overrides?.avoidDisplayBounds ? { avoidDisplayBounds: overrides.avoidDisplayBounds } : {}),
   };
 }
 
@@ -2188,7 +2209,8 @@ function applyDedicatedCommandFields(leaseKey: string, cmd: Command): void {
   // `default` — that difference is the whole point of the pool.
   const pinnedSlot = typeof cmd.windowSlot === 'string' && DEDICATED_SLOT_PATTERN.test(cmd.windowSlot) ? cmd.windowSlot : null;
   const slot = pinnedSlot ?? dedicatedSlotNameFor(leaseKey);
-  const patch: SessionOverrides = { autoSelect: cmd.autoSelect !== false, ...(pinnedSlot ? { windowSlot: pinnedSlot } : {}) };
+  dedicatedAvoidDisplayBounds = cmd.avoidDisplayBounds;
+  const patch: SessionOverrides = { avoidDisplayBounds: cmd.avoidDisplayBounds, autoSelect: cmd.autoSelect !== false, ...(pinnedSlot ? { windowSlot: pinnedSlot } : {}) };
   // Placement is replaced as a whole: bounds and a display pattern never linger from an earlier command.
   if (isRect(cmd.windowBounds)) {
     patch.windowBounds = normalizeRect(cmd.windowBounds);
@@ -2218,6 +2240,9 @@ function tabActivationFor(leaseKey: string): boolean {
  */
 async function resolveDedicatedTarget(state: DedicatedSlotState, request: DedicatedPlacementRequest): Promise<{ target: Rect | null; area: Rect | null }> {
   const previous = state.placement;
+  if (!request.bounds && !request.display && state.windowId !== null && previous.source === 'auto' && previous.requestedBounds) {
+    return { target: previous.requestedBounds, area: previous.requestedBounds };
+  }
   if (request.bounds) {
     state.placement = { ...emptyDedicatedPlacement(), source: 'bounds', requestedBounds: normalizeRect(request.bounds), displayPattern: request.display ?? null };
   } else if (request.display) {
@@ -2232,7 +2257,7 @@ async function resolveDedicatedTarget(state: DedicatedSlotState, request: Dedica
   // `opencli browser <session> open <url>` land off the person's screen by itself.
   if (placement.source !== 'display' || !placement.displayPattern) {
     const { displays } = await listDisplays();
-    const automationDisplays = pickAutomationDisplays(displays);
+    const automationDisplays = pickAutomationDisplays(displays, dedicatedAvoidDisplayBounds);
     if (!automationDisplays.length) {
       state.placement = { ...emptyDedicatedPlacement(), source: 'auto' };
       return { target: null, area: null };
@@ -2247,6 +2272,7 @@ async function resolveDedicatedTarget(state: DedicatedSlotState, request: Dedica
       displayName: display.name,
       displayFound: true,
       cell: target ? index : null,
+      excludedDisplayBounds: excludedDisplayBounds(displays),
     };
     return { target, area: target };
   }
@@ -2296,6 +2322,7 @@ async function ensureDedicatedWindowUnlocked(
   state: DedicatedSlotState,
   request: DedicatedPlacementRequest & { reposition?: boolean; initialUrl?: string },
 ): Promise<DedicatedEnsureResult> {
+  dedicatedAvoidDisplayBounds = request.avoidDisplayBounds;
   await reapIdleDedicatedWindows();
   let win: chrome.windows.Window | null = null;
   if (state.windowId !== null) {
@@ -2851,6 +2878,7 @@ async function handleDedicatedWindowOp(cmd: Command): Promise<Result> {
     if (cmd.foreignTabPolicy === 'evict' || cmd.foreignTabPolicy === 'tolerate') state.foreignTabPolicy = cmd.foreignTabPolicy;
     if (typeof cmd.autoSelect === 'boolean') state.autoSelect = cmd.autoSelect;
     const result = await ensureDedicatedWindow(slot, {
+      ...(cmd.avoidDisplayBounds ? { avoidDisplayBounds: cmd.avoidDisplayBounds } : {}),
       ...(isRect(cmd.windowBounds) ? { bounds: normalizeRect(cmd.windowBounds) } : {}),
       ...(typeof cmd.windowDisplay === 'string' && cmd.windowDisplay.trim() ? { display: cmd.windowDisplay.trim() } : {}),
       reposition: true,
@@ -2865,7 +2893,7 @@ async function handleDedicatedWindowOp(cmd: Command): Promise<Result> {
     if (filter && state.slot !== filter) continue;
     windows.push(await describeDedicatedSlot(state, displays));
   }
-  const automationDisplays = pickAutomationDisplays(displays);
+  const automationDisplays = pickAutomationDisplays(displays, dedicatedAvoidDisplayBounds);
   const automationDisplay = automationDisplays[0] ?? null;
   const area = automationDisplay ? displayArea(automationDisplay) : null;
   const naturalCapacity = automationDisplays.length ? automationDisplays.reduce((sum, d) => sum + dedicatedCapacity(displayArea(d)), 0) : null;

@@ -10,6 +10,8 @@ Default browser window placement changes from `background` to `dedicated`, and `
 
 ### Features
 
+* **browser window** — on macOS, dedicated windows avoid the display under the mouse (falling back to the front application focused window); single-display and helper-unavailable setups retain the existing placement fallback.
+
 * **browser window** — raise the dedicated pool limit to 40; reap idle windows after 15 seconds by default using a lease-release timeout, the existing alarm, and checks before window acquisition/creation. A full pool reclaims its oldest idle windows first and reports `dedicated-pool-exhausted` only when every window has an active lease. `OPENCLI_DEDICATED_IDLE_MS` still overrides the TTL.
 
 * **browser window** — extension 1.4.0: the `dedicated` pool is now capped at 40 windows (`pool.capacity`) instead of the number that fit without overlap on one display; `pool.naturalCapacity` keeps the non-overlapping count. With secondary/virtual displays attached, automation windows use only those displays (`pool.automationDisplays`), tiling across all of them without overlap and cascading only after every display is full; with no secondary display the primary one is used as before. `dedicated-pool-exhausted` now appears only when 40 windows are live and all are busy.

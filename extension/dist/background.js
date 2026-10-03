@@ -2071,6 +2071,7 @@ function initialTabIsAvailable(tabId) {
   }
   return true;
 }
+let dedicatedAvoidDisplayBounds;
 const DEDICATED_SLOT_PATTERN = /^[A-Za-z0-9_.-]{1,40}$/;
 const DEDICATED_PLACEHOLDER_PREFIX = "about:blank#opencli-dedicated=";
 function dedicatedPlaceholderUrl(slot) {
@@ -2202,8 +2203,21 @@ function dedicatedTile(area, index, count) {
     height: grid.height
   };
 }
-function pickAutomationDisplays(displays) {
+function sameDisplayBounds(a, b) {
+  return a.left === b.left && a.top === b.top && a.width === b.width && a.height === b.height;
+}
+function excludedDisplayBounds(displays) {
+  const excluded = displays?.find((d) => dedicatedAvoidDisplayBounds && sameDisplayBounds(d.bounds, dedicatedAvoidDisplayBounds));
+  return excluded && pickAutomationDisplays(displays, dedicatedAvoidDisplayBounds).every((d) => d.id !== excluded.id) ? excluded.bounds : null;
+}
+function pickAutomationDisplays(displays, avoidDisplayBounds) {
   const usable = (displays ?? []).filter((d) => d.bounds.width > 0 && d.bounds.height > 0);
+  if (avoidDisplayBounds) {
+    const remaining = usable.filter((d) => !sameDisplayBounds(d.bounds, avoidDisplayBounds));
+    if (remaining.length && remaining.length < usable.length) {
+      return remaining.sort((a, b) => Number(a.internal) - Number(b.internal) || a.id.localeCompare(b.id, void 0, { numeric: true }));
+    }
+  }
   const secondary = usable.filter((d) => !d.primary).sort((a, b) => Number(a.internal) - Number(b.internal) || a.id.localeCompare(b.id, void 0, { numeric: true }));
   return secondary.length ? secondary : usable.slice(0, 1);
 }
@@ -2236,7 +2250,7 @@ function claimTileIndex(state) {
   return index;
 }
 async function retileDedicatedWindows(displays) {
-  const automationDisplays = pickAutomationDisplays(displays);
+  const automationDisplays = pickAutomationDisplays(displays, dedicatedAvoidDisplayBounds);
   if (!automationDisplays.length) return;
   const auto = liveDedicatedStates().filter((state) => state.placement.source === "auto");
   if (!auto.length) return;
@@ -2252,6 +2266,7 @@ async function retileDedicatedWindows(displays) {
     state.placement.cell = i;
     state.placement.displayName = display.name;
     state.placement.displayFound = true;
+    state.placement.excludedDisplayBounds = excludedDisplayBounds(displays);
     let current = null;
     try {
       const win = await chrome.windows.get(state.windowId);
@@ -2272,7 +2287,7 @@ async function retileDedicatedWindows(displays) {
 async function assertDedicatedCapacity(state) {
   if (state.windowId !== null) return;
   const { displays } = await listDisplays();
-  const automationDisplays = pickAutomationDisplays(displays);
+  const automationDisplays = pickAutomationDisplays(displays, dedicatedAvoidDisplayBounds);
   const display = automationDisplays[0];
   const naturalCapacity = automationDisplays.length ? automationDisplays.reduce((sum, d) => sum + dedicatedCapacity(displayArea(d)), 0) : null;
   const capacity = DEDICATED_POOL_MAX;
@@ -2466,6 +2481,7 @@ function coerceDedicatedPlacement(raw) {
     displayPattern: typeof p.displayPattern === "string" ? p.displayPattern : null,
     displayName: typeof p.displayName === "string" ? p.displayName : null,
     displayFound: typeof p.displayFound === "boolean" ? p.displayFound : null,
+    ...p.excludedDisplayBounds !== void 0 ? { excludedDisplayBounds: p.excludedDisplayBounds } : {},
     cell: typeof p.cell === "number" && Number.isInteger(p.cell) ? p.cell : null
   };
 }
@@ -2513,7 +2529,8 @@ function dedicatedPlacementRequest(leaseKey) {
   const overrides = sessionOverrides.get(leaseKey);
   return {
     ...overrides?.windowBounds ? { bounds: overrides.windowBounds } : {},
-    ...overrides?.windowDisplay ? { display: overrides.windowDisplay } : {}
+    ...overrides?.windowDisplay ? { display: overrides.windowDisplay } : {},
+    ...overrides?.avoidDisplayBounds ? { avoidDisplayBounds: overrides.avoidDisplayBounds } : {}
   };
 }
 function dedicatedSlotNameFor(leaseKey, { hold = false } = {}) {
@@ -2530,7 +2547,8 @@ function applyDedicatedCommandFields(leaseKey, cmd) {
   }
   const pinnedSlot = typeof cmd.windowSlot === "string" && DEDICATED_SLOT_PATTERN.test(cmd.windowSlot) ? cmd.windowSlot : null;
   const slot = pinnedSlot ?? dedicatedSlotNameFor(leaseKey);
-  const patch = { autoSelect: cmd.autoSelect !== false, ...pinnedSlot ? { windowSlot: pinnedSlot } : {} };
+  dedicatedAvoidDisplayBounds = cmd.avoidDisplayBounds;
+  const patch = { avoidDisplayBounds: cmd.avoidDisplayBounds, autoSelect: cmd.autoSelect !== false, ...pinnedSlot ? { windowSlot: pinnedSlot } : {} };
   if (isRect(cmd.windowBounds)) {
     patch.windowBounds = normalizeRect(cmd.windowBounds);
     patch.windowDisplay = typeof cmd.windowDisplay === "string" && cmd.windowDisplay.trim() ? cmd.windowDisplay.trim() : void 0;
@@ -2550,6 +2568,9 @@ function tabActivationFor(leaseKey) {
 }
 async function resolveDedicatedTarget(state, request) {
   const previous = state.placement;
+  if (!request.bounds && !request.display && state.windowId !== null && previous.source === "auto" && previous.requestedBounds) {
+    return { target: previous.requestedBounds, area: previous.requestedBounds };
+  }
   if (request.bounds) {
     state.placement = { ...emptyDedicatedPlacement(), source: "bounds", requestedBounds: normalizeRect(request.bounds), displayPattern: request.display ?? null };
   } else if (request.display) {
@@ -2561,7 +2582,7 @@ async function resolveDedicatedTarget(state, request) {
   }
   if (placement.source !== "display" || !placement.displayPattern) {
     const { displays: displays2 } = await listDisplays();
-    const automationDisplays = pickAutomationDisplays(displays2);
+    const automationDisplays = pickAutomationDisplays(displays2, dedicatedAvoidDisplayBounds);
     if (!automationDisplays.length) {
       state.placement = { ...emptyDedicatedPlacement(), source: "auto" };
       return { target: null, area: null };
@@ -2575,7 +2596,8 @@ async function resolveDedicatedTarget(state, request) {
       displayPattern: null,
       displayName: display2.name,
       displayFound: true,
-      cell: target ? index : null
+      cell: target ? index : null,
+      excludedDisplayBounds: excludedDisplayBounds(displays2)
     };
     return { target, area: target };
   }
@@ -2615,6 +2637,7 @@ async function ensureDedicatedWindow(slot, request = {}) {
   return tracked;
 }
 async function ensureDedicatedWindowUnlocked(state, request) {
+  dedicatedAvoidDisplayBounds = request.avoidDisplayBounds;
   await reapIdleDedicatedWindows();
   let win = null;
   if (state.windowId !== null) {
@@ -3085,6 +3108,7 @@ async function handleDedicatedWindowOp(cmd) {
     if (cmd.foreignTabPolicy === "evict" || cmd.foreignTabPolicy === "tolerate") state.foreignTabPolicy = cmd.foreignTabPolicy;
     if (typeof cmd.autoSelect === "boolean") state.autoSelect = cmd.autoSelect;
     const result = await ensureDedicatedWindow(slot, {
+      ...cmd.avoidDisplayBounds ? { avoidDisplayBounds: cmd.avoidDisplayBounds } : {},
       ...isRect(cmd.windowBounds) ? { bounds: normalizeRect(cmd.windowBounds) } : {},
       ...typeof cmd.windowDisplay === "string" && cmd.windowDisplay.trim() ? { display: cmd.windowDisplay.trim() } : {},
       reposition: true
@@ -3099,7 +3123,7 @@ async function handleDedicatedWindowOp(cmd) {
     if (filter && state.slot !== filter) continue;
     windows.push(await describeDedicatedSlot(state, displays));
   }
-  const automationDisplays = pickAutomationDisplays(displays);
+  const automationDisplays = pickAutomationDisplays(displays, dedicatedAvoidDisplayBounds);
   const automationDisplay = automationDisplays[0] ?? null;
   const area = automationDisplay ? displayArea(automationDisplay) : null;
   const naturalCapacity = automationDisplays.length ? automationDisplays.reduce((sum, d) => sum + dedicatedCapacity(displayArea(d)), 0) : null;

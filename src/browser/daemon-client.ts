@@ -24,6 +24,7 @@ import {
 } from './daemon-transport.js';
 import {
   resolveDedicatedPlacement,
+  activeDisplayBounds,
   type DedicatedWindowPlacementOverride,
 } from './window-placement.js';
 
@@ -264,6 +265,7 @@ export interface DaemonCommand {
   windowBounds?: { left: number; top: number; width: number; height: number };
   /** Dedicated-window display-name pattern ('/re/flags' or case-insensitive substring). Used when windowBounds is absent. */
   windowDisplay?: string;
+  avoidDisplayBounds?: { left: number; top: number; width: number; height: number };
   /** Auto-select the session's tab in its dedicated window before every page-scoped command. Default true when dedicated (applied by the extension when omitted). */
   autoSelect?: boolean;
   /** Policy for tabs that appear in a dedicated window without being opened by OpenCLI. Default 'evict' (applied by the extension when omitted). */
@@ -414,6 +416,9 @@ async function sendCommandRaw(
   const windowSlot = params.windowSlot ?? placement.windowSlot;
   const windowBounds = params.windowBounds ?? placement.windowBounds;
   const windowDisplay = params.windowDisplay ?? placement.windowDisplay;
+  const avoidDisplayBounds = windowMode === 'dedicated' && !windowBounds && !windowDisplay
+    ? params.avoidDisplayBounds ?? await activeDisplayBounds()
+    : undefined;
   const autoSelect = params.autoSelect ?? placement.autoSelect;
   const foreignTabPolicy = params.foreignTabPolicy ?? placement.foreignTabPolicy;
   const dedicatedIdleMs = params.dedicatedIdleMs ?? placement.dedicatedIdleMs;
@@ -463,6 +468,7 @@ async function sendCommandRaw(
       ...(windowSlot !== undefined && { windowSlot }),
       ...(windowBounds !== undefined && { windowBounds }),
       ...(windowDisplay !== undefined && { windowDisplay }),
+      ...(avoidDisplayBounds !== undefined && { avoidDisplayBounds }),
       ...(autoSelect !== undefined && { autoSelect }),
       ...(foreignTabPolicy !== undefined && { foreignTabPolicy }),
       ...(dedicatedIdleMs !== undefined && { dedicatedIdleMs }),
