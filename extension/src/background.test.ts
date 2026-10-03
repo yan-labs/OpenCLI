@@ -3454,6 +3454,43 @@ describe('dedicated automation window', () => {
     expect(mod.__test__.getContainer('interactive').windowId).not.toBe(2);
   });
 
+  it.each([
+    { name: 'primary fallback', bounds: { left: 0, top: 0, width: 500, height: 900 }, avoid: undefined, ignored: true },
+    { name: 'current primary screen', bounds: { left: 0, top: 0, width: 1360, height: 900 }, avoid: { left: 0, top: 0, width: 1512, height: 982 }, ignored: true },
+    { name: 'current virtual screen', bounds: { left: -2480, top: -1380, width: 500, height: 900 }, avoid: { left: -2560, top: -1440, width: 2560, height: 1440 }, ignored: true },
+    { name: 'other screen', bounds: { left: -2480, top: -1380, width: 500, height: 900 }, avoid: { left: 0, top: 0, width: 1512, height: 982 }, ignored: false },
+  ])('handles explicit bounds on $name', async ({ bounds, avoid, ignored }) => {
+    const h = dedicatedHarness();
+    vi.stubGlobal('chrome', h.chrome);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const mod = await import('./background');
+    const result = await mod.__test__.handleSessions({
+      id: 'e', action: 'sessions', op: 'window-ensure', windowSlot: 'bounds-check',
+      windowBounds: bounds, avoidDisplayBounds: avoid,
+    } as never);
+    expect(result.ok).toBe(true);
+    const state = mod.__test__.getDedicatedSlot('bounds-check')!;
+    if (ignored) {
+      const area = avoid?.left === -2560
+        ? { left: 0, top: 25, width: 1512, height: 957 }
+        : { left: -2560, top: -1440, width: 2560, height: 1440 };
+      const target = mod.__test__.dedicatedTile(area, 0, 1);
+      expect(state).toMatchObject({ tileIndex: 0, placement: { source: 'auto', requestedBounds: target, ignoredBounds: bounds } });
+      expect(h.chrome.windows.create).toHaveBeenCalledWith(expect.objectContaining(target));
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('显式 bounds 落在用户当前屏，已改用自动宫格'));
+      const status = await mod.__test__.handleSessions({ id: 's', action: 'sessions', op: 'window-status' } as never);
+      expect((status.data as any).windows[0].placement.ignoredBounds).toEqual(bounds);
+      await mod.__test__.restoreDedicatedState();
+      expect(mod.__test__.getDedicatedSlot('bounds-check')?.placement.ignoredBounds).toEqual(bounds);
+    } else {
+      expect(state).toMatchObject({ tileIndex: null, placement: { source: 'bounds', requestedBounds: bounds } });
+      expect(state.placement).not.toHaveProperty('ignoredBounds');
+      expect(h.chrome.windows.create).toHaveBeenCalledWith(expect.objectContaining(bounds));
+      expect(warn).not.toHaveBeenCalled();
+    }
+    warn.mockRestore();
+  });
+
   it('tiles slots on the display matched by name without overlapping them', async () => {
     const h = dedicatedHarness();
     vi.stubGlobal('chrome', h.chrome);

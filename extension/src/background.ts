@@ -1586,6 +1586,7 @@ type DedicatedPlacement = {
   displayFound: boolean | null;
   cell: number | null;
   excludedDisplayBounds?: Rect | null;
+  ignoredBounds?: Rect;
 };
 type DedicatedEnsureResult = { windowId: number; initialTabId?: number; created: boolean; moved: boolean };
 type DedicatedSlotState = {
@@ -2142,6 +2143,7 @@ function coerceDedicatedPlacement(raw: unknown): DedicatedPlacement {
     displayName: typeof p.displayName === 'string' ? p.displayName : null,
     displayFound: typeof p.displayFound === 'boolean' ? p.displayFound : null,
     ...(p.excludedDisplayBounds !== undefined ? { excludedDisplayBounds: p.excludedDisplayBounds as Rect | null } : {}),
+    ...(isRect(p.ignoredBounds) ? { ignoredBounds: normalizeRect(p.ignoredBounds) } : {}),
     cell: typeof p.cell === 'number' && Number.isInteger(p.cell) ? p.cell : null,
   };
 }
@@ -2259,6 +2261,16 @@ function tabActivationFor(leaseKey: string): boolean {
  * the whole display — a window the person nudged within the display is left alone).
  */
 async function resolveDedicatedTarget(state: DedicatedSlotState, request: DedicatedPlacementRequest): Promise<{ target: Rect | null; area: Rect | null }> {
+  if (request.bounds && !request.display) {
+    const { displays } = await listDisplays();
+    const userDisplayBounds = dedicatedAvoidDisplayBounds ?? displays?.find(d => d.primary)?.bounds;
+    const bounds = normalizeRect(request.bounds);
+    if (userDisplayBounds && rectCenterInside(bounds, userDisplayBounds)) {
+      state.placement = { ...emptyDedicatedPlacement(), ignoredBounds: bounds };
+      request = { ...request, bounds: undefined };
+      console.warn(`[opencli] WARN: 显式 bounds 落在用户当前屏，已改用自动宫格 (slot=${state.slot}, bounds=${JSON.stringify(bounds)})`);
+    }
+  }
   const previous = state.placement;
   if (!request.bounds && !request.display && state.windowId !== null && previous.source === 'auto' && previous.requestedBounds) {
     return { target: previous.requestedBounds, area: previous.requestedBounds };
@@ -2279,7 +2291,7 @@ async function resolveDedicatedTarget(state: DedicatedSlotState, request: Dedica
     const { displays } = await listDisplays();
     const automationDisplays = pickAutomationDisplays(displays, dedicatedAvoidDisplayBounds);
     if (!automationDisplays.length) {
-      state.placement = { ...emptyDedicatedPlacement(), source: 'auto' };
+      state.placement = { ...emptyDedicatedPlacement(), source: 'auto', ...(placement.ignoredBounds && { ignoredBounds: placement.ignoredBounds }) };
       return { target: null, area: null };
     }
     const others = liveDedicatedStates().filter(s => s.slot !== state.slot && s.placement.source === 'auto').length;
@@ -2293,6 +2305,7 @@ async function resolveDedicatedTarget(state: DedicatedSlotState, request: Dedica
       displayFound: true,
       cell: target ? index : null,
       excludedDisplayBounds: excludedDisplayBounds(displays),
+      ...(placement.ignoredBounds && { ignoredBounds: placement.ignoredBounds }),
     };
     return { target, area: target };
   }

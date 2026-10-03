@@ -28,6 +28,8 @@ Default browser window placement changes from `background` to `dedicated`, and `
 
 ### Bug Fixes
 
+* **browser window** — ignore explicit bounds centered on the current user display (primary fallback), use the automatic grid, and report `placement.ignoredBounds` with a warning; dedicated CLI requests now detect the current display even with bounds.
+
 * **browser window** — a `dedicated` command that would overlap another window on the automation display now fails closed with a `dedicated-pool-exhausted:` error telling the caller to wait or free a slot, instead of stacking a window nobody can see while `window status` still reported `onDisplay: true`.
 
 ## [1.8.4](https://github.com/jackwener/opencli/compare/v1.8.3...v1.8.4) (2026-06-15)

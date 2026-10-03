@@ -417,7 +417,7 @@ async function sendCommandRaw(
   const windowSlot = params.windowSlot ?? placement.windowSlot;
   const windowBounds = params.windowBounds ?? placement.windowBounds;
   const windowDisplay = params.windowDisplay ?? placement.windowDisplay;
-  const avoidDisplayBounds = windowMode === 'dedicated' && !windowBounds && !windowDisplay
+  const avoidDisplayBounds = windowMode === 'dedicated'
     ? params.avoidDisplayBounds ?? await activeDisplayBounds()
     : undefined;
   const half = windowMode === 'dedicated' ? params.half ?? placement.half : undefined;
