@@ -106,8 +106,10 @@ export interface Command {
   dedicatedIdleMs?: number;
   /** sessions window-close: close a window even while a live lease still holds it. */
   force?: boolean;
-  /** Custom idle timeout in seconds for this session. Overrides the default. */
+  /** Custom idle timeout in seconds; -1 means never expire. Overrides the default. */
   idleTimeout?: number;
+  /** In-flight command budget in milliseconds; extended for a longer command timeout. */
+  inflightMaxMs?: number;
   /** Frame index for cross-frame operations (0-based, from 'frames' action) */
   frameIndex?: number;
   /**

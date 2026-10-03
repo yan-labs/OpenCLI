@@ -620,7 +620,7 @@ describe('createProgram root help descriptions', () => {
       });
       // session is now a hidden internal option (consumed from the <session> positional).
       // namespace_options should only list user-facing options.
-      expect(data.namespace_options.map((option: any) => option.name)).toEqual(['window', 'windowSlot', 'windowBounds', 'half', 'windowDisplay']);
+      expect(data.namespace_options.map((option: any) => option.name)).toEqual(['window', 'keepAlive', 'idleTimeout', 'windowSlot', 'windowBounds', 'half', 'windowDisplay']);
       expect(data.structured_help).toMatchObject({
         usage: 'opencli browser <session> tab --help -f yaml',
       });
@@ -652,7 +652,7 @@ describe('createProgram root help descriptions', () => {
       });
       expect(data.command_options.map((option: any) => option.name)).toEqual(['role', 'name', 'label', 'text', 'testid', 'nth', 'tab']);
       // session is hidden; `window` and its dedicated-mode placement siblings surface as namespace options.
-      expect(data.namespace_options.map((option: any) => option.name)).toEqual(['window', 'windowSlot', 'windowBounds', 'half', 'windowDisplay']);
+      expect(data.namespace_options.map((option: any) => option.name)).toEqual(['window', 'keepAlive', 'idleTimeout', 'windowSlot', 'windowBounds', 'half', 'windowDisplay']);
       expect(data.global_options.map((option: any) => option.name)).toContain('profile');
     } finally {
       process.argv = argv;
@@ -1217,6 +1217,25 @@ describe('browser tab targeting commands', () => {
     const runId = mockSetDaemonRunContext.mock.calls.at(-1)?.[0].runId;
     expect(mockClearDaemonRunContext).toHaveBeenCalledWith(runId);
     expect(mockReleaseSessionLease).toHaveBeenCalledWith({ runId, session: 'test', surface: 'browser' });
+  });
+
+  it.each([
+    { flags: ['--keep-alive'], env: '25', expected: -1 },
+    { flags: ['--idle-timeout', '42'], env: 'never', expected: 42 },
+    { flags: [], env: 'never', expected: -1 },
+    { flags: [], env: '25', expected: 25 },
+  ])('passes idle settings with CLI priority: $flags / $env', async ({ flags, env, expected }) => {
+    vi.stubEnv('OPENCLI_BROWSER_IDLE_TIMEOUT', env);
+    try {
+      const program = createProgram('', '');
+      const { rewriteBrowserArgv } = await import('./cli-argv-preprocess.js');
+      await program.parseAsync(['node', 'opencli', ...rewriteBrowserArgv([
+        'browser', 'test', 'open', 'https://example.com', ...flags,
+      ])]);
+      expect(mockBrowserConnect).toHaveBeenCalledWith(expect.objectContaining({ idleTimeout: expected }));
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it('passes browser --window through Commander options without relying on env pre-processing', async () => {
@@ -1904,7 +1923,7 @@ describe('browser sessions command', () => {
 
   it('marks the active tab with a leading "*" and appends [dedicated:<slot>] for a dedicated-slot entry, in table format', async () => {
     mockSendCommand.mockResolvedValueOnce([
-      { session: 'semrush', surface: 'browser', kind: 'lease', windowId: 1234, groupTitle: 'semrush', url: 'https://semrush.com/report', dedicatedSlot: 'semrush', tabActive: true },
+      { session: 'semrush', surface: 'browser', kind: 'lease', windowId: 1234, groupTitle: 'semrush', url: 'https://semrush.com/report', dedicatedSlot: 'semrush', tabActive: true, keepAlive: true, idleDeadlineAt: 0 },
       { session: 'plain', surface: 'browser', kind: 'lease', windowId: 5, groupTitle: 'plain', url: 'https://example.com', dedicatedSlot: null, tabActive: false },
     ]);
     const program = createProgram('', '');
@@ -1915,6 +1934,7 @@ describe('browser sessions command', () => {
     const semrushLine = logs.split('\n').find((l) => l.includes('semrush') && l.includes('win1234'))!;
     expect(semrushLine).toMatch(/^\*/);
     expect(semrushLine).toContain('[dedicated:semrush]');
+    expect(semrushLine).toContain('[keep-alive]');
     const plainLine = logs.split('\n').find((l) => l.includes('plain') && l.includes('win5'))!;
     expect(plainLine).not.toContain('[dedicated:');
     expect(plainLine.startsWith('*')).toBe(false);

@@ -403,3 +403,14 @@ describe('escapeLeadingDashPositional', () => {
     expect(escapeLeadingDashPositional(['boss', 'detail'], manifest)).toEqual(['boss', 'detail']);
   });
 });
+
+
+describe('browser idle options', () => {
+  it.each([
+    ['--keep-alive'], ['--idle-timeout', '60'], ['--idle-timeout=60'],
+  ])('accepts trailing or namespace placement: %j', (...flags) => {
+    const expected = ['browser', '--session', 'review', ...flags, 'open', 'https://example.com'];
+    expect(rewriteBrowserArgv(['browser', 'review', 'open', 'https://example.com', ...flags])).toEqual(expected);
+    expect(rewriteBrowserArgv(['browser', 'review', ...flags, 'open', 'https://example.com'])).toEqual(expected);
+  });
+});

@@ -2562,6 +2562,122 @@ describe('background tab isolation', () => {
     expect(mod.__test__.getSession(adapterKey('chatgpt'))).not.toBeNull();
   });
 
+  it.each(['timer', 'alarm'])('reclaims a stuck in-flight command via %s without waiting for finally', async (path) => {
+    const { chrome } = createChromeMock();
+    vi.useFakeTimers();
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    mod.__test__.setDefaultWindowMode('background');
+    const key = browserKey('stuck');
+    mod.__test__.setAutomationWindowId(key, 1);
+    const blocked = deferred<never[]>();
+    chrome.cookies.getAll.mockReturnValueOnce(blocked.promise);
+    const pending = mod.__test__.handleCommand({
+      id: 'stuck', action: 'cookies', session: 'stuck', domain: 'example.com',
+      idleTimeout: 1, inflightMaxMs: 2000,
+    });
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(mod.__test__.getSession(key)).not.toBeNull();
+    if (path === 'timer') await vi.advanceTimersByTimeAsync(1001);
+    else {
+      vi.setSystemTime(Date.now() + 1001);
+      await chrome.alarms.onAlarm.addListener.mock.calls[0][0]({
+        name: `opencli:lease-idle:${encodeURIComponent(key)}`,
+      });
+    }
+    expect(mod.__test__.getSession(key)).toBeNull();
+    expect(mod.__test__.activeCommands.has(key)).toBe(false);
+    // A late completion must not reset the idle clock of a replacement lease.
+    mod.__test__.setAutomationWindowId(key, 1);
+    const replacement = mod.__test__.getSession(key);
+    blocked.resolve([]);
+    await pending;
+    expect(mod.__test__.getSession(key)).toEqual(replacement);
+  });
+
+  it('respects a command timeout longer than the configured in-flight budget', async () => {
+    const { chrome } = createChromeMock();
+    vi.useFakeTimers();
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    mod.__test__.setDefaultWindowMode('background');
+    const key = browserKey('long');
+    mod.__test__.setAutomationWindowId(key, 1);
+    const blocked = deferred<never[]>();
+    chrome.cookies.getAll.mockReturnValueOnce(blocked.promise);
+    const pending = mod.__test__.handleCommand({
+      id: 'long', action: 'cookies', session: 'long', domain: 'example.com',
+      idleTimeout: 1, inflightMaxMs: 2000, timeout: 4,
+    });
+    await vi.advanceTimersByTimeAsync(3001);
+    expect(mod.__test__.getSession(key)).not.toBeNull();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(mod.__test__.getSession(key)).toBeNull();
+    blocked.resolve([]);
+    await pending;
+  });
+
+  it('persists idleTimeout -1 across reconcile and releases it on cleanup or close', async () => {
+    const { chrome } = createChromeMock();
+    vi.useFakeTimers();
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    mod.__test__.setDefaultWindowMode('background');
+    const key = browserKey('never');
+    mod.__test__.setSession(key, { windowId: 1, owned: true, preferredTabId: 1 });
+    await mod.__test__.handleCommand({
+      id: 'never', action: 'cookies', session: 'never', domain: 'example.com', idleTimeout: -1,
+    });
+    expect(mod.__test__.getIdleTimeout(key)).toBe(-1);
+    mod.__test__.sessionOverrides.clear();
+    await mod.__test__.reconcileTargetLeaseRegistry();
+    expect(mod.__test__.getIdleTimeout(key)).toBe(-1);
+    await vi.advanceTimersByTimeAsync(1_200_001);
+    await chrome.alarms.onAlarm.addListener.mock.calls[0][0]({
+      name: `opencli:lease-idle:${encodeURIComponent(key)}`,
+    });
+    expect(mod.__test__.getSession(key)).not.toBeNull();
+    const listed = await mod.__test__.handleSessions({ id: 'list', action: 'sessions' });
+    expect(listed.data).toEqual(expect.arrayContaining([expect.objectContaining({
+      session: 'never', keepAlive: true, idleDeadlineAt: 0,
+    })]));
+    await mod.__test__.handleCommand({ id: 'close', action: 'close-window', session: 'never' });
+    expect(mod.__test__.getSession(key)).toBeNull();
+    mod.__test__.setSession(key, { windowId: 1, owned: true, preferredTabId: 1 });
+    await mod.__test__.handleCommand({
+      id: 'again', action: 'cookies', session: 'never', domain: 'example.com', idleTimeout: -1,
+    });
+    await mod.__test__.handleSessions({ id: 'cleanup', action: 'sessions', op: 'cleanup' });
+    expect(mod.__test__.getSession(key)).toBeNull();
+  });
+
+  it('restores the original in-flight start and custom idle timeout on reconcile', async () => {
+    const { chrome } = createChromeMock();
+    vi.useFakeTimers();
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    mod.__test__.setDefaultWindowMode('background');
+    const key = browserKey('restore-stuck');
+    mod.__test__.setSession(key, { windowId: 1, owned: true, preferredTabId: 1 });
+    await mod.__test__.handleCommand({
+      id: 'nav', action: 'cookies', session: 'restore-stuck', domain: 'example.com', idleTimeout: 1,
+    });
+    const blocked = deferred<never[]>();
+    chrome.cookies.getAll.mockReturnValueOnce(blocked.promise);
+    const pending = mod.__test__.handleCommand({
+      id: 'restore', action: 'cookies', session: 'restore-stuck', domain: 'example.com', inflightMaxMs: 2000,
+    });
+    await vi.advanceTimersByTimeAsync(500);
+    mod.__test__.activeCommands.clear();
+    mod.__test__.sessionOverrides.clear();
+    await mod.__test__.reconcileTargetLeaseRegistry();
+    expect(mod.__test__.getIdleTimeout(key)).toBe(1000);
+    await vi.advanceTimersByTimeAsync(1501);
+    expect(mod.__test__.getSession(key)).toBeNull();
+    blocked.resolve([]);
+    await pending;
+  });
+
   it('uses 10-minute timeout for browser:* sessions', async () => {
     const { chrome } = createChromeMock();
     vi.useFakeTimers();

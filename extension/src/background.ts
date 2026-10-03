@@ -427,6 +427,8 @@ const ownedGroupLedger = new Map<number, string | null>();
 type StoredLease = Omit<TargetLease, 'idleTimer' | 'idleDeadlineAt'> & {
   idleDeadlineAt: number;
   updatedAt: number;
+  idleTimeoutMs?: number;
+  inflightCommands?: InflightCommand[];
 };
 
 // The registry lives in chrome.storage.session, never chrome.storage.local:
@@ -490,8 +492,31 @@ function setSessionOverride(key: string, patch: SessionOverrides): void {
   sessionOverrides.set(key, { ...sessionOverrides.get(key), ...patch });
 }
 
-/** Commands currently executing per lease — idle release is deferred while > 0. */
-const activeCommandCounts = new Map<string, number>();
+/** Each command retains its own start and budget, including across worker restarts. */
+const INFLIGHT_MAX_MS = 600_000;
+type InflightCommand = { startedAt: number; maxMs: number };
+const activeCommands = new Map<string, Set<InflightCommand>>();
+
+function oldestInflightRemaining(leaseKey: string): number | undefined {
+  const commands = activeCommands.get(leaseKey);
+  if (!commands?.size) return undefined;
+  const oldest = [...commands].reduce((a, b) => a.startedAt <= b.startedAt ? a : b);
+  return oldest.startedAt + oldest.maxMs - Date.now();
+}
+
+async function handleIdleExpiry(leaseKey: string, reason: string): Promise<void> {
+  if (getIdleTimeout(leaseKey) <= 0) return;
+  const remaining = oldestInflightRemaining(leaseKey);
+  if (remaining !== undefined && remaining > 0) {
+    resetWindowIdleTimer(leaseKey, remaining);
+    return;
+  }
+  if (remaining !== undefined) {
+    activeCommands.delete(leaseKey);
+    reason = `stuck command (${reason})`;
+  }
+  await releaseLease(leaseKey, reason);
+}
 const LEASE_KEY_SEPARATOR = '\u0000';
 
 function getLeaseKey(session: string, surface: BrowserSurface): string {
@@ -704,6 +729,8 @@ async function persistRuntimeState(): Promise<void> {
       windowRole: session.windowRole,
       idleDeadlineAt: session.idleDeadlineAt,
       updatedAt: Date.now(),
+      idleTimeoutMs: sessionOverrides.get(leaseKey)?.idleTimeoutMs,
+      inflightCommands: [...(activeCommands.get(leaseKey) ?? [])],
     };
   }
   await writeRegistry({
@@ -764,19 +791,13 @@ function resetWindowIdleTimer(leaseKey: string, remainingMs?: number): void {
     void persistRuntimeState();
     return;
   }
-  const interval = remainingMs === undefined
-    ? timeout
-    : Math.max(0, Math.min(remainingMs, timeout));
+  const inflightRemaining = oldestInflightRemaining(leaseKey);
+  const interval = Math.max(0, Math.min(timeout, remainingMs ?? timeout, inflightRemaining ?? timeout));
   scheduleIdleAlarm(leaseKey, interval);
   session.idleDeadlineAt = Date.now() + interval;
   void persistRuntimeState();
-  session.idleTimer = setTimeout(async () => {
-    if ((activeCommandCounts.get(leaseKey) ?? 0) > 0) {
-      // A command is still executing on this lease — never tear the tab down
-      // from under it. Its completion re-arms the timer.
-      return;
-    }
-    await releaseLease(leaseKey, 'idle timeout');
+  session.idleTimer = setTimeout(() => {
+    void handleIdleExpiry(leaseKey, 'idle timeout');
   }, interval);
 }
 
@@ -3230,13 +3251,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   }
   const leaseKey = leaseKeyFromAlarmName(alarm.name);
   if (!leaseKey) return;
-  if ((activeCommandCounts.get(leaseKey) ?? 0) > 0) {
-    // A command is mid-flight (the alarm can fire while a long command runs
-    // in a woken worker) — defer; command completion re-arms the idle timer.
-    resetWindowIdleTimer(leaseKey);
-    return;
-  }
-  await releaseLease(leaseKey, 'idle alarm');
+  await handleIdleExpiry(leaseKey, 'idle alarm');
 });
 
 // ─── Popup status API ───────────────────────────────────────────────
@@ -3298,15 +3313,19 @@ async function handleCommand(cmd: Command): Promise<Result> {
     setSessionOverride(leaseKey, { lifecycle: cmd.siteSession });
   }
   // Apply custom idle timeout if specified in the command
-  if (cmd.idleTimeout != null && cmd.idleTimeout > 0) {
-    setSessionOverride(leaseKey, { idleTimeoutMs: cmd.idleTimeout * 1000 });
+  if (cmd.idleTimeout === -1 || (Number.isInteger(cmd.idleTimeout) && cmd.idleTimeout! > 0)) {
+    setSessionOverride(leaseKey, { idleTimeoutMs: cmd.idleTimeout === -1 ? IDLE_TIMEOUT_NONE : cmd.idleTimeout! * 1000 });
   }
-  // Reset idle timer on every command (window stays alive while active).
-  // The in-flight refcount below additionally blocks idle release while a
-  // long command is still executing — otherwise a 30s idle timer could tear
-  // the tab down mid-command.
+  const inflight: InflightCommand = {
+    startedAt: Date.now(),
+    // Explicit long operations retain their own timeout budget.
+    maxMs: Math.max(cmd.inflightMaxMs && cmd.inflightMaxMs > 0 ? cmd.inflightMaxMs : INFLIGHT_MAX_MS,
+      (cmd.timeout ?? 0) * 1000, cmd.timeoutMs ?? 0),
+  };
+  const commands = activeCommands.get(leaseKey) ?? new Set<InflightCommand>();
+  commands.add(inflight);
+  activeCommands.set(leaseKey, commands);
   resetWindowIdleTimer(leaseKey);
-  activeCommandCounts.set(leaseKey, (activeCommandCounts.get(leaseKey) ?? 0) + 1);
   try {
     switch (cmd.action) {
       case 'exec':
@@ -3347,11 +3366,11 @@ async function handleCommand(cmd: Command): Promise<Result> {
   } catch (err) {
     return errorResult(cmd.id, err);
   } finally {
-    const remaining = (activeCommandCounts.get(leaseKey) ?? 1) - 1;
-    if (remaining <= 0) activeCommandCounts.delete(leaseKey);
-    else activeCommandCounts.set(leaseKey, remaining);
-    // Grant a fresh idle window measured from command COMPLETION, not start.
-    resetWindowIdleTimer(leaseKey);
+    // A late finally from a released lease must not alter its replacement.
+    if (activeCommands.get(leaseKey) === commands && commands.delete(inflight)) {
+      if (!commands.size) activeCommands.delete(leaseKey);
+      resetWindowIdleTimer(leaseKey);
+    }
   }
 }
 
@@ -4237,6 +4256,8 @@ async function handleSessions(cmd: Command): Promise<Result> {
     windowFallbackReason: WindowFallbackReason | null;
     dedicatedSlot: string | null;
     tabActive: boolean | null;
+    keepAlive: boolean;
+    idleDeadlineAt: number;
     url?: string;
     title?: string;
   }> = [];
@@ -4281,6 +4302,8 @@ async function handleSessions(cmd: Command): Promise<Result> {
       groupId,
       groupTitle,
       windowFallbackReason,
+      keepAlive: getIdleTimeout(leaseKey) === IDLE_TIMEOUT_NONE,
+      idleDeadlineAt: lease.idleDeadlineAt,
       dedicatedSlot: dedicatedSlotForWindow(windowId)?.slot ?? null,
       tabActive,
       url,
@@ -4415,6 +4438,7 @@ async function handleClipboard(cmd: Command): Promise<Result> {
 }
 
 async function releaseLease(leaseKey: string, reason: string = 'released'): Promise<void> {
+  activeCommands.delete(leaseKey);
   const session = automationSessions.get(leaseKey);
   if (!session) {
     sessionOverrides.delete(leaseKey);
@@ -4528,6 +4552,12 @@ async function reconcileTargetLeaseRegistry(): Promise<void> {
       if (stored.lifecycle === 'ephemeral' || stored.lifecycle === 'persistent' || stored.lifecycle === 'pinned') {
         setSessionOverride(leaseKey, { lifecycle: stored.lifecycle });
       }
+      if (stored.idleTimeoutMs === -1 || (Number.isInteger(stored.idleTimeoutMs) && stored.idleTimeoutMs! > 0)) {
+        setSessionOverride(leaseKey, { idleTimeoutMs: stored.idleTimeoutMs });
+      }
+      if (stored.inflightCommands?.length) {
+        activeCommands.set(leaseKey, new Set(stored.inflightCommands));
+      }
       const session = makeSession(leaseKey, {
         session: typeof stored.session === 'string' ? stored.session : getSessionFromKey(leaseKey),
         surface: stored.surface === 'adapter' ? 'adapter' : getSurfaceFromKey(leaseKey),
@@ -4554,7 +4584,7 @@ async function reconcileTargetLeaseRegistry(): Promise<void> {
       const remaining = stored.idleDeadlineAt > 0 ? stored.idleDeadlineAt - Date.now() : timeout;
       if (timeout > 0) {
         if (remaining <= 0) {
-          await releaseLease(leaseKey, 'reconciled idle expiry');
+          await handleIdleExpiry(leaseKey, 'reconciled idle expiry');
         } else {
           // Honor the persisted remaining lifetime — not a fresh full timeout —
           // so a lease cannot dodge idle expiry by riding repeated SW restarts.
@@ -4690,6 +4720,8 @@ export const __test__ = {
   getIdleTimeout,
   getLeaseKey,
   sessionOverrides,
+  activeCommands,
+  handleIdleExpiry,
   reconcileTargetLeaseRegistry,
   ensureOwnedContainerGroup,
   getContainer: (role: OwnedWindowRole) => ({

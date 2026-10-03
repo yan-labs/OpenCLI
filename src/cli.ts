@@ -491,19 +491,20 @@ async function getBrowserPage(
   session: string,
   targetPage?: string,
   profileSelection?: ProfileSelection,
-  opts: { windowMode?: BrowserWindowMode } = {},
+  opts: { windowMode?: BrowserWindowMode; idleTimeout?: number } = {},
 ): Promise<import('./types.js').IPage> {
   const { BrowserBridge } = await import('./browser/index.js');
   const bridge = new BrowserBridge();
   // Internal GC timeout for browser sessions. Not the per-command runtime timeout.
   const envTimeout = process.env.OPENCLI_BROWSER_IDLE_TIMEOUT;
-  const idleTimeout = envTimeout ? parseInt(envTimeout, 10) : undefined;
+  const envSeconds = envTimeout ? parseInt(envTimeout, 10) : undefined;
+  const idleTimeout = opts.idleTimeout ?? (envTimeout === 'never' ? -1 : envSeconds);
   const page = await bridge.connect({
     timeout: DEFAULT_BROWSER_CONNECT_TIMEOUT,
     session,
     surface: 'browser',
     ...profileRouteParams(profileSelection),
-    ...(idleTimeout && idleTimeout > 0 && { idleTimeout }),
+    ...((idleTimeout === -1 || (idleTimeout != null && idleTimeout > 0)) && { idleTimeout }),
     windowMode: opts.windowMode ?? getBrowserWindowMode(undefined, 'dedicated'),
   });
   const targetScope = getBrowserScope(session, profileSelection?.contextId);
@@ -884,6 +885,13 @@ export function createProgram(BUILTIN_CLIS: string, USER_CLIS: string): Command 
     // positional; main.ts argv preprocessor rewrites positional -> --session.
     .addOption(new Option('--session <name>', 'Internal — set automatically from the <session> positional').hideHelp())
     .option('--window <mode>', 'Window mode: dedicated (default — an OpenCLI-owned window, created unfocused and placed off your screen when a second display exists; the tab itself renders visible), background (hidden tab in your current window, never steals focus), active (selects the tab within its window only, no OS focus steal), foreground (raise + select), isolated (background in its own window)')
+    .option('--keep-alive', 'Never idle-expire this session; caller must close it')
+    .option('--idle-timeout <seconds>', 'Session idle timeout in positive integer seconds (default: 600)', (raw: string) => {
+      if (!/^\d+$/.test(raw) || !Number.isSafeInteger(Number(raw)) || Number(raw) <= 0) {
+        throw new InvalidArgumentError('--idle-timeout must be a positive integer in seconds');
+      }
+      return Number(raw);
+    })
     .option('--window-slot <name>', 'Pin this session to a named dedicated window (only used with --window dedicated). Omit it and the session borrows an idle window from the pool and hands it back when its lease ends')
     .option('--window-bounds <x,y,w,h>', 'Dedicated window explicit placement: left,top,width,height (only used with --window dedicated)')
     .option('--half', 'Dedicated only: occupy one full grid cell at half its width, aligned left, for mobile/H5 layouts; do not resize the window width manually')
@@ -1043,6 +1051,10 @@ still usable even when navigation is reported as timed out.
         session = getBrowserSession(command);
         const profileSelection = getBrowserProfileSelection(command);
         const windowMode = getBrowserWindowMode(command, 'dedicated');
+        const keepAlive = getCommandOption(command, 'keepAlive');
+        const idleSeconds = getCommandOption(command, 'idleTimeout');
+        if (keepAlive && idleSeconds !== undefined) throw new Error('Use either --keep-alive or --idle-timeout, not both.');
+        const idleTimeout = keepAlive ? -1 : idleSeconds as number | undefined;
         // --window-slot/--window-bounds/--window-display override env for this
         // invocation only; sendCommandRaw resolves them (dedicated mode only)
         // with this override taking precedence over OPENCLI_WINDOW_*.
@@ -1063,7 +1075,7 @@ still usable even when navigation is reported as timed out.
           command: browserCommandLabel(command),
           access: browserCommandAccess(command, args),
         });
-        page = await getBrowserPage(session, targetPage, profileSelection, { windowMode });
+        page = await getBrowserPage(session, targetPage, profileSelection, { windowMode, idleTimeout });
         await fn(page, ...args);
       } catch (err) {
         if (err instanceof BrowserConnectError) {
@@ -3454,8 +3466,11 @@ cli({
               const dedicated = typeof e.dedicatedSlot === 'string' && e.dedicatedSlot
                 ? `  [dedicated:${e.dedicatedSlot}]`
                 : '';
+              const expiry = e.keepAlive === true ? '  [keep-alive]'
+                : typeof e.idleDeadlineAt === 'number' && e.idleDeadlineAt > 0
+                  ? `  [idle ${Math.max(0, Math.ceil((e.idleDeadlineAt - Date.now()) / 1000))}s]` : '';
               const activeMarker = e.tabActive === true ? '*' : ' ';
-              console.log(`${activeMarker} ${(e.session as string).padEnd(34)} ${(e.surface as string).padEnd(9)} ${(e.kind as string).padEnd(7)} ${win.padEnd(10)} ${group.padEnd(28)} ${url}${dedicated}${fallback}`);
+              console.log(`${activeMarker} ${(e.session as string).padEnd(34)} ${(e.surface as string).padEnd(9)} ${(e.kind as string).padEnd(7)} ${win.padEnd(10)} ${group.padEnd(28)} ${url}${dedicated}${fallback}${expiry}`);
             }
           }
         }

@@ -273,8 +273,10 @@ export interface DaemonCommand {
   foreignTabPolicy?: 'evict' | 'tolerate';
   /** Idle TTL (ms) for the dedicated window pool, from OPENCLI_DEDICATED_IDLE_MS. Overrides the extension's default when set; omitted otherwise. */
   dedicatedIdleMs?: number;
-  /** Custom idle timeout in seconds for this session. Overrides the default. */
+  /** Custom idle timeout in seconds; -1 means never expire. Overrides the default. */
   idleTimeout?: number;
+  /** In-flight command budget in milliseconds; extended for a longer command timeout. */
+  inflightMaxMs?: number;
   /** Frame index for cross-frame operations (0-based, from 'frames' action) */
   frameIndex?: number;
   /** When true, the 'frames' action returns `{ frames, debug }` diagnostics instead of a bare array. */
@@ -463,6 +465,8 @@ async function sendCommandRaw(
       action,
       ...params,
       timeout: timeoutSeconds,
+      ...(Number.isSafeInteger(Number(process.env.OPENCLI_INFLIGHT_MAX_MS)) && Number(process.env.OPENCLI_INFLIGHT_MAX_MS) > 0
+        ? { inflightMaxMs: Number(process.env.OPENCLI_INFLIGHT_MAX_MS) } : {}),
       deadlineAt,
       ...(contextId && { contextId }),
       ...(preferredContextId && { preferredContextId }),
