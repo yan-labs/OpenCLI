@@ -4374,6 +4374,68 @@ describe('dedicated automation window — pool and layout', () => {
     expect(h.windows.get(51)).toEqual(b);
   });
 
+  it('reassigns slots 4 and 5 into distinct normal cells after a 5120×2850 screen shrinks', async () => {
+    const h = dedicatedHarness();
+    h.displays[1].bounds = h.displays[1].workArea = { left: 0, top: 0, width: 5120, height: 2850 };
+    vi.stubGlobal('chrome', h.chrome);
+    const mod = await import('./background');
+    for (let i = 0; i < 6; i += 1) await mod.__test__.ensureDedicatedWindow(`shrink-${i}`);
+    for (let i = 0; i < 4; i += 1) await h.closeWindow(50 + i);
+    expect(mod.__test__.getDedicatedSlot('shrink-4')!.tileIndex).toBe(4);
+    expect(mod.__test__.getDedicatedSlot('shrink-5')!.tileIndex).toBe(5);
+    h.displays[1].bounds = h.displays[1].workArea = { left: 0, top: 0, width: 2560, height: 1440 };
+    await mod.__test__.reconcileDedicatedWindows();
+    for (let i = 0; i < 2; i += 1) {
+      expect(mod.__test__.getDedicatedSlot(`shrink-${i + 4}`)).toMatchObject({ displayId: 'virt', tileIndex: i });
+      expect(h.windows.get(54 + i)).toMatchObject(mod.__test__.dedicatedTile(h.displays[1].workArea, i));
+    }
+    expect(overlaps(h.windows.get(54), h.windows.get(55))).toBe(false);
+  });
+
+  it('preserves valid cells on two virtual screens and moves excess cells to the next free grid', async () => {
+    const h = dedicatedHarness();
+    h.displays[1].id = '20';
+    h.displays[1].bounds = h.displays[1].workArea = { left: -5120, top: 0, width: 5120, height: 2850 };
+    h.displays.push({ ...h.displays[1], id: '21', name: 'Virtual B', bounds: { left: 1512, top: 0, width: 2560, height: 1440 }, workArea: { left: 1512, top: 0, width: 2560, height: 1440 } });
+    vi.stubGlobal('chrome', h.chrome);
+    const mod = await import('./background');
+    await mod.__test__.ensureDedicatedWindow('stable', { avoidDisplayBounds: h.displays[1].bounds });
+    const stable = { ...h.windows.get(50)! };
+    for (let i = 0; i < 6; i += 1) await mod.__test__.ensureDedicatedWindow(`shrink-${i}`);
+    h.displays[1].bounds = h.displays[1].workArea = { left: -2560, top: 0, width: 2560, height: 1440 };
+    await mod.__test__.reconcileDedicatedWindows();
+    expect(h.windows.get(50)).toEqual(stable);
+    for (let i = 0; i < 6; i += 1) {
+      const display = h.displays[i < 4 ? 1 : 2];
+      const index = i < 4 ? i : i - 3;
+      expect(mod.__test__.getDedicatedSlot(`shrink-${i}`)).toMatchObject({ displayId: display.id, tileIndex: index });
+      expect(h.windows.get(51 + i)).toMatchObject(mod.__test__.dedicatedTile(display.workArea, index));
+    }
+    const windows = [...h.windows.values()].filter(w => w.id >= 50);
+    for (const [i, win] of windows.entries()) {
+      for (const other of windows.slice(i + 1)) expect(overlaps(win, other)).toBe(false);
+    }
+  });
+
+  it('restores a legacy window into another screen before cascading on its full remembered screen', async () => {
+    const h = dedicatedHarness();
+    h.displays[1].id = '20';
+    h.displays.push({ ...h.displays[1], id: '21', name: 'Virtual B', bounds: { left: 1512, top: 0, width: 2560, height: 1440 }, workArea: { left: 1512, top: 0, width: 2560, height: 1440 } });
+    vi.stubGlobal('chrome', h.chrome);
+    const mod = await import('./background');
+    for (let i = 0; i < 4; i += 1) await mod.__test__.ensureDedicatedWindow(`full-${i}`);
+    await mod.__test__.ensureDedicatedWindow('legacy');
+    const storage = await h.chrome.storage.session.get('opencli_dedicated_windows_v1');
+    const legacy = storage.opencli_dedicated_windows_v1.slots.legacy;
+    delete legacy.displayId;
+    legacy.placement.requestedBounds = { ...h.displays[1].workArea, width: 1280, height: 720 };
+    await h.chrome.storage.session.set(storage);
+    await mod.__test__.restoreDedicatedState();
+    await mod.__test__.reconcileDedicatedWindows();
+    expect(mod.__test__.getDedicatedSlot('legacy')).toMatchObject({ displayId: '21', tileIndex: 0 });
+    expect(h.windows.get(54)).toMatchObject(mod.__test__.dedicatedTile(h.displays[2].workArea, 0));
+  });
+
   it('reuses the 30-second alarm for reconciliation and preserves half width', async () => {
     const h = dedicatedHarness();
     vi.stubGlobal('chrome', h.chrome);

@@ -1846,7 +1846,8 @@ function claimTileIndex(state: DedicatedSlotState, displays: DisplayInfo[], avoi
     .filter(s => s !== state && s.placement.source === 'auto' && s.displayId === display.id && s.windowId !== null)
     .map(s => s.tileIndex));
   const existing = displays.find(d => d.id === state.displayId);
-  if (existing && state.tileIndex !== null && !taken(existing).has(state.tileIndex)) return existing;
+  if (existing && state.tileIndex !== null && state.tileIndex >= 0
+    && state.tileIndex < dedicatedCapacity(displayArea(existing)) && !taken(existing).has(state.tileIndex)) return existing;
   // Old registries had no displayId. Adopt the remembered screen rather than
   // moving all legacy windows to the first display during the initial upgrade.
   if (state.displayId === null && state.windowId !== null && state.placement.requestedBounds) {
@@ -1857,15 +1858,14 @@ function claimTileIndex(state: DedicatedSlotState, displays: DisplayInfo[], avoi
       const grid = dedicatedGrid(area);
       const col = Math.max(0, Math.min(grid.cols - 1, Math.round((bounds.left - area.left) / grid.width)));
       const row = Math.max(0, Math.min(grid.rows - 1, Math.round((bounds.top - area.top) / grid.height)));
-      let index = row * grid.cols + col;
-      const used = taken(display);
-      if (used.has(index)) {
-        index = 0;
-        while (used.has(index)) index += 1;
+      const index = row * grid.cols + col;
+      if (!taken(display).has(index)) {
+        state.displayId = display.id;
+        state.tileIndex = index;
+        return display;
       }
-      state.displayId = display.id;
-      state.tileIndex = index;
-      return display;
+      // A conflicting legacy cell uses the normal allocator across all screens.
+      // Never cascade on the remembered screen while another grid has space.
     }
   }
   const candidates = avoid

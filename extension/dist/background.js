@@ -2253,7 +2253,7 @@ function liveDedicatedStates() {
 function claimTileIndex(state, displays, avoid) {
   const taken = (display2) => new Set([...dedicatedSlots.values()].filter((s) => s !== state && s.placement.source === "auto" && s.displayId === display2.id && s.windowId !== null).map((s) => s.tileIndex));
   const existing = displays.find((d) => d.id === state.displayId);
-  if (existing && state.tileIndex !== null && !taken(existing).has(state.tileIndex)) return existing;
+  if (existing && state.tileIndex !== null && state.tileIndex >= 0 && state.tileIndex < dedicatedCapacity(displayArea(existing)) && !taken(existing).has(state.tileIndex)) return existing;
   if (state.displayId === null && state.windowId !== null && state.placement.requestedBounds) {
     const bounds = state.placement.requestedBounds;
     const display2 = displays.find((d) => rectCenterInside(bounds, displayArea(d)));
@@ -2262,15 +2262,12 @@ function claimTileIndex(state, displays, avoid) {
       const grid = dedicatedGrid(area);
       const col = Math.max(0, Math.min(grid.cols - 1, Math.round((bounds.left - area.left) / grid.width)));
       const row = Math.max(0, Math.min(grid.rows - 1, Math.round((bounds.top - area.top) / grid.height)));
-      let index2 = row * grid.cols + col;
-      const used2 = taken(display2);
-      if (used2.has(index2)) {
-        index2 = 0;
-        while (used2.has(index2)) index2 += 1;
+      const index2 = row * grid.cols + col;
+      if (!taken(display2).has(index2)) {
+        state.displayId = display2.id;
+        state.tileIndex = index2;
+        return display2;
       }
-      state.displayId = display2.id;
-      state.tileIndex = index2;
-      return display2;
     }
   }
   const candidates = avoid ? [...displays.filter((d) => !sameDisplayBounds(d.bounds, avoid)), ...displays.filter((d) => sameDisplayBounds(d.bounds, avoid))] : displays;
