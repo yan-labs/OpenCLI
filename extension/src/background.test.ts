@@ -3512,6 +3512,28 @@ describe('dedicated automation window', () => {
     warn.mockRestore();
   });
 
+  it('syncs relocated bounds size on slot reuse and leaves matching-size nudges alone', async () => {
+    const h = dedicatedHarness();
+    vi.stubGlobal('chrome', h.chrome);
+    const mod = await import('./background');
+    const avoidDisplayBounds = { left: 0, top: 0, width: 1512, height: 982 };
+    await mod.__test__.ensureDedicatedWindow('reuse-bounds', { avoidDisplayBounds, reposition: true });
+    expect(h.windows.get(50)).toMatchObject({ width: 1280, height: 900 });
+    h.chrome.windows.update.mockClear();
+
+    const request = { bounds: { left: 0, top: 0, width: 1360, height: 900 }, avoidDisplayBounds, reposition: true };
+    const resized = await mod.__test__.ensureDedicatedWindow('reuse-bounds', request);
+    expect(resized).toMatchObject({ windowId: 50, created: false, moved: true });
+    expect(h.chrome.windows.update).toHaveBeenCalledWith(50, expect.objectContaining({ width: 1360, height: 900 }));
+    expect(h.windows.get(50)).toMatchObject({ width: 1360, height: 900 });
+
+    Object.assign(h.windows.get(50)!, { left: -2400, top: -1300 });
+    h.chrome.windows.update.mockClear();
+    expect(await mod.__test__.ensureDedicatedWindow('reuse-bounds', request)).toMatchObject({ moved: false });
+    expect(h.chrome.windows.update).not.toHaveBeenCalled();
+    expect(h.windows.get(50)).toMatchObject({ left: -2400, top: -1300, width: 1360, height: 900 });
+  });
+
   it('tiles slots on the display matched by name without overlapping them', async () => {
     const h = dedicatedHarness();
     vi.stubGlobal('chrome', h.chrome);

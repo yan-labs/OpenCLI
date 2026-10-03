@@ -2723,7 +2723,7 @@ async function ensureDedicatedWindowUnlocked(state, request) {
     }
   } else if ((halfChanged || request.reposition && area) && target && (win.state === void 0 || win.state === "normal")) {
     const current = rectFromWindow(win);
-    if (halfChanged || state.half && current?.width !== target.width || !current || !rectCenterInside(current, area ?? state.fullBounds)) {
+    if (halfChanged || state.half && current?.width !== target.width || state.placement.relocatedFrom && (current?.width !== target.width || current?.height !== target.height) || !current || !rectCenterInside(current, area ?? state.fullBounds)) {
       const updateWindow = chrome.windows.update;
       if (typeof updateWindow === "function") {
         try {

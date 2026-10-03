@@ -2417,7 +2417,7 @@ async function ensureDedicatedWindowUnlocked(
     // Minimized / maximized / fullscreen windows are reported, not moved: resizing one
     // would leave fullscreen (a Space switch on macOS) or un-minimize it.
     const current = rectFromWindow(win);
-    if (halfChanged || (state.half && current?.width !== target.width) || !current || !rectCenterInside(current, area ?? state.fullBounds)) {
+    if (halfChanged || (state.half && current?.width !== target.width) || (state.placement.relocatedFrom && (current?.width !== target.width || current?.height !== target.height)) || !current || !rectCenterInside(current, area ?? state.fullBounds)) {
       // No `focused` here: moving the window must never raise it.
       const updateWindow = (chrome.windows as unknown as { update?: (id: number, info: Partial<Rect>) => Promise<unknown> }).update;
       if (typeof updateWindow === 'function') {
