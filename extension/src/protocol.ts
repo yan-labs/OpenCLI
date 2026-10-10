@@ -18,6 +18,7 @@ export type Action =
   | 'bind'
   | 'network-capture-start'
   | 'network-capture-read'
+  | 'console-read'
   | 'wait-download'
   | 'cdp'
   | 'frames'

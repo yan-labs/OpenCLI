@@ -1380,6 +1380,11 @@ still usable even when navigation is reported as timed out.
         });
 
       if (opts.follow) {
+        const capturePage = page as typeof page & {
+          consoleCapture?: () => Promise<{ captureSupported: boolean; startedAt: number | null; messages: unknown[] }>;
+        };
+        const capture = capturePage.consoleCapture ? await capturePage.consoleCapture() : undefined;
+        console.log(JSON.stringify({ captureSupported: capture?.captureSupported ?? false, startedAt: capture?.startedAt ?? null }));
         let lastSeenTs = 0;
         while (true) {
           const messages = filter(normalize(await page.consoleMessages('all')));
@@ -1395,10 +1400,16 @@ still usable even when navigation is reported as timed out.
         }
       }
 
-      const messages = filter(normalize(await page.consoleMessages(opts.level)));
+      const capturePage = page as typeof page & {
+        consoleCapture?: () => Promise<{ captureSupported: boolean; startedAt: number | null; messages: unknown[] }>;
+      };
+      const capture = capturePage.consoleCapture ? await capturePage.consoleCapture() : undefined;
+      const messages = filter(normalize(capture?.messages ?? await page.consoleMessages(opts.level)));
       console.log(JSON.stringify({
         session: getPageSession(page),
         captured_at: new Date().toISOString(),
+        captureSupported: capture?.captureSupported ?? false,
+        startedAt: capture?.startedAt ?? null,
         count: messages.length,
         messages: messages.map((message) => ({
           ...message,

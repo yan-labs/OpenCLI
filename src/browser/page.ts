@@ -101,6 +101,22 @@ export class Page extends CDPBasePage {
     };
   }
 
+  async consoleCapture(): Promise<{ captureSupported: boolean; startedAt: number | null; messages: unknown[] }> {
+    try {
+      return await sendCommand('console-read', this._cmdOpts()) as { captureSupported: boolean; startedAt: number | null; messages: unknown[] };
+    } catch (err) {
+      const message = err instanceof Error ? err.message.toLowerCase() : String(err).toLowerCase();
+      if (!message.includes('unknown action') || !message.includes('console-read')) throw err;
+      return { captureSupported: false, startedAt: null, messages: [] };
+    }
+  }
+
+  override async consoleMessages(level = 'all'): Promise<unknown[]> {
+    const { messages } = await this.consoleCapture();
+    return level === 'all' ? messages : messages.filter(message =>
+      (message as { type?: string }).type === level);
+  }
+
   async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: number; timeoutMs?: number }): Promise<void> {
     // Omitted (undefined) so an older extension build — which does not read this
     // field yet — falls back to its own hardcoded 15s default rather than seeing

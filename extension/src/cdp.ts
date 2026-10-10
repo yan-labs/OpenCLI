@@ -7,6 +7,34 @@
  */
 
 const attached = new Set<number>();
+type ConsoleMessage = { type: string; text: string; timestamp: number };
+type ConsoleCapture = { captureSupported: boolean; startedAt: number | null; messages: ConsoleMessage[] };
+const consoleCaptures = new Map<number, ConsoleCapture>();
+
+export function readConsoleCapture(tabId: number): ConsoleCapture {
+  const capture = consoleCaptures.get(tabId);
+  return capture ? { ...capture, messages: [...capture.messages] }
+    : { captureSupported: false, startedAt: null, messages: [] };
+}
+
+function recordConsoleEvent(tabId: number, method: string, params: any): void {
+  const capture = consoleCaptures.get(tabId);
+  if (!capture) return;
+  let type: string;
+  let text: string;
+  if (method === 'Runtime.consoleAPICalled') {
+    type = params?.type === 'warn' ? 'warning' : String(params?.type ?? 'log');
+    text = (params?.args ?? []).map((arg: any) => arg.value !== undefined
+      ? (typeof arg.value === 'string' ? arg.value : JSON.stringify(arg.value))
+      : String(arg.description ?? arg.unserializableValue ?? arg.type ?? '')).join(' ');
+  } else if (method === 'Runtime.exceptionThrown') {
+    type = 'error';
+    text = String(params?.exceptionDetails?.exception?.description ?? params?.exceptionDetails?.text ?? 'Uncaught exception');
+  } else return;
+  capture.messages.push({ type, text: text.slice(0, 8192), timestamp: Number(params?.timestamp) || Date.now() });
+  if (capture.messages.length > 500) capture.messages.shift();
+}
+
 
 /**
  * `sessionId` is the flatten-mode CDP session (per chrome.debugger's `source`
@@ -230,7 +258,7 @@ export async function sendDebuggerCommand<T = unknown>(
 /** Check if a URL can be attached via CDP — only allow http(s) and blank pages. */
 function isDebuggableUrl(url?: string): boolean {
   if (!url) return true;  // empty/undefined = tab still loading, allow it
-  return url.startsWith('http://') || url.startsWith('https://') || url === 'about:blank' || url.startsWith('data:');
+  return url.startsWith('http://') || url.startsWith('https://') || (url === 'about:blank' || url.startsWith('about:blank#')) || url.startsWith('data:');
 }
 
 export async function ensureAttached(tabId: number, aggressiveRetry: boolean = false): Promise<void> {
@@ -337,10 +365,14 @@ export async function ensureAttached(tabId: number, aggressiveRetry: boolean = f
   }
   attached.add(tabId);
 
+  // Start a new capture interval after each attachment; a detach creates a gap.
+  const capture: ConsoleCapture = { captureSupported: false, startedAt: Date.now(), messages: [] };
+  consoleCaptures.set(tabId, capture);
   try {
     await sendDebuggerCommand({ tabId }, 'Runtime.enable');
+    capture.captureSupported = true;
   } catch {
-    // Some pages may not need explicit enable
+    capture.startedAt = null;
   }
 
   // Restore network capture that the re-attach (detach + onDetach) tore down.
@@ -982,6 +1014,7 @@ export function registerFrameTracking(): void {
     // side — see the type above). Undefined means this event came from the
     // tab-level session itself.
     const eventSessionId = (source as DebuggerSessionTarget).sessionId;
+    recordConsoleEvent(tabId, method, params);
 
     if (method === 'Runtime.executionContextCreated') {
       const context = params.context;
@@ -1076,6 +1109,7 @@ export function registerFrameTracking(): void {
   });
 
   chrome.tabs.onRemoved.addListener((tabId) => {
+    consoleCaptures.delete(tabId);
     tabFrameContexts.delete(tabId);
     tabAllContexts.delete(tabId);
     tabIframeTargets.delete(tabId);
@@ -1440,6 +1474,7 @@ function clearFrameTargetsForTab(tabId: number): void {
 }
 
 export async function detach(tabId: number): Promise<void> {
+  consoleCaptures.delete(tabId);
   clearFrameTargetsForTab(tabId);
   if (!attached.has(tabId)) return;
   attached.delete(tabId);
@@ -1453,6 +1488,7 @@ export async function detach(tabId: number): Promise<void> {
 
 export function registerListeners(): void {
   chrome.tabs.onRemoved.addListener((tabId) => {
+    consoleCaptures.delete(tabId);
     attached.delete(tabId);
     networkCaptures.delete(tabId);
     tabFrameContexts.delete(tabId);
@@ -1463,6 +1499,8 @@ export function registerListeners(): void {
   });
   chrome.debugger.onDetach.addListener((source) => {
     if (source.tabId) {
+      const capture = consoleCaptures.get(source.tabId);
+      if (capture) capture.captureSupported = false;
       attached.delete(source.tabId);
       networkCaptures.delete(source.tabId);
       tabFrameContexts.delete(source.tabId);

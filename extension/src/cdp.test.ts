@@ -51,6 +51,48 @@ describe('cdp attach recovery', () => {
     vi.unstubAllGlobals();
   });
 
+  it('captures real console and exceptions with a bounded per-tab cache', async () => {
+    const { chrome, debuggerApi, debuggerEventListeners, tabRemovedListeners } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./cdp');
+    mod.registerFrameTracking();
+    mod.registerListeners();
+    expect(mod.readConsoleCapture(1)).toEqual({ captureSupported: false, startedAt: null, messages: [] });
+    await mod.ensureAttached(1);
+    const emit = (method: string, params: unknown) => debuggerEventListeners.forEach(fn => fn({ tabId: 1 }, method, params));
+    emit('Runtime.consoleAPICalled', { type: 'error', args: [{ value: 'deliberate error' }], timestamp: 123 });
+    emit('Runtime.exceptionThrown', { exceptionDetails: { exception: { description: 'Error: deliberate exception' } } });
+    expect(mod.readConsoleCapture(1)).toMatchObject({ captureSupported: true, startedAt: expect.any(Number), messages: [
+      { type: 'error', text: 'deliberate error', timestamp: 123 },
+      { type: 'error', text: 'Error: deliberate exception' },
+    ] });
+    expect(mod.readConsoleCapture(2).captureSupported).toBe(false);
+    for (let n = 0; n < 501; n++) emit('Runtime.consoleAPICalled', { type: 'log', args: [{ value: String(n) }] });
+    const capture = mod.readConsoleCapture(1);
+    expect(capture.messages).toHaveLength(500);
+    expect(capture.messages[0].text).toBe('1');
+    capture.messages.pop();
+    expect(mod.readConsoleCapture(1).messages).toHaveLength(500);
+    const detachListener = debuggerApi.onDetach.addListener.mock.calls[0][0] as (source: { tabId: number }) => void;
+    detachListener({ tabId: 1 });
+    expect(mod.readConsoleCapture(1).captureSupported).toBe(false);
+    await mod.ensureAttached(1);
+    expect(mod.readConsoleCapture(1)).toMatchObject({ captureSupported: true, messages: [] });
+    tabRemovedListeners.forEach(fn => fn(1));
+    expect(mod.readConsoleCapture(1).startedAt).toBeNull();
+  });
+
+  it('does not claim capture support when Runtime.enable fails', async () => {
+    const { chrome, debuggerApi } = createChromeMock();
+    debuggerApi.sendCommand.mockRejectedValueOnce(new Error('unsupported Runtime'));
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./cdp');
+    await mod.ensureAttached(1);
+    expect(mod.readConsoleCapture(1)).toEqual({ captureSupported: false, startedAt: null, messages: [] });
+    await mod.detach(1);
+    expect(mod.readConsoleCapture(1).startedAt).toBeNull();
+  });
+
   it('does not mutate the DOM before a successful attach', async () => {
     const { chrome, debuggerApi, scripting } = createChromeMock();
     vi.stubGlobal('chrome', chrome);
@@ -518,7 +560,7 @@ describe('cdp network capture correctness', () => {
   });
 
   function createNetworkMock() {
-    const onEventListeners = [];
+    const onEventListeners: Array<(source: { tabId?: number }, method: string, params: any) => void> = [];
     const debuggerApi = {
       attach: vi.fn(async () => {}),
       detach: vi.fn(async () => {}),
@@ -535,7 +577,7 @@ describe('cdp network capture correctness', () => {
       onRemoved: { addListener: vi.fn() },
       onUpdated: { addListener: vi.fn() },
     };
-    const fire = async (method, params) => {
+    const fire = async (method: string, params: any) => {
       for (const fn of onEventListeners) await fn({ tabId: 1 }, method, params);
     };
     return {
@@ -605,7 +647,7 @@ describe('cdp evaluateInFrame stale context fallback', () => {
   });
 
   it('falls back to the frame target when the cached context id went stale', async () => {
-    const debuggerEventListeners = [];
+    const debuggerEventListeners: Array<(source: { tabId?: number }, method: string, params: any) => void> = [];
     const debuggerApi = {
       attach: vi.fn(async () => {}),
       detach: vi.fn(async () => {}),

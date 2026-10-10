@@ -3411,6 +3411,10 @@ async function handleCommand(cmd: Command): Promise<Result> {
         return await handleBind(cmd, leaseKey, guard);
       case 'network-capture-start':
         return await handleNetworkCaptureStart(cmd, leaseKey, guard);
+      case 'console-read': {
+        const tabId = await resolveTabId(await resolveCommandTabId(cmd), leaseKey, undefined, guard);
+        return pageScopedResult(cmd.id, tabId, executor.readConsoleCapture(tabId));
+      }
       case 'network-capture-read':
         return await handleNetworkCaptureRead(cmd, leaseKey, guard);
       case 'wait-download':
@@ -3446,7 +3450,7 @@ const DEFAULT_NAVIGATE_TIMEOUT_MS = 15000;
 /** Check if a URL can be attached via CDP — only allow http(s) and blank pages. */
 function isDebuggableUrl(url?: string): boolean {
   if (!url) return true;  // empty/undefined = tab still loading, allow it
-  return url.startsWith('http://') || url.startsWith('https://') || url === 'about:blank' || url.startsWith('data:');
+  return url.startsWith('http://') || url.startsWith('https://') || (url === 'about:blank' || url.startsWith('about:blank#')) || url.startsWith('data:');
 }
 
 /** Check if a URL is safe for user-facing navigation (http/https only). */
@@ -3936,35 +3940,24 @@ function preferOwnedTab(leaseKey: string, tabId: number, guard?: CommandGuard): 
 
 async function handleNavigate(cmd: Command, leaseKey: string, guard?: CommandGuard): Promise<Result> {
   if (!cmd.url) return { id: cmd.id, ok: false, error: 'Missing url' };
-  if (!isSafeNavigationUrl(cmd.url)) {
+  if (cmd.url !== BLANK_PAGE && !isSafeNavigationUrl(cmd.url)) {
     return { id: cmd.id, ok: false, error: 'Blocked URL scheme -- only http:// and https:// are allowed' };
   }
-  // Pass target URL so that first-time window creation can start on the right domain
+  // Create a blank tab so Runtime capture is armed before the first page load.
   const cmdTabId = await resolveCommandTabId(cmd);
-  const resolved = await resolveTab(cmdTabId, leaseKey, cmd.url, guard);
+  const resolved = await resolveTab(cmdTabId, leaseKey, BLANK_PAGE, guard);
   guard?.();
   const tabId = resolved.tabId;
 
   const beforeTab = resolved.tab ?? await chrome.tabs.get(tabId);
   const beforeNormalized = normalizeUrlForComparison(beforeTab.url);
   const targetUrl = cmd.url;
+  await executor.ensureAttached(tabId);
 
   // The new window may already be loading this URL; do not navigate it twice.
   const alreadyAtTarget = isTargetUrl(beforeTab.url, targetUrl);
   if (alreadyAtTarget && beforeTab.status === 'complete') {
     return pageScopedResult(cmd.id, tabId, { title: beforeTab.title, url: beforeTab.url, timedOut: false });
-  }
-
-  // Detach any existing debugger before top-level navigation unless network
-  // capture is already armed on this tab. Otherwise we would clear the capture
-  // state right before the page load we are trying to observe.
-  // Some sites (observed on creator.xiaohongshu.com flows) can invalidate the
-  // current inspected target during navigation, which leaves a stale CDP attach
-  // state and causes the next Runtime.evaluate to fail with
-  // "Inspected target navigated or closed". Resetting here forces a clean
-  // re-attach after navigation when capture is not active.
-  if (!executor.hasActiveNetworkCapture(tabId)) {
-    await executor.detach(tabId);
   }
 
   let rejectedNavigation: unknown;
