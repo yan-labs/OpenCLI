@@ -1341,6 +1341,25 @@ still usable even when navigation is reported as timed out.
       }
     }));
 
+  const viewport = browser.command('viewport').description('Keep an exact CSS viewport across session commands (DPR 1)');
+  const parseViewportDim = (value: string, name: string): number => {
+    if (!/^\d+$/.test(value) || !Number.isSafeInteger(Number(value)) || Number(value) <= 0) {
+      throw new InvalidArgumentError(`${name} must be a positive safe integer`);
+    }
+    return Number(value);
+  };
+  viewport.command('set')
+    .argument('<width>', 'CSS width', (value: string) => parseViewportDim(value, 'width'))
+    .argument('<height>', 'CSS height', (value: string) => parseViewportDim(value, 'height'))
+    .description('Set a persistent viewport before or after open')
+    .action(browserAction(async (page, width, height) => {
+      console.log(JSON.stringify(await sendCommand('viewport', { session: getPageSession(page), surface: 'browser', op: 'set', width, height }), null, 2));
+    }));
+  viewport.command('reset').description('Restore the session tabs to their browser viewport')
+    .action(browserAction(async (page) => {
+      console.log(JSON.stringify(await sendCommand('viewport', { session: getPageSession(page), surface: 'browser', op: 'reset' }), null, 2));
+    }));
+
   addBrowserTabOption(browser.command('console'))
     .option('--level <level>', 'Console level: all, error, warning, log, info, debug', 'all')
     .option('--since <duration>', 'Only include messages from the last duration (for example: 30s, 2m)')
@@ -1380,6 +1399,11 @@ still usable even when navigation is reported as timed out.
         });
 
       if (opts.follow) {
+        const capturePage = page as typeof page & {
+          consoleCapture?: () => Promise<{ captureSupported: boolean; startedAt: number | null; messages: unknown[] }>;
+        };
+        const capture = capturePage.consoleCapture ? await capturePage.consoleCapture() : undefined;
+        console.log(JSON.stringify({ captureSupported: capture?.captureSupported ?? false, startedAt: capture?.startedAt ?? null }));
         let lastSeenTs = 0;
         while (true) {
           const messages = filter(normalize(await page.consoleMessages('all')));
@@ -1395,10 +1419,16 @@ still usable even when navigation is reported as timed out.
         }
       }
 
-      const messages = filter(normalize(await page.consoleMessages(opts.level)));
+      const capturePage = page as typeof page & {
+        consoleCapture?: () => Promise<{ captureSupported: boolean; startedAt: number | null; messages: unknown[] }>;
+      };
+      const capture = capturePage.consoleCapture ? await capturePage.consoleCapture() : undefined;
+      const messages = filter(normalize(capture?.messages ?? await page.consoleMessages(opts.level)));
       console.log(JSON.stringify({
         session: getPageSession(page),
         captured_at: new Date().toISOString(),
+        captureSupported: capture?.captureSupported ?? false,
+        startedAt: capture?.startedAt ?? null,
         count: messages.length,
         messages: messages.map((message) => ({
           ...message,
@@ -3349,13 +3379,19 @@ cli({
             case 'screenshot': {
               const shotOpts: ScreenshotOptions = {
                 fullPage: a.fullPage === true,
+                annotate: a.annotate === true,
+                ...(a.width !== undefined && { width: parseScreenshotDim(String(a.width), 'width') }),
+                ...(a.height !== undefined && { height: parseScreenshotDim(String(a.height), 'height') }),
                 ...(typeof a.path === 'string' && { path: a.path }),
               };
+              const capture = a.annotate === true
+                ? (page.annotatedScreenshot ?? page.screenshot).bind(page)
+                : page.screenshot.bind(page);
               if (typeof a.path === 'string') {
-                await page.screenshot({ ...shotOpts, path: a.path as string });
+                await capture({ ...shotOpts, path: a.path as string });
                 result = { saved: a.path };
               } else {
-                const base64 = await page.screenshot({ ...shotOpts, format: 'png' });
+                const base64 = await capture({ ...shotOpts, format: 'png' });
                 result = { base64 };
               }
               break;
@@ -3414,13 +3450,19 @@ cli({
             default:
               throw new Error(`Unknown batch command: "${cmd}". Supported: open, state, click, type, fill, eval, wait, extract, screenshot, scroll, find, keys, hover, select, back`);
           }
-          results.push({ cmd, index: i, ok: true, result });
+          const failed = result !== null && typeof result === 'object'
+            && (('ok' in result && result.ok === false)
+              || (cmd === 'fill' && 'verified' in result && result.verified === false));
+          results.push({ cmd, index: i, ok: !failed, result,
+            ...(failed && { error: cmd === 'fill' ? 'Fill verification failed' : 'Command returned ok:false' }) });
+          if (failed && stopOnError) break;
         } catch (err) {
           const errorMsg = err instanceof Error ? err.message : String(err);
           results.push({ cmd, index: i, ok: false, error: errorMsg });
           if (stopOnError) break;
         }
       }
+      if (results.some((step) => !step.ok)) process.exitCode = EXIT_CODES.GENERIC_ERROR;
       console.log(JSON.stringify(results, null, 2));
     }));
 

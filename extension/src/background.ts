@@ -13,6 +13,7 @@ import * as executor from './cdp';
 import * as identity from './identity';
 import { executeWithJournal } from './journal';
 
+const sessionViewports = new Map<string, { width: number; height: number; tabs: Set<number> }>();
 let ws: WebSocket | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let reconnectAttempts = 0;
@@ -3397,6 +3398,8 @@ async function handleCommand(cmd: Command): Promise<Result> {
         return await handleTabs(cmd, leaseKey, guard);
       case 'cookies':
         return await handleCookies(cmd);
+      case 'viewport':
+        return await handleViewport(cmd, leaseKey, guard);
       case 'screenshot':
         return await handleScreenshot(cmd, leaseKey, guard);
       case 'close-window':
@@ -3411,6 +3414,10 @@ async function handleCommand(cmd: Command): Promise<Result> {
         return await handleBind(cmd, leaseKey, guard);
       case 'network-capture-start':
         return await handleNetworkCaptureStart(cmd, leaseKey, guard);
+      case 'console-read': {
+        const tabId = await resolveTabId(await resolveCommandTabId(cmd), leaseKey, undefined, guard);
+        return pageScopedResult(cmd.id, tabId, executor.readConsoleCapture(tabId));
+      }
       case 'network-capture-read':
         return await handleNetworkCaptureRead(cmd, leaseKey, guard);
       case 'wait-download':
@@ -3446,7 +3453,7 @@ const DEFAULT_NAVIGATE_TIMEOUT_MS = 15000;
 /** Check if a URL can be attached via CDP — only allow http(s) and blank pages. */
 function isDebuggableUrl(url?: string): boolean {
   if (!url) return true;  // empty/undefined = tab still loading, allow it
-  return url.startsWith('http://') || url.startsWith('https://') || url === 'about:blank' || url.startsWith('data:');
+  return url.startsWith('http://') || url.startsWith('https://') || (url === 'about:blank' || url.startsWith('about:blank#')) || url.startsWith('data:');
 }
 
 /** Check if a URL is safe for user-facing navigation (http/https only). */
@@ -3584,6 +3591,12 @@ type ResolvedTab = { tabId: number; tab: chrome.tabs.Tab | null };
 async function resolveTab(tabId: number | undefined, leaseKey: string, initialUrl?: string, guard?: CommandGuard): Promise<ResolvedTab> {
   const resolved = await resolveTabForLease(tabId, leaseKey, initialUrl, guard);
   guard?.();
+  const viewport = sessionViewports.get(leaseKey);
+  if (viewport) {
+    await executor.setViewport(resolved.tabId, { width: viewport.width, height: viewport.height });
+    viewport.tabs.add(resolved.tabId);
+    guard?.();
+  }
   if (getWindowMode(leaseKey) !== 'dedicated') return resolved;
   return applyDedicatedSessionPolicy(leaseKey, resolved, guard);
 }
@@ -3936,35 +3949,24 @@ function preferOwnedTab(leaseKey: string, tabId: number, guard?: CommandGuard): 
 
 async function handleNavigate(cmd: Command, leaseKey: string, guard?: CommandGuard): Promise<Result> {
   if (!cmd.url) return { id: cmd.id, ok: false, error: 'Missing url' };
-  if (!isSafeNavigationUrl(cmd.url)) {
+  if (cmd.url !== BLANK_PAGE && !isSafeNavigationUrl(cmd.url)) {
     return { id: cmd.id, ok: false, error: 'Blocked URL scheme -- only http:// and https:// are allowed' };
   }
-  // Pass target URL so that first-time window creation can start on the right domain
+  // Create a blank tab so Runtime capture is armed before the first page load.
   const cmdTabId = await resolveCommandTabId(cmd);
-  const resolved = await resolveTab(cmdTabId, leaseKey, cmd.url, guard);
+  const resolved = await resolveTab(cmdTabId, leaseKey, BLANK_PAGE, guard);
   guard?.();
   const tabId = resolved.tabId;
 
   const beforeTab = resolved.tab ?? await chrome.tabs.get(tabId);
   const beforeNormalized = normalizeUrlForComparison(beforeTab.url);
   const targetUrl = cmd.url;
+  await executor.ensureAttached(tabId);
 
   // The new window may already be loading this URL; do not navigate it twice.
   const alreadyAtTarget = isTargetUrl(beforeTab.url, targetUrl);
   if (alreadyAtTarget && beforeTab.status === 'complete') {
     return pageScopedResult(cmd.id, tabId, { title: beforeTab.title, url: beforeTab.url, timedOut: false });
-  }
-
-  // Detach any existing debugger before top-level navigation unless network
-  // capture is already armed on this tab. Otherwise we would clear the capture
-  // state right before the page load we are trying to observe.
-  // Some sites (observed on creator.xiaohongshu.com flows) can invalidate the
-  // current inspected target during navigation, which leaves a stale CDP attach
-  // state and causes the next Runtime.evaluate to fail with
-  // "Inspected target navigated or closed". Resetting here forces a clean
-  // re-attach after navigation when capture is not active.
-  if (!executor.hasActiveNetworkCapture(tabId)) {
-    await executor.detach(tabId);
   }
 
   let rejectedNavigation: unknown;
@@ -4384,6 +4386,37 @@ async function handleSessions(cmd: Command): Promise<Result> {
   return { id: cmd.id, ok: true, data: entries };
 }
 
+async function handleViewport(cmd: Command, leaseKey: string, guard?: CommandGuard): Promise<Result> {
+  if (cmd.op !== 'set' && cmd.op !== 'reset') return { id: cmd.id, ok: false, error: 'Viewport op must be set or reset' };
+  if (cmd.op === 'set') {
+    if (!Number.isSafeInteger(cmd.width) || cmd.width! <= 0 || !Number.isSafeInteger(cmd.height) || cmd.height! <= 0) {
+      return { id: cmd.id, ok: false, error: 'Viewport width and height must be positive safe integers' };
+    }
+    const previous = sessionViewports.get(leaseKey);
+    const viewport = { width: cmd.width!, height: cmd.height!, tabs: previous?.tabs ?? new Set<number>() };
+    const tabId = automationSessions.get(leaseKey)?.preferredTabId;
+    if (tabId != null) {
+      await executor.setViewport(tabId, { width: viewport.width, height: viewport.height });
+      guard?.();
+      viewport.tabs.add(tabId);
+    }
+    sessionViewports.set(leaseKey, viewport);
+    return { id: cmd.id, ok: true, data: { supported: true, viewport: { width: viewport.width, height: viewport.height, deviceScaleFactor: 1 } } };
+  }
+  await resetSessionViewport(leaseKey);
+  return { id: cmd.id, ok: true, data: { supported: true, viewport: null } };
+}
+
+async function resetSessionViewport(leaseKey: string): Promise<void> {
+  const viewport = sessionViewports.get(leaseKey);
+  if (!viewport) return;
+  for (const tabId of viewport.tabs) {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (tab) await executor.setViewport(tabId, null);
+  }
+  sessionViewports.delete(leaseKey);
+}
+
 async function handleCloseWindow(cmd: Command, leaseKey: string): Promise<Result> {
   const sessionName = automationSessions.get(leaseKey)?.session ?? getSessionFromKey(leaseKey);
   await releaseLease(leaseKey, 'explicit close');
@@ -4509,6 +4542,7 @@ async function handleClipboard(cmd: Command): Promise<Result> {
 }
 
 async function releaseLease(leaseKey: string, reason: string = 'released'): Promise<void> {
+  await resetSessionViewport(leaseKey);
   activeCommands.delete(leaseKey);
   const session = automationSessions.get(leaseKey);
   if (!session) {

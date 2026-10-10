@@ -27,6 +27,17 @@ describe('Page.getCurrentUrl', () => {
     warnMock.mockReset();
   });
 
+  it('reads console metadata and falls back only for an older extension', async () => {
+    const page = new Page('console-test');
+    sendCommandMock.mockResolvedValueOnce({ captureSupported: true, startedAt: 123, messages: [{ type: 'error', text: 'boom' }] });
+    expect(await page.consoleMessages('error')).toEqual([{ type: 'error', text: 'boom' }]);
+    expect(sendCommandMock).toHaveBeenCalledWith('console-read', expect.objectContaining({ session: 'console-test' }));
+    sendCommandMock.mockRejectedValueOnce(new Error('Unknown action: console-read'));
+    expect(await page.consoleCapture()).toEqual({ captureSupported: false, startedAt: null, messages: [] });
+    sendCommandMock.mockRejectedValueOnce(new Error('connection lost'));
+    await expect(page.consoleCapture()).rejects.toThrow('connection lost');
+  });
+
   it('reads the real browser URL when no local navigation cache exists', async () => {
     sendCommandMock.mockResolvedValueOnce('https://notebooklm.google.com/notebook/nb-live');
 

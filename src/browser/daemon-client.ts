@@ -225,7 +225,7 @@ function isPreConnectFetchError(err: unknown): boolean {
 
 export interface DaemonCommand {
   id: string;
-  action: 'exec' | 'navigate' | 'tabs' | 'cookies' | 'screenshot' | 'close-window' | 'sessions' | 'set-file-input' | 'insert-text' | 'bind' | 'network-capture-start' | 'network-capture-read' | 'wait-download' | 'cdp' | 'frames' | 'contexts' | 'clipboard' | 'lease-release';
+  action: 'exec' | 'navigate' | 'tabs' | 'cookies' | 'screenshot' | 'viewport' | 'close-window' | 'sessions' | 'set-file-input' | 'insert-text' | 'bind' | 'network-capture-start' | 'network-capture-read' | 'console-read' | 'wait-download' | 'cdp' | 'frames' | 'contexts' | 'clipboard' | 'lease-release';
   /** Target page identity (targetId). Cross-layer contract with the extension. */
   page?: string;
   code?: string;
