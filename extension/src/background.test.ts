@@ -276,6 +276,30 @@ describe('background tab isolation', () => {
     vi.unstubAllGlobals();
   });
 
+  it('stores viewport before open, applies it across tab operations, and clears it on reset and close', async () => {
+    const { chrome } = createChromeMock();
+    chrome.debugger.sendCommand = vi.fn(async () => ({}));
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    mod.__test__.setDefaultWindowMode('background');
+    const command = { id: 'viewport', action: 'viewport' as const, session: 'viewport', surface: 'browser' as const };
+    const set = await mod.__test__.handleCommand({ ...command, op: 'set', width: 390, height: 844 });
+    expect(set).toMatchObject({ ok: true, data: { supported: true, viewport: { width: 390, height: 844, deviceScaleFactor: 1 } } });
+    expect(chrome.tabs.create).not.toHaveBeenCalled();
+    const tabId = await mod.__test__.resolveTabId(undefined, browserKey('viewport'), 'https://automation.example');
+    expect(chrome.debugger.sendCommand).toHaveBeenCalledWith({ tabId }, 'Emulation.setDeviceMetricsOverride', { width: 390, height: 844, mobile: false, deviceScaleFactor: 1 });
+    await mod.__test__.resolveTabId(undefined, browserKey('viewport'));
+    const reset = await mod.__test__.handleCommand({ ...command, op: 'reset' });
+    expect(reset).toMatchObject({ ok: true, data: { supported: true, viewport: null } });
+    expect(chrome.debugger.sendCommand).toHaveBeenCalledWith({ tabId }, 'Emulation.clearDeviceMetricsOverride');
+    await mod.__test__.handleCommand({ ...command, op: 'set', width: 1440, height: 900 });
+    await mod.__test__.handleCommand({ ...command, action: 'close-window' });
+    chrome.debugger.sendCommand.mockClear();
+    await mod.__test__.resolveTabId(undefined, browserKey('viewport'), 'https://automation.example');
+    expect(chrome.debugger.sendCommand.mock.calls.some((call: any[]) => call[1] === 'Emulation.setDeviceMetricsOverride')).toBe(false);
+    await mod.__test__.handleCommand({ ...command, action: 'close-window' });
+  });
+
   it('lists only automation-window web tabs', async () => {
     const { chrome } = createChromeMock();
     vi.stubGlobal('chrome', chrome);

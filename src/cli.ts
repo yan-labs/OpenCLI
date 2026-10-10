@@ -1341,6 +1341,25 @@ still usable even when navigation is reported as timed out.
       }
     }));
 
+  const viewport = browser.command('viewport').description('Keep an exact CSS viewport across session commands (DPR 1)');
+  const parseViewportDim = (value: string, name: string): number => {
+    if (!/^\d+$/.test(value) || !Number.isSafeInteger(Number(value)) || Number(value) <= 0) {
+      throw new InvalidArgumentError(`${name} must be a positive safe integer`);
+    }
+    return Number(value);
+  };
+  viewport.command('set')
+    .argument('<width>', 'CSS width', (value: string) => parseViewportDim(value, 'width'))
+    .argument('<height>', 'CSS height', (value: string) => parseViewportDim(value, 'height'))
+    .description('Set a persistent viewport before or after open')
+    .action(browserAction(async (page, width, height) => {
+      console.log(JSON.stringify(await sendCommand('viewport', { session: getPageSession(page), surface: 'browser', op: 'set', width, height }), null, 2));
+    }));
+  viewport.command('reset').description('Restore the session tabs to their browser viewport')
+    .action(browserAction(async (page) => {
+      console.log(JSON.stringify(await sendCommand('viewport', { session: getPageSession(page), surface: 'browser', op: 'reset' }), null, 2));
+    }));
+
   addBrowserTabOption(browser.command('console'))
     .option('--level <level>', 'Console level: all, error, warning, log, info, debug', 'all')
     .option('--since <duration>', 'Only include messages from the last duration (for example: 30s, 2m)')

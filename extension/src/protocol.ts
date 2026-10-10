@@ -11,6 +11,7 @@ export type Action =
   | 'tabs'
   | 'cookies'
   | 'screenshot'
+  | 'viewport'
   | 'close-window'
   | 'sessions'
   | 'set-file-input'
@@ -46,7 +47,7 @@ export interface Command {
    * Sub-operation. tabs: list, new, close, select. sessions: list (default),
    * cleanup, window-status, window-ensure (dedicated automation windows).
    */
-  op?: 'list' | 'new' | 'close' | 'select' | 'cleanup' | 'window-status' | 'window-ensure' | 'window-list' | 'window-close' | 'window-relayout' | 'runtime-reload';
+  op?: 'list' | 'new' | 'close' | 'select' | 'cleanup' | 'window-status' | 'window-ensure' | 'window-list' | 'window-close' | 'window-relayout' | 'runtime-reload' | 'set' | 'reset';
   /** Tab index for tabs select/close */
   index?: number;
   /** Cookie domain filter */

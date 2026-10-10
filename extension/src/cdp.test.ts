@@ -1023,3 +1023,41 @@ describe('cdp response body capture', () => {
     expect(next.responsePreview === big).toBe(true);
   });
 });
+
+
+describe('persistent viewport', () => {
+  beforeEach(() => vi.resetModules());
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('keeps the viewport through ordinary and temporary screenshots and reattach, then resets', async () => {
+    const { chrome, calls } = chromeMockForScreenshot();
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./cdp');
+    await mod.setViewport(1, { width: 390, height: 844 });
+    await mod.screenshot(1);
+    expect(calls.filter(c => c.method === 'Emulation.clearDeviceMetricsOverride')).toHaveLength(0);
+    await mod.screenshot(1, { width: 1440, height: 900 });
+    expect(calls.filter(c => c.method === 'Emulation.setDeviceMetricsOverride').at(-1)?.params)
+      .toEqual({ width: 390, height: 844, mobile: false, deviceScaleFactor: 1 });
+    await mod.screenshot(1, { fullPage: true });
+    expect(calls.filter(c => c.method === 'Emulation.setDeviceMetricsOverride').at(-1)?.params)
+      .toEqual({ width: 390, height: 844, mobile: false, deviceScaleFactor: 1 });
+    await mod.detach(1);
+    await mod.evaluate(1, '1');
+    expect(calls.filter(c => c.method === 'Emulation.setDeviceMetricsOverride').at(-1)?.params).toMatchObject({ width: 390 });
+    await mod.setViewport(1, null);
+    expect(calls.at(-1)?.method).toBe('Emulation.clearDeviceMetricsOverride');
+    await mod.detach(1);
+    calls.length = 0;
+    await mod.evaluate(1, '1');
+    expect(calls.some(c => c.method === 'Emulation.setDeviceMetricsOverride')).toBe(false);
+  });
+
+  it('rejects invalid dimensions before attaching', async () => {
+    const { chrome } = chromeMockForScreenshot();
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./cdp');
+    await expect(mod.setViewport(1, { width: 0, height: 844 })).rejects.toThrow('positive safe integers');
+    expect(chrome.debugger.attach).not.toHaveBeenCalled();
+  });
+});

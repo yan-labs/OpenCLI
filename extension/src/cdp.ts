@@ -7,6 +7,29 @@
  */
 
 const attached = new Set<number>();
+const viewports = new Map<number, { width: number; height: number }>();
+
+async function applyViewport(tabId: number, viewport: { width: number; height: number }): Promise<void> {
+  await sendDebuggerCommand({ tabId }, 'Emulation.setDeviceMetricsOverride', {
+    ...viewport, mobile: false, deviceScaleFactor: 1,
+  });
+}
+
+export async function setViewport(tabId: number, viewport: { width: number; height: number } | null): Promise<void> {
+  if (viewport && (!Number.isSafeInteger(viewport.width) || viewport.width <= 0
+    || !Number.isSafeInteger(viewport.height) || viewport.height <= 0)) {
+    throw new Error('Viewport width and height must be positive safe integers');
+  }
+  await ensureAttached(tabId);
+  if (viewport) {
+    await applyViewport(tabId, viewport);
+    viewports.set(tabId, viewport);
+  } else {
+    await sendDebuggerCommand({ tabId }, 'Emulation.clearDeviceMetricsOverride');
+    viewports.delete(tabId);
+  }
+}
+
 type ConsoleMessage = { type: string; text: string; timestamp: number };
 type ConsoleCapture = { captureSupported: boolean; startedAt: number | null; messages: ConsoleMessage[] };
 const consoleCaptures = new Map<number, ConsoleCapture>();
@@ -375,6 +398,9 @@ export async function ensureAttached(tabId: number, aggressiveRetry: boolean = f
     capture.startedAt = null;
   }
 
+  const viewport = viewports.get(tabId);
+  if (viewport) await applyViewport(tabId, viewport);
+
   // Restore network capture that the re-attach (detach + onDetach) tore down.
   // The detach always disables the CDP Network domain, so re-enable it and put
   // the accumulated capture state back unconditionally. Done last (after the
@@ -447,6 +473,7 @@ export async function screenshot(
 ): Promise<string> {
   await ensureAttached(tabId);
 
+  const persistentViewport = viewports.get(tabId);
   const format = options.format ?? 'png';
   const fullPage = options.fullPage === true;
   const overrideWidth = options.width && options.width > 0 ? Math.ceil(options.width) : undefined;
@@ -454,38 +481,38 @@ export async function screenshot(
   const overrideHeight = !fullPage && options.height && options.height > 0 ? Math.ceil(options.height) : undefined;
   const needsOverride = fullPage || overrideWidth !== undefined || overrideHeight !== undefined;
 
-  if (needsOverride) {
-    // When width is set, apply it first so layout reflows before we read content size.
-    if (overrideWidth !== undefined && fullPage) {
+  try {
+    if (needsOverride) {
+      // When width is set, apply it first so layout reflows before we read content size.
+      if (overrideWidth !== undefined && fullPage) {
+        await sendDebuggerCommand({ tabId }, 'Emulation.setDeviceMetricsOverride', {
+          mobile: false,
+          width: overrideWidth,
+          height: 0,
+          deviceScaleFactor: 1,
+        });
+      }
+      let finalWidth = overrideWidth ?? persistentViewport?.width ?? 0;
+      let finalHeight = overrideHeight ?? persistentViewport?.height ?? 0;
+      if (fullPage) {
+        const metrics = await sendDebuggerCommand({ tabId }, 'Page.getLayoutMetrics') as {
+          contentSize?: { width: number; height: number };
+          cssContentSize?: { width: number; height: number };
+        };
+        const size = metrics.cssContentSize || metrics.contentSize;
+        if (size) {
+          if (finalWidth === 0) finalWidth = Math.ceil(size.width);
+          finalHeight = Math.ceil(size.height);
+        }
+      }
       await sendDebuggerCommand({ tabId }, 'Emulation.setDeviceMetricsOverride', {
         mobile: false,
-        width: overrideWidth,
-        height: 0,
+        width: finalWidth,
+        height: finalHeight,
         deviceScaleFactor: 1,
       });
     }
-    let finalWidth = overrideWidth ?? 0;
-    let finalHeight = overrideHeight ?? 0;
-    if (fullPage) {
-      const metrics = await sendDebuggerCommand({ tabId }, 'Page.getLayoutMetrics') as {
-        contentSize?: { width: number; height: number };
-        cssContentSize?: { width: number; height: number };
-      };
-      const size = metrics.cssContentSize || metrics.contentSize;
-      if (size) {
-        if (finalWidth === 0) finalWidth = Math.ceil(size.width);
-        finalHeight = Math.ceil(size.height);
-      }
-    }
-    await sendDebuggerCommand({ tabId }, 'Emulation.setDeviceMetricsOverride', {
-      mobile: false,
-      width: finalWidth,
-      height: finalHeight,
-      deviceScaleFactor: 1,
-    });
-  }
 
-  try {
     const params: Record<string, unknown> = { format };
     if (format === 'jpeg' && options.quality !== undefined) {
       params.quality = Math.max(0, Math.min(100, options.quality));
@@ -498,7 +525,8 @@ export async function screenshot(
     return result.data;
   } finally {
     if (needsOverride) {
-      await sendDebuggerCommand({ tabId }, 'Emulation.clearDeviceMetricsOverride').catch(() => {});
+      if (persistentViewport) await applyViewport(tabId, persistentViewport);
+      else await sendDebuggerCommand({ tabId }, 'Emulation.clearDeviceMetricsOverride').catch(() => {});
     }
   }
 }
@@ -1488,6 +1516,7 @@ export async function detach(tabId: number): Promise<void> {
 
 export function registerListeners(): void {
   chrome.tabs.onRemoved.addListener((tabId) => {
+    viewports.delete(tabId);
     consoleCaptures.delete(tabId);
     attached.delete(tabId);
     networkCaptures.delete(tabId);

@@ -13,6 +13,7 @@ import * as executor from './cdp';
 import * as identity from './identity';
 import { executeWithJournal } from './journal';
 
+const sessionViewports = new Map<string, { width: number; height: number; tabs: Set<number> }>();
 let ws: WebSocket | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let reconnectAttempts = 0;
@@ -3397,6 +3398,8 @@ async function handleCommand(cmd: Command): Promise<Result> {
         return await handleTabs(cmd, leaseKey, guard);
       case 'cookies':
         return await handleCookies(cmd);
+      case 'viewport':
+        return await handleViewport(cmd, leaseKey, guard);
       case 'screenshot':
         return await handleScreenshot(cmd, leaseKey, guard);
       case 'close-window':
@@ -3588,6 +3591,12 @@ type ResolvedTab = { tabId: number; tab: chrome.tabs.Tab | null };
 async function resolveTab(tabId: number | undefined, leaseKey: string, initialUrl?: string, guard?: CommandGuard): Promise<ResolvedTab> {
   const resolved = await resolveTabForLease(tabId, leaseKey, initialUrl, guard);
   guard?.();
+  const viewport = sessionViewports.get(leaseKey);
+  if (viewport) {
+    await executor.setViewport(resolved.tabId, { width: viewport.width, height: viewport.height });
+    viewport.tabs.add(resolved.tabId);
+    guard?.();
+  }
   if (getWindowMode(leaseKey) !== 'dedicated') return resolved;
   return applyDedicatedSessionPolicy(leaseKey, resolved, guard);
 }
@@ -4377,6 +4386,37 @@ async function handleSessions(cmd: Command): Promise<Result> {
   return { id: cmd.id, ok: true, data: entries };
 }
 
+async function handleViewport(cmd: Command, leaseKey: string, guard?: CommandGuard): Promise<Result> {
+  if (cmd.op !== 'set' && cmd.op !== 'reset') return { id: cmd.id, ok: false, error: 'Viewport op must be set or reset' };
+  if (cmd.op === 'set') {
+    if (!Number.isSafeInteger(cmd.width) || cmd.width! <= 0 || !Number.isSafeInteger(cmd.height) || cmd.height! <= 0) {
+      return { id: cmd.id, ok: false, error: 'Viewport width and height must be positive safe integers' };
+    }
+    const previous = sessionViewports.get(leaseKey);
+    const viewport = { width: cmd.width!, height: cmd.height!, tabs: previous?.tabs ?? new Set<number>() };
+    const tabId = automationSessions.get(leaseKey)?.preferredTabId;
+    if (tabId != null) {
+      await executor.setViewport(tabId, { width: viewport.width, height: viewport.height });
+      guard?.();
+      viewport.tabs.add(tabId);
+    }
+    sessionViewports.set(leaseKey, viewport);
+    return { id: cmd.id, ok: true, data: { supported: true, viewport: { width: viewport.width, height: viewport.height, deviceScaleFactor: 1 } } };
+  }
+  await resetSessionViewport(leaseKey);
+  return { id: cmd.id, ok: true, data: { supported: true, viewport: null } };
+}
+
+async function resetSessionViewport(leaseKey: string): Promise<void> {
+  const viewport = sessionViewports.get(leaseKey);
+  if (!viewport) return;
+  for (const tabId of viewport.tabs) {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (tab) await executor.setViewport(tabId, null);
+  }
+  sessionViewports.delete(leaseKey);
+}
+
 async function handleCloseWindow(cmd: Command, leaseKey: string): Promise<Result> {
   const sessionName = automationSessions.get(leaseKey)?.session ?? getSessionFromKey(leaseKey);
   await releaseLease(leaseKey, 'explicit close');
@@ -4502,6 +4542,7 @@ async function handleClipboard(cmd: Command): Promise<Result> {
 }
 
 async function releaseLease(leaseKey: string, reason: string = 'released'): Promise<void> {
+  await resetSessionViewport(leaseKey);
   activeCommands.delete(leaseKey);
   const session = automationSessions.get(leaseKey);
   if (!session) {

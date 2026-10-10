@@ -4119,3 +4119,27 @@ describe('renderVerifyPreview', () => {
     expect(out).not.toContain('xxxxxxxxxxx'); // never 11 consecutive
   });
 });
+
+
+describe('browser viewport command', () => {
+  beforeEach(() => {
+    process.exitCode = undefined;
+    mockBrowserConnect.mockClear();
+    mockSendCommand.mockReset().mockResolvedValue({ supported: true });
+    browserState.page = { session: 'test', tabs: vi.fn().mockResolvedValue([]) } as unknown as IPage;
+  });
+
+  it('sends set and reset to the session without requiring an open tab', async () => {
+    await createProgram('', '').parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'viewport', 'set', '390', '844']);
+    expect(mockSendCommand).toHaveBeenCalledWith('viewport', { session: 'test', surface: 'browser', op: 'set', width: 390, height: 844 });
+    await createProgram('', '').parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'viewport', 'reset']);
+    expect(mockSendCommand).toHaveBeenLastCalledWith('viewport', { session: 'test', surface: 'browser', op: 'reset' });
+  });
+
+  it.each(['0', '-1', '3.9', '9007199254740992'])('rejects width %s before connecting', async (width) => {
+    const program = createProgram('', '').exitOverride();
+    await expect(program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'viewport', 'set', width, '844'])).rejects.toThrow();
+    expect(mockBrowserConnect).not.toHaveBeenCalled();
+    expect(mockSendCommand).not.toHaveBeenCalled();
+  });
+});
