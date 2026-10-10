@@ -3349,13 +3349,19 @@ cli({
             case 'screenshot': {
               const shotOpts: ScreenshotOptions = {
                 fullPage: a.fullPage === true,
+                annotate: a.annotate === true,
+                ...(a.width !== undefined && { width: parseScreenshotDim(String(a.width), 'width') }),
+                ...(a.height !== undefined && { height: parseScreenshotDim(String(a.height), 'height') }),
                 ...(typeof a.path === 'string' && { path: a.path }),
               };
+              const capture = a.annotate === true
+                ? (page.annotatedScreenshot ?? page.screenshot).bind(page)
+                : page.screenshot.bind(page);
               if (typeof a.path === 'string') {
-                await page.screenshot({ ...shotOpts, path: a.path as string });
+                await capture({ ...shotOpts, path: a.path as string });
                 result = { saved: a.path };
               } else {
-                const base64 = await page.screenshot({ ...shotOpts, format: 'png' });
+                const base64 = await capture({ ...shotOpts, format: 'png' });
                 result = { base64 };
               }
               break;
@@ -3414,13 +3420,19 @@ cli({
             default:
               throw new Error(`Unknown batch command: "${cmd}". Supported: open, state, click, type, fill, eval, wait, extract, screenshot, scroll, find, keys, hover, select, back`);
           }
-          results.push({ cmd, index: i, ok: true, result });
+          const failed = result !== null && typeof result === 'object'
+            && (('ok' in result && result.ok === false)
+              || (cmd === 'fill' && 'verified' in result && result.verified === false));
+          results.push({ cmd, index: i, ok: !failed, result,
+            ...(failed && { error: cmd === 'fill' ? 'Fill verification failed' : 'Command returned ok:false' }) });
+          if (failed && stopOnError) break;
         } catch (err) {
           const errorMsg = err instanceof Error ? err.message : String(err);
           results.push({ cmd, index: i, ok: false, error: errorMsg });
           if (stopOnError) break;
         }
       }
+      if (results.some((step) => !step.ok)) process.exitCode = EXIT_CODES.GENERIC_ERROR;
       console.log(JSON.stringify(results, null, 2));
     }));
 
