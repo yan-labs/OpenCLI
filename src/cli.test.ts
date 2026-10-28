@@ -3190,6 +3190,33 @@ describe('browser cdp command', () => {
     expect(lastJsonLog()).toEqual({ result: true });
   });
 
+  it('awaits batch CDP steps in order and rejects non-object params before dispatch', async () => {
+    const calls: string[] = [];
+    cdp.mockImplementation(async (method: string) => {
+      calls.push(method);
+      await Promise.resolve();
+      expect(calls.at(-1)).toBe(method);
+      return { method };
+    });
+    const commands = [
+      { cmd: 'cdp', args: { method: 'Input.dispatchKeyEvent', params: { type: 'keyDown', key: 'Shift' } } },
+      { cmd: 'cdp', args: { method: 'Input.imeSetComposition', params: { text: '中' } } },
+      { cmd: 'cdp', args: { method: 'Performance.getMetrics' } },
+      ...[null, [], 1, '{}'].map(params => ({ cmd: 'cdp', args: { method: 'Input.insertText', params } })),
+      { cmd: 'cdp', args: {} },
+    ];
+    await createProgram('', '').parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'batch', '--commands', JSON.stringify(commands)]);
+    expect(cdp.mock.calls).toEqual([
+      ['Input.dispatchKeyEvent', { type: 'keyDown', key: 'Shift' }],
+      ['Input.imeSetComposition', { text: '中' }],
+      ['Performance.getMetrics', {}],
+    ]);
+    expect(lastJsonLog().map((step: { ok: boolean }) => step.ok)).toEqual([true, true, true, false, false, false, false, false]);
+    expect(mockSetDaemonRunContext).toHaveBeenCalledWith(expect.objectContaining({ access: 'write' }));
+    expect(process.exitCode).toBeDefined();
+    cdp.mockResolvedValue({ result: true });
+  });
+
   it.each(['[]', 'null', '1', '{'])('rejects non-object or invalid JSON: %s', async params => {
     await createProgram('', '').parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'cdp', 'Performance.getMetrics', params]);
     expect(cdp).not.toHaveBeenCalled();

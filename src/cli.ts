@@ -3427,6 +3427,16 @@ cli({
               result = findResult;
               break;
             }
+            case 'cdp': {
+              if (typeof a.method !== 'string' || !a.method) throw new Error('cdp requires args.method');
+              const params = a.params === undefined ? {} : a.params;
+              if (!params || typeof params !== 'object' || Array.isArray(params)) {
+                throw new Error('CDP params must be a JSON object.');
+              }
+              if (!page.cdp) throw new Error('This browser bridge does not support CDP commands.');
+              result = await page.cdp(a.method, params as Record<string, unknown>) ?? null;
+              break;
+            }
             case 'keys': {
               const key = String(a.key ?? '');
               if (!key) throw new Error('keys requires args.key');
@@ -3463,7 +3473,7 @@ cli({
               break;
             }
             default:
-              throw new Error(`Unknown batch command: "${cmd}". Supported: open, state, click, type, fill, eval, wait, extract, screenshot, scroll, find, keys, hover, select, back`);
+              throw new Error(`Unknown batch command: "${cmd}". Supported: open, state, click, type, fill, eval, wait, extract, screenshot, scroll, find, keys, cdp, hover, select, back`);
           }
           const failed = result !== null && typeof result === 'object'
             && (('ok' in result && result.ok === false)
