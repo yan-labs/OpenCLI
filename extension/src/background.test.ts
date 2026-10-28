@@ -441,6 +441,25 @@ describe('background tab isolation', () => {
     expect(chrome.debugger.sendCommand).toHaveBeenCalledWith({ tabId: 1 }, method, {});
   });
 
+  it('dispatches WS statistics locally on the resolved tab without generic event forwarding', async () => {
+    const { chrome } = createChromeMock();
+    chrome.debugger.sendCommand = vi.fn(async () => ({}));
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    mod.__test__.setDefaultWindowMode('background');
+    mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
+    const run = (cdpMethod: string, cdpParams = {}) => mod.__test__.handleCommand({ id: 'ws', action: 'cdp', session: 'twitter', surface: 'adapter', cdpMethod, cdpParams });
+    expect((await run('OpenCLI.startWebSocketStats', { origin: 'wss://example.com', pathPrefix: '/ws/' })).ok).toBe(true);
+    const read = await run('OpenCLI.readWebSocketStats');
+    expect(read.ok).toBe(true);
+    expect(read.data).toMatchObject({ handshakes101: 0, frames: 0, active: 0, responsiveActive: 0 });
+    expect(chrome.debugger.sendCommand).toHaveBeenCalledWith({ tabId: 1 }, 'Network.enable');
+    expect(chrome.debugger.sendCommand.mock.calls.some(([, method]) => method.startsWith('OpenCLI.'))).toBe(false);
+    expect((await run('OpenCLI.stopWebSocketStats')).ok).toBe(true);
+    expect((await run('OpenCLI.readWebSocketStats')).ok).toBe(false);
+    expect((await run('OpenCLI.subscribeEvents')).ok).toBe(false);
+  });
+
   it('allows CPU throttling only through the resolved tab and still denies browser management', async () => {
     const { chrome } = createChromeMock();
     chrome.debugger.sendCommand = vi.fn(async () => ({}));
@@ -611,6 +630,7 @@ describe('background tab isolation', () => {
 
     const sendCommandInFrameTarget = vi.fn(async () => ({ nodes: [] }));
     vi.doMock('./cdp', () => ({
+      releaseWebSocketStats: vi.fn(),
       registerListeners: vi.fn(),
       registerFrameTracking: vi.fn(),
       hasActiveNetworkCapture: vi.fn(() => false),
@@ -659,6 +679,7 @@ describe('background tab isolation', () => {
       elapsedMs: 12,
     }));
     vi.doMock('./cdp', () => ({
+      releaseWebSocketStats: vi.fn(),
       registerListeners: vi.fn(),
       registerFrameTracking: vi.fn(),
       hasActiveNetworkCapture: vi.fn(() => false),
@@ -698,6 +719,7 @@ describe('background tab isolation', () => {
 
     const evaluateInFrame = vi.fn(async () => 'frame-result');
     vi.doMock('./cdp', () => ({
+      releaseWebSocketStats: vi.fn(),
       registerListeners: vi.fn(),
       registerFrameTracking: vi.fn(),
       hasActiveNetworkCapture: vi.fn(() => false),
@@ -760,6 +782,7 @@ describe('background tab isolation', () => {
 
     const evaluateAsync = vi.fn(async () => 'main-result');
     vi.doMock('./cdp', () => ({
+      releaseWebSocketStats: vi.fn(),
       registerListeners: vi.fn(),
       registerFrameTracking: vi.fn(),
       hasActiveNetworkCapture: vi.fn(() => false),
@@ -982,6 +1005,7 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
     const ensureAttached = vi.fn(async () => {});
     vi.doMock('./cdp', () => ({
+      releaseWebSocketStats: vi.fn(),
       registerListeners: vi.fn(),
       ensureAttached,
     }));
@@ -1022,6 +1046,7 @@ describe('background tab isolation', () => {
 
     const detachMock = vi.fn(async () => {});
     vi.doMock('./cdp', () => ({
+      releaseWebSocketStats: vi.fn(),
       registerListeners: vi.fn(),
       ensureAttached: vi.fn(async () => {}),
       hasActiveNetworkCapture: vi.fn(() => true),
@@ -1064,6 +1089,7 @@ describe('background tab isolation', () => {
     });
     vi.stubGlobal('chrome', chrome);
     vi.doMock('./cdp', () => ({
+      releaseWebSocketStats: vi.fn(),
       registerListeners: vi.fn(),
       ensureAttached: vi.fn(async () => {}),
       hasActiveNetworkCapture: vi.fn(() => false),
@@ -1119,6 +1145,7 @@ describe('background tab isolation', () => {
     });
     vi.stubGlobal('chrome', chrome);
     vi.doMock('./cdp', () => ({
+      releaseWebSocketStats: vi.fn(),
       registerListeners: vi.fn(),
       ensureAttached: vi.fn(async () => {}),
       hasActiveNetworkCapture: vi.fn(() => false),
@@ -1398,6 +1425,7 @@ describe('background tab isolation', () => {
     let inFlight = 0;
     let maxInFlight = 0;
     vi.doMock('./cdp', () => ({
+      releaseWebSocketStats: vi.fn(),
       registerListeners: vi.fn(),
       evaluateAsync: vi.fn(async (tabId: number, code: string) => {
         inFlight++;
@@ -1439,6 +1467,7 @@ describe('background tab isolation', () => {
     let inFlight = 0;
     let maxInFlight = 0;
     vi.doMock('./cdp', () => ({
+      releaseWebSocketStats: vi.fn(),
       registerListeners: vi.fn(),
       evaluateAsync: vi.fn(async (tabId: number, code: string) => {
         inFlight++;
@@ -3160,6 +3189,7 @@ describe('background tab isolation', () => {
     const { chrome } = createChromeMock();
     vi.stubGlobal('chrome', chrome);
     vi.doMock('./cdp', () => ({
+      releaseWebSocketStats: vi.fn(),
       registerListeners: vi.fn(),
       ensureAttached: vi.fn(async () => {}),
       registerFrameTracking: vi.fn(),

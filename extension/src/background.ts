@@ -4244,6 +4244,9 @@ const CDP_ALLOWLIST = new Set([
   'DOMSnapshot.captureSnapshot',
   // Bounded native input queue handled locally, never forwarded as a CDP method.
   'OpenCLI.dispatchInputBurst',
+  'OpenCLI.startWebSocketStats',
+  'OpenCLI.readWebSocketStats',
+  'OpenCLI.stopWebSocketStats',
   // Native input events
   'Input.dispatchMouseEvent',
   'Input.dispatchKeyEvent',
@@ -4286,6 +4289,16 @@ async function handleCdp(cmd: Command, leaseKey: string, guard?: CommandGuard): 
   try {
     const aggressive = getSurfaceFromKey(leaseKey) === 'browser';
     const params = cmd.cdpParams ?? {};
+    if (['OpenCLI.startWebSocketStats', 'OpenCLI.readWebSocketStats', 'OpenCLI.stopWebSocketStats'].includes(cmd.cdpMethod)) {
+      if (cmd.cdpMethod === 'OpenCLI.startWebSocketStats') {
+        await executor.ensureAttached(tabId, aggressive);
+        await executor.startWebSocketStats(tabId, leaseKey, params);
+      } else if (cmd.cdpMethod === 'OpenCLI.stopWebSocketStats') {
+        executor.stopWebSocketStats(tabId, leaseKey);
+        return pageScopedResult(cmd.id, tabId, {});
+      }
+      return pageScopedResult(cmd.id, tabId, executor.readWebSocketStats(tabId, leaseKey));
+    }
     if (cmd.cdpMethod === 'OpenCLI.dispatchInputBurst') {
       const { commands, busyMs = 0 } = params;
       const methods = new Set(['Input.dispatchKeyEvent', 'Input.imeSetComposition', 'Input.insertText']);
@@ -4577,6 +4590,7 @@ async function handleClipboard(cmd: Command): Promise<Result> {
 }
 
 async function releaseLease(leaseKey: string, reason: string = 'released'): Promise<void> {
+  executor.releaseWebSocketStats(leaseKey);
   await resetSessionViewport(leaseKey);
   activeCommands.delete(leaseKey);
   const session = automationSessions.get(leaseKey);

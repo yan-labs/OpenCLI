@@ -1,3 +1,7 @@
+import { createServer } from 'node:http';
+import { once } from 'node:events';
+import { randomBytes } from 'node:crypto';
+import WebSocket, { WebSocketServer } from 'ws';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 function createChromeMock() {
@@ -1059,5 +1063,105 @@ describe('persistent viewport', () => {
     const mod = await import('./cdp');
     await expect(mod.setViewport(1, { width: 0, height: 844 })).rejects.toThrow('positive safe integers');
     expect(chrome.debugger.attach).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('CDP WebSocket statistics', () => {
+  beforeEach(() => vi.resetModules());
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('counts real loopback 101/frames, requires the same active responsive socket and retains no canary', async () => {
+    const mock = createChromeMock();
+    vi.stubGlobal('chrome', mock.chrome);
+    const mod = await import('./cdp');
+    mod.registerListeners();
+    const fire = async (id: string, method: string, extra = {}, tabId = 1) => {
+      for (const listener of mock.debuggerEventListeners) await listener({ tabId }, method, { requestId: id, ...extra });
+    };
+    const canary = randomBytes(24).toString('hex');
+    const server = createServer();
+    const wss = new WebSocketServer({ server });
+    const clients: WebSocket[] = [];
+    const snapshots: unknown[] = [];
+    try {
+      server.listen(0, '127.0.0.1');
+      await once(server, 'listening');
+      const address = server.address() as { port: number };
+      const origin = `ws://127.0.0.1:${address.port}`;
+      await mod.startWebSocketStats(1, 'owner', { origin, pathPrefix: '/ws/' });
+      const read = () => { const data = mod.readWebSocketStats(1, 'owner'); snapshots.push(data); return data; };
+      await fire('ignored', 'Network.webSocketCreated', { url: `${origin}/other/${canary}` });
+      await fire('cross-tab', 'Network.webSocketCreated', { url: `${origin}/ws/${canary}` }, 2);
+      await fire('cross-origin', 'Network.webSocketCreated', { url: `ws://localhost:${address.port}/ws/${canary}` });
+      await fire('not101', 'Network.webSocketCreated', { url: `${origin}/ws/${canary}` });
+      await fire('not101', 'Network.webSocketHandshakeResponseReceived', { response: { status: 200, headers: { secret: canary } } });
+      await fire('not101', 'Network.webSocketFrameReceived', { response: { payloadData: canary } });
+      expect(read()).toMatchObject({ active: 0, responsive: 1, responsiveActive: 0 });
+      // This is a protocol/collector self-check: ws events feed the mocked CDP listener,
+      // not evidence that Chrome loaded this build. The separate live fixture checks Chrome.
+      const connect = async (id: string) => {
+        await fire(id, 'Network.webSocketCreated', { url: `${origin}/ws/${canary}` });
+        const accepted = once(wss, 'connection');
+        const client = new WebSocket(`${origin}/ws/${canary}`);
+        clients.push(client);
+        const upgrade = once(client, 'upgrade');
+        const opened = once(client, 'open');
+        const [response] = await upgrade;
+        expect(response.statusCode).toBe(101);
+        await fire(id, 'Network.webSocketHandshakeResponseReceived', { response: { status: response.statusCode, headers: response.headers } });
+        await opened;
+        const [peer] = await accepted;
+        return { client, peer: peer as WebSocket };
+      };
+      const first = await connect('first');
+      expect(read()).toMatchObject({ handshakes101: 1, active: 1, responsive: 1, responsiveActive: 0 });
+      const received = once(first.client, 'message');
+      first.peer.send(canary);
+      const [data] = await received;
+      await fire('first', 'Network.webSocketFrameReceived', { response: { payloadData: data.toString() } });
+      expect(read()).toMatchObject({ frames: 2, active: 1, responsiveActive: 1 });
+      const closed = once(first.client, 'close');
+      first.client.close();
+      await closed;
+      await fire('first', 'Network.webSocketClosed');
+      expect(read()).toMatchObject({ active: 0, responsiveActive: 0, closed: 1 });
+      const second = await connect('second');
+      expect(read()).toMatchObject({ handshakes101: 2, active: 1, responsive: 2, responsiveActive: 0 });
+      expect(JSON.stringify(snapshots)).not.toContain(canary);
+      expect(JSON.stringify(snapshots)).not.toContain(origin);
+      expect(() => mod.readWebSocketStats(1, 'other')).toThrow('lease');
+      await expect(mod.startWebSocketStats(1, 'other', { origin, pathPrefix: '/ws/' })).rejects.toThrow('lease');
+      expect(() => mod.stopWebSocketStats(1, 'other')).toThrow('lease');
+      mod.stopWebSocketStats(1, 'owner');
+      await fire('second', 'Network.webSocketFrameReceived', { response: { payloadData: canary } });
+      expect(() => read()).toThrow('not started');
+      await mod.startWebSocketStats(1, 'owner', { origin, pathPrefix: '/ws/' });
+      mod.releaseWebSocketStats('owner');
+      expect(() => read()).toThrow('not started');
+      await mod.startWebSocketStats(1, 'owner', { origin, pathPrefix: '/ws/' });
+      for (const listener of mock.tabRemovedListeners) listener(1);
+      expect(() => read()).toThrow('not started');
+      second.client.close();
+    } finally {
+      for (const client of clients) client.terminate();
+      for (const peer of wss.clients) peer.terminate();
+      await new Promise<void>(resolve => wss.close(() => resolve()));
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  });
+
+  it('rejects unsafe filters without echoing them and clears statistics on detach', async () => {
+    const mock = createChromeMock();
+    vi.stubGlobal('chrome', mock.chrome);
+    const mod = await import('./cdp');
+    const secret = randomBytes(24).toString('hex');
+    for (const params of [{ origin: `ws://user:${secret}@localhost`, pathPrefix: '/' },
+      { origin: 'http://localhost', pathPrefix: '/' }, { origin: 'ws://localhost', pathPrefix: `/?${secret}` }]) {
+      await expect(mod.startWebSocketStats(1, 'owner', params)).rejects.toThrow('WS stats require');
+    }
+    await mod.startWebSocketStats(1, 'owner', { origin: 'ws://localhost', pathPrefix: '/' });
+    await mod.detach(1);
+    expect(() => mod.readWebSocketStats(1, 'owner')).toThrow('not started');
   });
 });

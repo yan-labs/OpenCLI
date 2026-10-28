@@ -30,6 +30,83 @@ export async function setViewport(tabId: number, viewport: { width: number; heig
   }
 }
 
+type WebSocketStats = {
+  owner: string; origin: string; pathPrefix: string;
+  created: number; handshakes101: number; frames: number; responsive: number; closed: number;
+  sockets: Map<string, { active: boolean; responsive: boolean }>;
+  overflow: number;
+};
+const webSocketStats = new Map<number, WebSocketStats>();
+
+export async function startWebSocketStats(tabId: number, owner: string, params: Record<string, unknown>): Promise<void> {
+  const { origin, pathPrefix } = params;
+  let validOrigin = false;
+  try {
+    const url = new URL(String(origin));
+    validOrigin = ['ws:', 'wss:'].includes(url.protocol) && url.origin === origin;
+  } catch { /* Reject without echoing potentially sensitive input. */ }
+  if (!validOrigin || typeof pathPrefix !== 'string' || !pathPrefix.startsWith('/') || /[?#]/.test(pathPrefix)) {
+    throw new Error('WS stats require a ws/wss origin and pathname prefix.');
+  }
+  const prior = webSocketStats.get(tabId);
+  if (prior && prior.owner !== owner) throw new Error('WS stats belong to another lease.');
+  await sendDebuggerCommand({ tabId }, 'Network.enable');
+  webSocketStats.set(tabId, { owner, origin: origin as string, pathPrefix,
+    created: 0, handshakes101: 0, frames: 0, responsive: 0, closed: 0, sockets: new Map(), overflow: 0 });
+}
+
+export function readWebSocketStats(tabId: number, owner: string) {
+  const state = webSocketStats.get(tabId);
+  if (!state || state.owner !== owner) throw new Error('WS stats are not started for this lease.');
+  let active = 0, responsiveActive = 0;
+  for (const socket of state.sockets.values()) {
+    if (socket.active) { active++; if (socket.responsive) responsiveActive++; }
+  }
+  return { created: state.created, handshakes101: state.handshakes101, frames: state.frames,
+    active, responsive: state.responsive, responsiveActive, closed: state.closed, overflow: state.overflow };
+}
+
+export function stopWebSocketStats(tabId: number, owner: string): void {
+  const state = webSocketStats.get(tabId);
+  if (state && state.owner !== owner) throw new Error('WS stats belong to another lease.');
+  webSocketStats.delete(tabId);
+}
+
+export function releaseWebSocketStats(owner: string): void {
+  for (const [tabId, state] of webSocketStats) if (state.owner === owner) webSocketStats.delete(tabId);
+}
+
+function recordWebSocketEvent(tabId: number, method: string, params: any): void {
+  const state = webSocketStats.get(tabId);
+  if (!state || typeof params?.requestId !== 'string') return;
+  const id = params.requestId;
+  if (method === 'Network.webSocketCreated') {
+    // Token-bearing URLs are used only for matching and never retained or returned.
+    try {
+      const url = new URL(params.url);
+      if (url.origin !== state.origin || !url.pathname.startsWith(state.pathPrefix)) return;
+    } catch { return; }
+    if (state.sockets.has(id)) return;
+    if (state.sockets.size >= 4096) { state.overflow++; return; }
+    state.created++;
+    state.sockets.set(id, { active: false, responsive: false });
+    return;
+  }
+  const socket = state.sockets.get(id);
+  if (!socket) return;
+  if (method === 'Network.webSocketHandshakeResponseReceived' && params.response?.status === 101) {
+    if (!socket.active) state.handshakes101++;
+    socket.active = true;
+  } else if (method === 'Network.webSocketFrameReceived') {
+    state.frames++;
+    if (!socket.responsive) state.responsive++;
+    socket.responsive = true;
+  } else if (method === 'Network.webSocketClosed') {
+    state.closed++;
+    state.sockets.delete(id);
+  }
+}
+
 type ConsoleMessage = { type: string; text: string; timestamp: number };
 type ConsoleCapture = { captureSupported: boolean; startedAt: number | null; messages: ConsoleMessage[] };
 const consoleCaptures = new Map<number, ConsoleCapture>();
@@ -1502,6 +1579,7 @@ function clearFrameTargetsForTab(tabId: number): void {
 }
 
 export async function detach(tabId: number): Promise<void> {
+  webSocketStats.delete(tabId);
   consoleCaptures.delete(tabId);
   clearFrameTargetsForTab(tabId);
   if (!attached.has(tabId)) return;
@@ -1517,6 +1595,7 @@ export async function detach(tabId: number): Promise<void> {
 export function registerListeners(): void {
   chrome.tabs.onRemoved.addListener((tabId) => {
     viewports.delete(tabId);
+    webSocketStats.delete(tabId);
     consoleCaptures.delete(tabId);
     attached.delete(tabId);
     networkCaptures.delete(tabId);
@@ -1528,6 +1607,7 @@ export function registerListeners(): void {
   });
   chrome.debugger.onDetach.addListener((source) => {
     if (source.tabId) {
+      webSocketStats.delete(source.tabId);
       const capture = consoleCaptures.get(source.tabId);
       if (capture) capture.captureSupported = false;
       attached.delete(source.tabId);
@@ -1550,6 +1630,7 @@ export function registerListeners(): void {
   chrome.debugger.onEvent.addListener(async (source, method, params) => {
     const tabId = source.tabId;
     if (!tabId) return;
+    if (!(source as DebuggerSessionTarget).sessionId) recordWebSocketEvent(tabId, method, params);
     const state = networkCaptures.get(tabId);
     if (!state) return;
     const eventParams = params as Record<string, any> | undefined;

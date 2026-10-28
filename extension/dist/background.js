@@ -4,6 +4,97 @@ const DAEMON_WS_URL = `ws://${DAEMON_HOST}:${DAEMON_PORT}/ext`;
 const DAEMON_PING_URL = `http://${DAEMON_HOST}:${DAEMON_PORT}/ping`;
 
 const attached = /* @__PURE__ */ new Set();
+const webSocketStats = /* @__PURE__ */ new Map();
+async function startWebSocketStats(tabId, owner, params) {
+  const { origin, pathPrefix } = params;
+  let validOrigin = false;
+  try {
+    const url = new URL(String(origin));
+    validOrigin = ["ws:", "wss:"].includes(url.protocol) && url.origin === origin;
+  } catch {
+  }
+  if (!validOrigin || typeof pathPrefix !== "string" || !pathPrefix.startsWith("/") || /[?#]/.test(pathPrefix)) {
+    throw new Error("WS stats require a ws/wss origin and pathname prefix.");
+  }
+  const prior = webSocketStats.get(tabId);
+  if (prior && prior.owner !== owner) throw new Error("WS stats belong to another lease.");
+  await sendDebuggerCommand({ tabId }, "Network.enable");
+  webSocketStats.set(tabId, {
+    owner,
+    origin,
+    pathPrefix,
+    created: 0,
+    handshakes101: 0,
+    frames: 0,
+    responsive: 0,
+    closed: 0,
+    sockets: /* @__PURE__ */ new Map(),
+    overflow: 0
+  });
+}
+function readWebSocketStats(tabId, owner) {
+  const state = webSocketStats.get(tabId);
+  if (!state || state.owner !== owner) throw new Error("WS stats are not started for this lease.");
+  let active = 0, responsiveActive = 0;
+  for (const socket of state.sockets.values()) {
+    if (socket.active) {
+      active++;
+      if (socket.responsive) responsiveActive++;
+    }
+  }
+  return {
+    created: state.created,
+    handshakes101: state.handshakes101,
+    frames: state.frames,
+    active,
+    responsive: state.responsive,
+    responsiveActive,
+    closed: state.closed,
+    overflow: state.overflow
+  };
+}
+function stopWebSocketStats(tabId, owner) {
+  const state = webSocketStats.get(tabId);
+  if (state && state.owner !== owner) throw new Error("WS stats belong to another lease.");
+  webSocketStats.delete(tabId);
+}
+function releaseWebSocketStats(owner) {
+  for (const [tabId, state] of webSocketStats) if (state.owner === owner) webSocketStats.delete(tabId);
+}
+function recordWebSocketEvent(tabId, method, params) {
+  const state = webSocketStats.get(tabId);
+  if (!state || typeof params?.requestId !== "string") return;
+  const id = params.requestId;
+  if (method === "Network.webSocketCreated") {
+    try {
+      const url = new URL(params.url);
+      if (url.origin !== state.origin || !url.pathname.startsWith(state.pathPrefix)) return;
+    } catch {
+      return;
+    }
+    if (state.sockets.has(id)) return;
+    if (state.sockets.size >= 4096) {
+      state.overflow++;
+      return;
+    }
+    state.created++;
+    state.sockets.set(id, { active: false, responsive: false });
+    return;
+  }
+  const socket = state.sockets.get(id);
+  if (!socket) return;
+  if (method === "Network.webSocketHandshakeResponseReceived" && params.response?.status === 101) {
+    if (!socket.active) state.handshakes101++;
+    socket.active = true;
+  } else if (method === "Network.webSocketFrameReceived") {
+    state.frames++;
+    if (!socket.responsive) state.responsive++;
+    socket.responsive = true;
+  } else if (method === "Network.webSocketClosed") {
+    state.closed++;
+    state.sockets.delete(id);
+  }
+}
 const tabFrameContexts = /* @__PURE__ */ new Map();
 const tabAllContexts = /* @__PURE__ */ new Map();
 const tabLiveSessionIds = /* @__PURE__ */ new Map();
@@ -895,6 +986,7 @@ function clearFrameTargetsForTab(tabId) {
   }
 }
 async function detach(tabId) {
+  webSocketStats.delete(tabId);
   clearFrameTargetsForTab(tabId);
   if (!attached.has(tabId)) return;
   attached.delete(tabId);
@@ -910,6 +1002,7 @@ async function detach(tabId) {
 }
 function registerListeners() {
   chrome.tabs.onRemoved.addListener((tabId) => {
+    webSocketStats.delete(tabId);
     attached.delete(tabId);
     networkCaptures.delete(tabId);
     tabFrameContexts.delete(tabId);
@@ -920,6 +1013,7 @@ function registerListeners() {
   });
   chrome.debugger.onDetach.addListener((source) => {
     if (source.tabId) {
+      webSocketStats.delete(source.tabId);
       attached.delete(source.tabId);
       networkCaptures.delete(source.tabId);
       tabFrameContexts.delete(source.tabId);
@@ -939,6 +1033,7 @@ function registerListeners() {
   chrome.debugger.onEvent.addListener(async (source, method, params) => {
     const tabId = source.tabId;
     if (!tabId) return;
+    if (!source.sessionId) recordWebSocketEvent(tabId, method, params);
     const state = networkCaptures.get(tabId);
     if (!state) return;
     const eventParams = params;
@@ -4225,6 +4320,9 @@ const CDP_ALLOWLIST = /* @__PURE__ */ new Set([
   "DOMSnapshot.captureSnapshot",
   // Bounded native input queue handled locally, never forwarded as a CDP method.
   "OpenCLI.dispatchInputBurst",
+  "OpenCLI.startWebSocketStats",
+  "OpenCLI.readWebSocketStats",
+  "OpenCLI.stopWebSocketStats",
   // Native input events
   "Input.dispatchMouseEvent",
   "Input.dispatchKeyEvent",
@@ -4266,6 +4364,16 @@ async function handleCdp(cmd, leaseKey, guard) {
   try {
     const aggressive = getSurfaceFromKey(leaseKey) === "browser";
     const params = cmd.cdpParams ?? {};
+    if (["OpenCLI.startWebSocketStats", "OpenCLI.readWebSocketStats", "OpenCLI.stopWebSocketStats"].includes(cmd.cdpMethod)) {
+      if (cmd.cdpMethod === "OpenCLI.startWebSocketStats") {
+        await ensureAttached(tabId, aggressive);
+        await startWebSocketStats(tabId, leaseKey, params);
+      } else if (cmd.cdpMethod === "OpenCLI.stopWebSocketStats") {
+        stopWebSocketStats(tabId, leaseKey);
+        return pageScopedResult(cmd.id, tabId, {});
+      }
+      return pageScopedResult(cmd.id, tabId, readWebSocketStats(tabId, leaseKey));
+    }
     if (cmd.cdpMethod === "OpenCLI.dispatchInputBurst") {
       const { commands, busyMs = 0 } = params;
       const methods = /* @__PURE__ */ new Set(["Input.dispatchKeyEvent", "Input.imeSetComposition", "Input.insertText"]);
@@ -4461,6 +4569,7 @@ async function handleClipboard(cmd) {
   }
 }
 async function releaseLease(leaseKey, reason = "released") {
+  releaseWebSocketStats(leaseKey);
   activeCommands.delete(leaseKey);
   const session = automationSessions.get(leaseKey);
   if (!session) {
