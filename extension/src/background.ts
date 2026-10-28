@@ -4242,6 +4242,8 @@ const CDP_ALLOWLIST = new Set([
   'DOM.querySelectorAll',
   'DOM.scrollIntoViewIfNeeded',
   'DOMSnapshot.captureSnapshot',
+  // Bounded native input queue handled locally, never forwarded as a CDP method.
+  'OpenCLI.dispatchInputBurst',
   // Native input events
   'Input.dispatchMouseEvent',
   'Input.dispatchKeyEvent',
@@ -4282,8 +4284,31 @@ async function handleCdp(cmd: Command, leaseKey: string, guard?: CommandGuard): 
   const tabId = await resolveTabId(cmdTabId, leaseKey, undefined, guard);
   try {
     const aggressive = getSurfaceFromKey(leaseKey) === 'browser';
-    await executor.ensureAttached(tabId, aggressive);
     const params = cmd.cdpParams ?? {};
+    if (cmd.cdpMethod === 'OpenCLI.dispatchInputBurst') {
+      const { commands, busyMs = 0 } = params;
+      const methods = new Set(['Input.dispatchKeyEvent', 'Input.imeSetComposition', 'Input.insertText']);
+      if (!Number.isInteger(busyMs) || (busyMs as number) < 0 || (busyMs as number) > 1000 ||
+          !Array.isArray(commands) || commands.length < 1 || commands.length > 256 ||
+          commands.some(step => step?.cmd !== 'cdp' || !methods.has(step.args?.method) ||
+            !CDP_ALLOWLIST.has(step.args.method) || !step.args.params || typeof step.args.params !== 'object' ||
+            Array.isArray(step.args.params))) {
+        throw new Error('Invalid input burst: 1–256 key/IME object steps and busyMs 0–1000 required.');
+      }
+      await executor.ensureAttached(tabId, aggressive);
+      // Queue in one extension turn so per-command lease reconciliation cannot reorder input.
+      const busy = busyMs ? Promise.allSettled([executor.sendDebuggerCommand({ tabId }, 'Runtime.evaluate', {
+        expression: `{ const end = performance.now() + ${busyMs}; while (performance.now() < end); }`,
+      })]) : Promise.resolve([]);
+      if (busyMs) await new Promise(resolve => setTimeout(resolve, 15));
+      const results = await Promise.allSettled(commands.map(step =>
+        executor.sendDebuggerCommand({ tabId }, step.args.method, step.args.params)));
+      const busyResults = await busy;
+      const failure = [...results, ...busyResults].find(result => result.status === 'rejected');
+      if (failure?.status === 'rejected') throw failure.reason;
+      return pageScopedResult(cmd.id, tabId, results.map(result => result.status === 'fulfilled' ? result.value ?? null : null));
+    }
+    await executor.ensureAttached(tabId, aggressive);
     const routeFrameId = typeof params.frameId === 'string' && params.sessionId === 'target'
       ? params.frameId
       : undefined;

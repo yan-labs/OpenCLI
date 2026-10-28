@@ -3217,6 +3217,21 @@ describe('browser cdp command', () => {
     cdp.mockResolvedValue({ result: true });
   });
 
+  it('submits a bounded burst once and rejects management methods before dispatch', async () => {
+    cdp.mockResolvedValue([{}, {}]);
+    const commands = ['keyDown', 'keyUp'].map(type => ({ cmd: 'cdp', args: { method: 'Input.dispatchKeyEvent', params: { type, key: 'a' } } }));
+    await createProgram('', '').parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'cdp-burst', '--busy-ms', '120', '--commands', JSON.stringify(commands)]);
+    expect(cdp.mock.calls).toEqual([['OpenCLI.dispatchInputBurst', { commands, busyMs: 120 }]]);
+    expect(mockSetDaemonRunContext).toHaveBeenCalledWith(expect.objectContaining({ access: 'write' }));
+    for (const invalid of [[], Array(257).fill(commands[0]), [{ cmd: 'cdp', args: { method: 'Browser.close', params: {} } }], [{ cmd: 'cdp', args: { method: 'Input.insertText', params: [] } }]]) {
+      cdp.mockClear();
+      await createProgram('', '').parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'cdp-burst', '--commands', JSON.stringify(invalid)]);
+      expect(cdp).not.toHaveBeenCalled();
+      expect(process.exitCode).toBeDefined();
+    }
+    cdp.mockResolvedValue({ result: true });
+  });
+
   it.each(['[]', 'null', '1', '{'])('rejects non-object or invalid JSON: %s', async params => {
     await createProgram('', '').parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'cdp', 'Performance.getMetrics', params]);
     expect(cdp).not.toHaveBeenCalled();

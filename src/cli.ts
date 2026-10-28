@@ -2382,6 +2382,26 @@ still usable even when navigation is reported as timed out.
       console.log(JSON.stringify(await page.cdp(method, params as Record<string, unknown>) ?? null, null, 2));
     }));
 
+  addBrowserTabOption(browser.command('cdp-burst')
+    .requiredOption('--commands <json>', '1–256 CDP input steps using batch {cmd,args} fields')
+    .option('--busy-ms <ms>', 'Bounded main-thread task before queuing input (0–1000 ms)', '0')
+    .description('Queue native key/IME commands before awaiting replies; existing batch stays sequential'))
+    .action(browserAction(async (page, opts) => {
+      const busyMs = Number(opts.busyMs);
+      if (!Number.isInteger(busyMs) || busyMs < 0 || busyMs > 1000) throw new Error('busy-ms must be an integer from 0 to 1000.');
+      const commands = JSON.parse(opts.commands);
+      const methods = new Set(['Input.dispatchKeyEvent', 'Input.imeSetComposition', 'Input.insertText']);
+      if (!Array.isArray(commands) || commands.length < 1 || commands.length > 256) throw new Error('Expected 1–256 CDP input steps.');
+      for (const step of commands) {
+        const a = step?.args;
+        if (step?.cmd !== 'cdp' || !methods.has(a?.method) || !a?.params || typeof a.params !== 'object' || Array.isArray(a.params)) {
+          throw new Error('Burst requires CDP key/IME steps with JSON object params.');
+        }
+      }
+      if (!page.cdp) throw new Error('This browser bridge does not support CDP commands.');
+      console.log(JSON.stringify(await page.cdp('OpenCLI.dispatchInputBurst', { commands, busyMs }), null, 2));
+    }));
+
   // ── Model-driven (JEV action selection) ──
   //
   // Logic lives entirely in src/browser/auto/*.ts (candidates.ts, safety.ts,

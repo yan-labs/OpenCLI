@@ -4223,6 +4223,8 @@ const CDP_ALLOWLIST = /* @__PURE__ */ new Set([
   "DOM.querySelectorAll",
   "DOM.scrollIntoViewIfNeeded",
   "DOMSnapshot.captureSnapshot",
+  // Bounded native input queue handled locally, never forwarded as a CDP method.
+  "OpenCLI.dispatchInputBurst",
   // Native input events
   "Input.dispatchMouseEvent",
   "Input.dispatchKeyEvent",
@@ -4262,8 +4264,25 @@ async function handleCdp(cmd, leaseKey, guard) {
   const tabId = await resolveTabId(cmdTabId, leaseKey, void 0, guard);
   try {
     const aggressive = getSurfaceFromKey(leaseKey) === "browser";
-    await ensureAttached(tabId, aggressive);
     const params = cmd.cdpParams ?? {};
+    if (cmd.cdpMethod === "OpenCLI.dispatchInputBurst") {
+      const { commands, busyMs = 0 } = params;
+      const methods = /* @__PURE__ */ new Set(["Input.dispatchKeyEvent", "Input.imeSetComposition", "Input.insertText"]);
+      if (!Number.isInteger(busyMs) || busyMs < 0 || busyMs > 1e3 || !Array.isArray(commands) || commands.length < 1 || commands.length > 256 || commands.some((step) => step?.cmd !== "cdp" || !methods.has(step.args?.method) || !CDP_ALLOWLIST.has(step.args.method) || !step.args.params || typeof step.args.params !== "object" || Array.isArray(step.args.params))) {
+        throw new Error("Invalid input burst: 1–256 key/IME object steps and busyMs 0–1000 required.");
+      }
+      await ensureAttached(tabId, aggressive);
+      const busy = busyMs ? Promise.allSettled([sendDebuggerCommand({ tabId }, "Runtime.evaluate", {
+        expression: `{ const end = performance.now() + ${busyMs}; while (performance.now() < end); }`
+      })]) : Promise.resolve([]);
+      if (busyMs) await new Promise((resolve) => setTimeout(resolve, 15));
+      const results = await Promise.allSettled(commands.map((step) => sendDebuggerCommand({ tabId }, step.args.method, step.args.params)));
+      const busyResults = await busy;
+      const failure = [...results, ...busyResults].find((result) => result.status === "rejected");
+      if (failure?.status === "rejected") throw failure.reason;
+      return pageScopedResult(cmd.id, tabId, results.map((result) => result.status === "fulfilled" ? result.value ?? null : null));
+    }
+    await ensureAttached(tabId, aggressive);
     const routeFrameId = typeof params.frameId === "string" && params.sessionId === "target" ? params.frameId : void 0;
     const routeTargetUrl = typeof params.targetUrl === "string" ? params.targetUrl : void 0;
     const data = routeFrameId ? await sendCommandInFrameTarget(tabId, routeFrameId, cmd.cdpMethod, stripOpenCliFrameRoutingParams(params, true), aggressive, commandCdpTimeoutMs(cmd) ?? 3e4, routeTargetUrl) : await sendDebuggerCommand(

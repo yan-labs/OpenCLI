@@ -441,6 +441,43 @@ describe('background tab isolation', () => {
     expect(chrome.debugger.sendCommand).toHaveBeenCalledWith({ tabId: 1 }, method, {});
   });
 
+  it('queues the bounded input sequence before awaiting replies and rejects unsafe bursts', async () => {
+    const { chrome } = createChromeMock();
+    const pending = deferred<Record<string, unknown>>();
+    const calls: string[] = [];
+    chrome.debugger.sendCommand = vi.fn((_target, method, params) => {
+      if (method === 'Input.dispatchKeyEvent') {
+        calls.push(params.type);
+        return pending.promise;
+      }
+      return Promise.resolve({});
+    });
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    mod.__test__.setDefaultWindowMode('background');
+    mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
+    const commands = ['rawKeyDown', 'keyUp'].map(type => ({ cmd: 'cdp', args: { method: 'Input.dispatchKeyEvent', params: { type, key: 'ArrowLeft' } } }));
+    const run = (cdpParams: Record<string, unknown>) => mod.__test__.handleCommand({ id: 'burst', action: 'cdp', session: 'twitter', surface: 'adapter', cdpMethod: 'OpenCLI.dispatchInputBurst', cdpParams });
+    const result = run({ commands, busyMs: 120 });
+    await vi.waitFor(() => expect(calls).toEqual(['rawKeyDown', 'keyUp']));
+    expect(chrome.debugger.sendCommand).toHaveBeenCalledWith({ tabId: 1 }, 'Runtime.evaluate', { expression: '{ const end = performance.now() + 120; while (performance.now() < end); }' });
+    pending.resolve({});
+    expect((await result).ok).toBe(true);
+    for (const params of [
+      { commands, busyMs: 1001 }, { commands, busyMs: -1 }, { commands, busyMs: 0.5 },
+      { commands: [] }, { commands: Array(257).fill(commands[0]) },
+      { commands: [{ cmd: 'cdp', args: { method: 'Browser.close', params: {} } }] },
+      { commands: [{ cmd: 'cdp', args: { method: 'Runtime.evaluate', params: { expression: '1' } } }] },
+      { commands: [{ cmd: 'cdp', args: { method: 'Input.insertText', params: [] } }] },
+    ]) {
+      chrome.debugger.sendCommand.mockClear();
+      expect((await run(params)).ok).toBe(false);
+      expect(chrome.debugger.sendCommand).not.toHaveBeenCalled();
+    }
+    chrome.debugger.sendCommand.mockImplementation((_target, method) => method === 'Input.dispatchKeyEvent' ? Promise.reject(new Error('native input failed')) : Promise.resolve({}));
+    expect((await run({ commands })).ok).toBe(false);
+  });
+
   it('keeps unrelated CDP methods denied', async () => {
     const { chrome } = createChromeMock();
     vi.stubGlobal('chrome', chrome);
