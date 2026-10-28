@@ -3179,6 +3179,24 @@ function installSelectorFirstTestHarness(label: string, pageOverrides: () => Par
   return { lastJsonLog };
 }
 
+describe('browser cdp command', () => {
+  const cdp = vi.fn().mockResolvedValue({ result: true });
+  const { lastJsonLog } = installSelectorFirstTestHarness('cdp', () => ({ cdp }));
+  beforeEach(() => cdp.mockClear());
+
+  it('routes method and object parameters through the existing page bridge', async () => {
+    await createProgram('', '').parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'cdp', 'Input.imeSetComposition', '{"text":"中","selectionStart":1,"selectionEnd":1}']);
+    expect(cdp).toHaveBeenCalledWith('Input.imeSetComposition', { text: '中', selectionStart: 1, selectionEnd: 1 });
+    expect(lastJsonLog()).toEqual({ result: true });
+  });
+
+  it.each(['[]', 'null', '1', '{'])('rejects non-object or invalid JSON: %s', async params => {
+    await createProgram('', '').parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'cdp', 'Performance.getMetrics', params]);
+    expect(cdp).not.toHaveBeenCalled();
+    expect(process.exitCode).toBeDefined();
+  });
+});
+
 describe('browser find command', () => {
   const { lastJsonLog } = installSelectorFirstTestHarness('find', () => ({
     evaluate: vi.fn(),

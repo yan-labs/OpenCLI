@@ -2367,6 +2367,21 @@ still usable even when navigation is reported as timed out.
       console.log(`Pressed: ${key}`);
     }));
 
+  addBrowserTabOption(browser.command('cdp')
+    .argument('<method>', 'CDP method permitted by the OpenCLI extension')
+    .argument('[params]', 'JSON object of CDP parameters', '{}'))
+    .description('Send a session-scoped CDP command through the existing extension allowlist')
+    .action(browserAction(async (page, method: string, raw: string) => {
+      let params: unknown;
+      try { params = JSON.parse(raw); }
+      catch { throw new Error('CDP params must be a JSON object.'); }
+      if (!params || typeof params !== 'object' || Array.isArray(params)) {
+        throw new Error('CDP params must be a JSON object.');
+      }
+      if (!page.cdp) throw new Error('This browser bridge does not support CDP commands.');
+      console.log(JSON.stringify(await page.cdp(method, params as Record<string, unknown>) ?? null, null, 2));
+    }));
+
   // ── Model-driven (JEV action selection) ──
   //
   // Logic lives entirely in src/browser/auto/*.ts (candidates.ts, safety.ts,

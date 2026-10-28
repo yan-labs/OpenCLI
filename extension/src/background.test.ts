@@ -429,6 +429,27 @@ describe('background tab isolation', () => {
     expect(mod.__test__.getCommandSurface({ session: browserKey('work'), surface: 'adapter' })).toBe('adapter');
   });
 
+  it.each(['Input.imeSetComposition', 'Performance.enable', 'Performance.getMetrics', 'Performance.disable', 'Runtime.getHeapUsage', 'Network.enable', 'Network.emulateNetworkConditions', 'Network.setBlockedURLs'])('allows scoped acceptance CDP method %s', async method => {
+    const { chrome } = createChromeMock();
+    chrome.debugger.sendCommand = vi.fn(async () => ({}));
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    mod.__test__.setDefaultWindowMode('background');
+    mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
+    const result = await mod.__test__.handleCommand({ id: 'accept-cdp', action: 'cdp', session: 'twitter', surface: 'adapter', cdpMethod: method, cdpParams: {} });
+    expect(result.ok).toBe(true);
+    expect(chrome.debugger.sendCommand).toHaveBeenCalledWith({ tabId: 1 }, method, {});
+  });
+
+  it('keeps unrelated CDP methods denied', async () => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    const result = await mod.__test__.handleCommand({ id: 'denied-cdp', action: 'cdp', session: 'test', surface: 'browser', cdpMethod: 'Browser.close' });
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('not permitted');
+  });
+
   it('routes structured command session and surface fields without encoded lease keys', async () => {
     const { chrome } = createChromeMock();
     chrome.debugger.sendCommand = vi.fn(async () => ({}));

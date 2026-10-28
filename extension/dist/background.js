@@ -4227,6 +4227,15 @@ const CDP_ALLOWLIST = /* @__PURE__ */ new Set([
   "Input.dispatchMouseEvent",
   "Input.dispatchKeyEvent",
   "Input.insertText",
+  "Input.imeSetComposition",
+  // Tab-scoped fault injection and performance sampling for browser acceptance.
+  "Network.enable",
+  "Network.emulateNetworkConditions",
+  "Network.setBlockedURLs",
+  "Performance.enable",
+  "Performance.getMetrics",
+  "Performance.disable",
+  "Runtime.getHeapUsage",
   // Page metrics & screenshots
   "Page.getLayoutMetrics",
   "Page.captureScreenshot",
