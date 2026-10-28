@@ -27,10 +27,16 @@ New extension allowlist entries require loading the matching extension build.
 - Keyboard: `keys` uses `Input.dispatchKeyEvent`; `type` inserts Unicode through
   `Input.insertText`. Text insertion is not a sequence of physical key presses.
 - Composition: `Input.imeSetComposition` followed by `Input.insertText` exercises
-  Chromium's composition path. In the checked Chrome, start/update are trusted but
-  compositionend is untrusted, so strict IME acceptance remains blocked. Cancel,
-  char and Enter alternatives did not produce a trusted compositionend either.
-  This does not operate a physical OS IME candidate window or prove hardware behavior.
+  Chromium's composition path, matching `imeWord` in the editor's original
+  `integration/apps/web-pc/e2e/user-cases/perf.ts:610–651`: successive composition
+  updates followed by a text commit. That contract has no `compositionend.isTrusted`
+  gate. The fixture checks start/update/end and exact committed text, and records
+  every observed event's `isTrusted` value without making it an extra IME gate.
+  In the checked Chrome, start/update are trusted and end is untrusted.
+  This does not operate or test a physical OS IME candidate window.
+  The fixture only checks bridge capabilities; editor acceptance must still run
+  the original `caretBehind`, `lostComposition`, `rollbacks` and three-way
+  consistency assertions unchanged. Passing this fixture does not pass those gates.
 - Pointer: `click` and `drag` try trusted CDP input. A strict check must reject
   `click_method` other than `cdp`, `native_drag_dropped:true`, and untrusted events.
 - Clipboard: `clipboard` reads plain text. This check does not write the shared
@@ -51,7 +57,7 @@ NODE_USE_ENV_PROXY=1 node scripts/live-input-check.mjs
 ```
 
 `OPENCLI_LIVE_OUT` selects the evidence directory; `OPENCLI_ACCEPT_CLI` selects a
-built CLI entry file. The script asserts trusted keyboard, composition and pointer
-input, clipboard readability, blocked/offline/restored fetches, metrics and final
-lease release. It does not visit business pages. Output contains no clipboard
+built CLI entry file. The script asserts trusted keyboard and pointer input, the
+CDP composition lifecycle and committed text, clipboard readability,
+blocked/offline/restored fetches, metrics and final lease release. It does not visit business pages. Output contains no clipboard
 contents or metadata belonging to other sessions.

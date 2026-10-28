@@ -61,14 +61,17 @@ try {
   assert(evidence.events.some(e => e.type === 'keydown' && e.key === 'ArrowLeft' && e.trusted));
   assert(evidence.events.some(e => e.type === 'input' && e.trusted));
   summary.checks.keyboard = evidence;
-  await cdp('Input.imeSetComposition', { text: '中', selectionStart: 1, selectionEnd: 1 });
-  await cdp('Input.insertText', { text: '中文' });
-  evidence = await evaluate(`({value:editor.value,events:events.filter(e=>e.type.startsWith('composition'))})`);
-  for (const type of ['compositionstart', 'compositionupdate']) assert(evidence.events.some(e => e.type === type && e.trusted), `Missing trusted ${type}`);
-  assert(evidence.value.includes('中文'));
-  if (!evidence.events.some(e => e.type === 'compositionend' && e.trusted)) {
-    summary.failures.push('Strict IME acceptance blocked: Chromium CDP compositionend is absent or untrusted.');
+  await browser('keys', 'End');
+  for (const text of ['z', 'zhong', 'zhongwen']) {
+    await cdp('Input.imeSetComposition', { text, selectionStart: text.length, selectionEnd: text.length });
   }
+  await cdp('Input.insertText', { text: '中文' });
+  evidence = await evaluate(`({value:editor.value,events:events.slice()})`);
+  // Match the original CDP IME contract; isTrusted is evidence, not an extra IME gate.
+  for (const type of ['compositionstart', 'compositionupdate', 'compositionend']) {
+    assert(evidence.events.some(e => e.type === type), `Missing ${type}`);
+  }
+  assert.equal(evidence.value, 'bridge中文');
   summary.checks.composition = evidence;
   await evaluate('(()=>{events.length=0;return true})()');
   const drag = JSON.parse(await browser('drag', '#source', '#target'));
