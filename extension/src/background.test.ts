@@ -161,7 +161,7 @@ function createChromeMock() {
         removeEmptyGroups();
       }),
       onUpdated: { addListener: vi.fn(), removeListener: vi.fn() } as Listener<(id: number, info: chrome.tabs.TabChangeInfo) => void>,
-      onRemoved: { addListener: vi.fn() } as Listener<(tabId: number) => void>,
+      onRemoved: { addListener: vi.fn(), removeListener: vi.fn() } as Listener<(tabId: number) => void>,
     },
     tabGroups: {
       TAB_GROUP_ID_NONE: -1,
@@ -516,6 +516,153 @@ describe('background tab isolation', () => {
     }
     chrome.debugger.sendCommand.mockImplementation((_target, method) => method === 'Input.dispatchKeyEvent' ? Promise.reject(new Error('native input failed')) : Promise.resolve({}));
     expect((await run({ commands })).ok).toBe(false);
+  });
+
+  it('paces native keys against one clock while awaiting local CDP order', async () => {
+    const { chrome } = createChromeMock();
+    const sent: Array<{ type: string; at: number }> = [];
+    chrome.debugger.sendCommand = vi.fn((_target, method, params) => {
+      if (method === 'Input.dispatchKeyEvent') {
+        sent.push({ type: params.type, at: performance.now() });
+        return new Promise(resolve => setTimeout(() => resolve({}), 2));
+      }
+      return Promise.resolve({});
+    });
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    mod.__test__.setDefaultWindowMode('background');
+    mod.__test__.setSession(adapterKey('paced'), { windowId: 1, owned: true, preferredTabId: 1 });
+    vi.useFakeTimers();
+    const commands = Array.from({ length: 3 }, () => ['keyDown', 'keyUp'].map(type => ({ cmd: 'cdp', args: { method: 'Input.dispatchKeyEvent', params: { type, key: 'a', ...(type === 'keyDown' ? { text: 'a' } : {}) } } }))).flat();
+    const startAt = Date.now() + 100;
+    const pending = mod.__test__.handleCommand({ id: 'paced', action: 'cdp', session: 'paced', surface: 'adapter', cdpMethod: 'OpenCLI.dispatchInputBurst', cdpParams: { commands, scheduleMs: [0, 0, 35, 35, 70, 70], startAt } });
+    await vi.advanceTimersByTimeAsync(200);
+    expect(sent.map(e => e.type)).toEqual(['keyDown', 'keyUp', 'keyDown', 'keyUp', 'keyDown', 'keyUp']);
+    expect(sent.map(e => e.at - sent[0].at)).toEqual([0, 2, 35, 37, 70, 72]);
+    const result = await pending;
+    vi.useRealTimers();
+    expect(result.error).toBeUndefined();
+    expect(result.ok).toBe(true);
+    expect(result.data).toMatchObject({ startAt, scheduleMs: [0, 0, 35, 35, 70, 70], latenessMs: [0, 2, 0, 2, 0, 2] });
+    expect(chrome.tabs.onUpdated.removeListener).toHaveBeenCalled();
+    expect(Object.keys(result.data as object)).toEqual(['startAt', 'scheduleMs', 'dispatchedAtMs', 'latenessMs']);
+  });
+
+  it('awaits every native IME prefix before its gap, including zero-gap and commit', async () => {
+    const { chrome } = createChromeMock();
+    const calls: Array<{ method: string; at: number }> = [];
+    chrome.debugger.sendCommand = vi.fn((_target, method) => {
+      if (!method.startsWith('Input.')) return Promise.resolve({});
+      calls.push({ method, at: performance.now() });
+      return new Promise(resolve => setTimeout(() => resolve({}), 17));
+    });
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    mod.__test__.setDefaultWindowMode('background');
+    mod.__test__.setSession(adapterKey('paced'), { windowId: 1, owned: true, preferredTabId: 1 });
+    vi.useFakeTimers();
+    const commands = ['z', 'zh', 'zhong'].map(text => ({ cmd: 'cdp', args: { method: 'Input.imeSetComposition', params: { text, selectionStart: text.length, selectionEnd: text.length } } }));
+    commands.push({ cmd: 'cdp', args: { method: 'Input.insertText', params: { text: '中' } } } as any);
+    for (const gap of [90, 18, 0]) {
+      calls.length = 0;
+      const pending = mod.__test__.handleCommand({ id: 'ime', action: 'cdp', session: 'paced', surface: 'adapter', cdpMethod: 'OpenCLI.dispatchInputBurst', cdpParams: { commands, delaysMs: [gap, gap, gap, 0] } });
+      await vi.advanceTimersByTimeAsync(4 * (gap + 17));
+      const result = await pending;
+      expect(result.error).toBeUndefined();
+      expect(calls.map(call => call.method)).toEqual(['Input.imeSetComposition', 'Input.imeSetComposition', 'Input.imeSetComposition', 'Input.insertText']);
+      expect(calls.map(call => call.at - calls[0].at)).toEqual([0, gap + 17, 2 * (gap + 17), 3 * (gap + 17)]);
+      expect(chrome.tabs.onUpdated.removeListener).toHaveBeenCalled();
+    }
+    vi.useRealTimers();
+  });
+
+  it('reports real lateness and bounds slow sequential input without leaving scheduled work', async () => {
+    const { chrome } = createChromeMock();
+    let latency = 10;
+    const calls: Array<{ method: string; at: number }> = [];
+    chrome.debugger.sendCommand = vi.fn((_target, method) => {
+      calls.push({ method, at: performance.now() });
+      return new Promise(resolve => setTimeout(() => resolve({}), latency));
+    });
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    mod.__test__.setDefaultWindowMode('background');
+    mod.__test__.setSession(adapterKey('paced'), { windowId: 1, owned: true, preferredTabId: 1 });
+    vi.useFakeTimers();
+    const keys = Array.from({ length: 3 }, () => ['keyDown', 'keyUp'].map(type => ({ cmd: 'cdp', args: { method: 'Input.dispatchKeyEvent', params: { type, key: 'a' } } }))).flat();
+    const run = (cdpParams: Record<string, unknown>) => mod.__test__.handleCommand({ id: 'slow', action: 'cdp', session: 'paced', surface: 'adapter', cdpMethod: 'OpenCLI.dispatchInputBurst', cdpParams });
+    const paced = run({ commands: keys, scheduleMs: [0, 0, 7, 7, 14, 14], startAt: Date.now() });
+    await vi.advanceTimersByTimeAsync(100);
+    expect((await paced).data).toMatchObject({ latenessMs: [0, 10, 13, 23, 26, 36] });
+    latency = 1000;
+    calls.length = 0;
+    const commands = Array.from({ length: 100 }, () => ({ cmd: 'cdp', args: { method: 'Input.imeSetComposition', params: { text: 'z', selectionStart: 1, selectionEnd: 1 } } }));
+    commands.push({ cmd: 'cdp', args: { method: 'Input.insertText', params: { text: '中' } } } as any);
+    const slow = run({ commands, delaysMs: commands.map(() => 0) });
+    await vi.advanceTimersByTimeAsync(55000);
+    expect((await slow).error).toContain('exceeded 45s');
+    expect(calls.length).toBeLessThan(50);
+    expect(chrome.debugger.sendCommand).toHaveBeenLastCalledWith({ tabId: 1 }, 'Input.imeSetComposition', { text: '', selectionStart: 0, selectionEnd: 0 });
+    const count = calls.length;
+    await vi.advanceTimersByTimeAsync(10000);
+    expect(calls).toHaveLength(count);
+    expect(chrome.tabs.onUpdated.removeListener).toHaveBeenCalled();
+    vi.useRealTimers();
+  });
+
+  it('rejects unsafe paced parameters before input and stops on navigation, lease loss or failure', async () => {
+    const { chrome } = createChromeMock();
+    chrome.debugger.sendCommand = vi.fn(async () => ({}));
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    mod.__test__.setDefaultWindowMode('background');
+    const commands = ['keyDown', 'keyUp', 'keyDown', 'keyUp'].map(type => ({ cmd: 'cdp', args: { method: 'Input.dispatchKeyEvent', params: { type, key: 'a', ...(type === 'keyDown' ? { text: 'a' } : {}) } } }));
+    const run = (params: Record<string, unknown>) => mod.__test__.handleCommand({ id: 'paced', action: 'cdp', session: 'paced', surface: 'adapter', cdpMethod: 'OpenCLI.dispatchInputBurst', cdpParams: params });
+    mod.__test__.setSession(adapterKey('paced'), { windowId: 1, owned: true, preferredTabId: 1 });
+    for (const params of [
+      { commands, scheduleMs: [0] }, { commands, scheduleMs: [0, 0, -1, 35] },
+      { commands, scheduleMs: [0, 0, 36, 35] }, { commands, scheduleMs: [0, 0, 30001, 30001] },
+      { commands, scheduleMs: [0, 0, NaN, 35] }, { commands, scheduleMs: [0, 0, 35, 35], busyMs: 1 },
+      { commands, scheduleMs: [0, 0, 35, 35], startAt: Date.now() + 6000 },
+      { commands, scheduleMs: [0, 0, 35, 35], startAt: Date.now() - 30001 },
+      { commands: [{ cmd: 'cdp', args: { method: 'Input.insertText', params: { text: 'a'.repeat(1025) } } }], scheduleMs: [0] },
+      { commands: [{ cmd: 'cdp', args: { method: 'Input.dispatchKeyEvent', params: { type: 'keyDown', key: 'a', sessionId: 'target' } } }], scheduleMs: [0] },
+      { commands: [commands[0]], scheduleMs: [0] },
+      { commands, delaysMs: [0, 0, 0, 0], scheduleMs: [0, 0, 35, 35] },
+      { commands, delaysMs: [0, 0, 0, 0], startAt: Date.now() },
+      { commands, delaysMs: [10000, 10000, 10000, 1] },
+      { commands, delaysMs: [-1, 0, 0, 0] },
+      { commands, delaysMs: [0] },
+    ]) {
+      chrome.debugger.sendCommand.mockClear();
+      expect((await run(params)).ok).toBe(false);
+      expect(chrome.debugger.sendCommand).not.toHaveBeenCalled();
+    }
+    for (const reason of ['navigation', 'lease', 'failure']) {
+      mod.__test__.setSession(adapterKey('paced'), { windowId: 1, owned: true, preferredTabId: 1 });
+      const sent: string[] = [];
+      chrome.debugger.sendCommand.mockImplementation(async (_target, method, params) => {
+        if (method !== 'Input.dispatchKeyEvent') return {};
+        sent.push(params.type);
+        if (sent.length === 1) {
+          if (reason === 'navigation') {
+            const listener = chrome.tabs.onUpdated.addListener.mock.calls.at(-1)[0];
+            listener(1, { status: 'loading' });
+          } else if (reason === 'lease') mod.__test__.forgetSession(adapterKey('paced'));
+          else throw new Error('native failed');
+        }
+        return {};
+      });
+      const result = await run({ commands, scheduleMs: [0, 0, 35, 35] });
+      expect(result.ok).toBe(false);
+      expect(sent.filter(type => type === 'keyDown')).toHaveLength(1);
+      if (reason === 'failure') expect(sent.at(-1)).toBe('keyUp');
+      expect(chrome.tabs.onUpdated.removeListener).toHaveBeenCalled();
+    }
+    mod.__test__.setSession(adapterKey('paced'), { windowId: 1, owned: false, preferredTabId: 1 });
+    chrome.debugger.sendCommand.mockClear();
+    expect((await run({ commands, scheduleMs: [0, 0, 35, 35] })).ok).toBe(false);
+    expect(chrome.debugger.sendCommand).not.toHaveBeenCalled();
   });
 
   it('keeps unrelated CDP methods denied', async () => {

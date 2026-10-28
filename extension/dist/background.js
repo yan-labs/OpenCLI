@@ -4354,6 +4354,132 @@ const CDP_ALLOWLIST = /* @__PURE__ */ new Set([
   "Emulation.setDeviceMetricsOverride",
   "Emulation.clearDeviceMetricsOverride"
 ]);
+async function dispatchPacedInput(tabId, leaseKey, params, guard) {
+  const { commands, scheduleMs, delaysMs, startAt = Date.now(), busyMs = 0 } = params;
+  const sequential = delaysMs !== void 0;
+  const timing = sequential ? delaysMs : scheduleMs;
+  const invalid = () => new Error("Invalid paced input: bounded, balanced key/IME steps and a 0–30000ms ordered schedule required.");
+  if (Object.keys(params).some((key) => !["commands", "scheduleMs", "delaysMs", "startAt", "busyMs"].includes(key)) || busyMs !== 0 || sequential && (scheduleMs !== void 0 || params.startAt !== void 0) || !Array.isArray(commands) || !Array.isArray(timing) || commands.length < 1 || commands.length > 256 || timing.length !== commands.length || !Number.isSafeInteger(startAt) || Math.abs(startAt - Date.now()) > 3e4 || startAt > Date.now() + 5e3 || timing.some((at, i) => !Number.isFinite(at) || at < 0 || at > 3e4 || !sequential && i > 0 && at < timing[i - 1]) || sequential && timing.reduce((sum, delay) => sum + delay, 0) > 3e4 || JSON.stringify(commands).length > 65536) throw invalid();
+  const held = /* @__PURE__ */ new Map();
+  const keyId = (p) => String(p.code ?? p.key ?? p.windowsVirtualKeyCode ?? "");
+  let textLength = 0;
+  let composing = false;
+  for (const step of commands) {
+    const method = step?.args?.method;
+    const p = step?.args?.params;
+    if (step?.cmd !== "cdp" || !p || typeof p !== "object" || Array.isArray(p)) throw invalid();
+    const fields = method === "Input.dispatchKeyEvent" ? ["type", "key", "code", "text", "unmodifiedText", "windowsVirtualKeyCode", "nativeVirtualKeyCode", "modifiers", "autoRepeat", "isKeypad", "isSystemKey", "location"] : method === "Input.imeSetComposition" ? ["text", "selectionStart", "selectionEnd", "replacementStart", "replacementEnd"] : method === "Input.insertText" ? ["text"] : [];
+    if (!fields.length || Object.keys(p).some((field) => !fields.includes(field))) throw invalid();
+    for (const [field, value] of Object.entries(p)) {
+      if (["text", "unmodifiedText", "key", "code", "type"].includes(field)) {
+        if (typeof value !== "string" || value.length > (field.includes("Text") || field === "text" ? 1024 : 128)) throw invalid();
+        textLength += value.length;
+      } else if (["autoRepeat", "isKeypad", "isSystemKey"].includes(field)) {
+        if (typeof value !== "boolean") throw invalid();
+      } else if (!Number.isInteger(value) || value < 0 || value > 65535) throw invalid();
+    }
+    if (p.modifiers !== void 0 && p.modifiers > 15 || p.location !== void 0 && p.location > 3) throw invalid();
+    if (method === "Input.dispatchKeyEvent") {
+      if (!["keyDown", "rawKeyDown", "char", "keyUp"].includes(p.type)) throw invalid();
+      if (p.type === "keyDown" || p.type === "rawKeyDown") held.set(keyId(p), p);
+      if (p.type === "keyUp") held.delete(keyId(p));
+    } else {
+      if (typeof p.text !== "string") throw invalid();
+      if (method === "Input.imeSetComposition") {
+        if (!Number.isInteger(p.selectionStart) || !Number.isInteger(p.selectionEnd) || p.selectionStart > p.text.length || p.selectionEnd > p.text.length || p.selectionStart > p.selectionEnd) throw invalid();
+        composing = p.text.length > 0;
+      } else composing = false;
+    }
+  }
+  if (held.size || composing || textLength > 8192) throw invalid();
+  const lease = automationSessions.get(leaseKey);
+  if (!lease?.owned || lease.preferredTabId !== tabId) throw new Error("Paced input requires the original owned lease target.");
+  let navigated = false;
+  const onUpdated = (id, info) => {
+    if (id === tabId && (info.url !== void 0 || info.status === "loading")) navigated = true;
+  };
+  const onRemoved = (id) => {
+    if (id === tabId) navigated = true;
+  };
+  let initialUrl;
+  const ownsTarget = () => automationSessions.get(leaseKey) === lease && lease.owned && lease.preferredTabId === tabId;
+  const check = () => {
+    guard?.();
+    if (navigated || !ownsTarget()) throw new Error("Paced input cancelled: lease or original page changed.");
+  };
+  const checkTarget = async () => {
+    check();
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.windowId !== lease.windowId || tab.url !== initialUrl || tab.pendingUrl || tab.status === "loading") navigated = true;
+    check();
+  };
+  const pending = [];
+  const deadline = performance.now() + 45e3;
+  let failed = false;
+  const dispatchedAtMs = [];
+  const latenessMs = [];
+  const epoch = Date.now();
+  const mono = performance.now();
+  const base = mono + (startAt - epoch);
+  const send = (method, p) => {
+    const result = sendDebuggerCommand({ tabId }, method, p, 5e3).then(() => {
+    }, () => {
+      failed = true;
+    });
+    pending.push(result);
+    return result;
+  };
+  const waitUntil = async (at) => {
+    while (performance.now() < at) {
+      check();
+      if (failed || performance.now() > deadline) throw new Error("Paced input failed or exceeded 45s; remaining steps cancelled.");
+      await new Promise((resolve) => setTimeout(resolve, Math.min(25, Math.max(1, at - performance.now()))));
+    }
+  };
+  chrome.tabs.onUpdated.addListener(onUpdated);
+  chrome.tabs.onRemoved.addListener(onRemoved);
+  try {
+    initialUrl = (await chrome.tabs.get(tabId)).url;
+    await checkTarget();
+    let nextAt = performance.now();
+    for (let i = 0; i < commands.length; i++) {
+      const at = sequential ? nextAt : base + timing[i];
+      await waitUntil(at);
+      await checkTarget();
+      if (failed || performance.now() > deadline) throw new Error("Paced input failed or exceeded 45s; remaining steps cancelled.");
+      const { method, params: p } = commands[i].args;
+      const now = performance.now();
+      dispatchedAtMs.push(epoch + now - mono);
+      latenessMs.push(Math.max(0, now - at));
+      if (method === "Input.dispatchKeyEvent") {
+        if (p.type === "keyDown" || p.type === "rawKeyDown") held.set(keyId(p), p);
+      } else if (method === "Input.imeSetComposition" && p.text.length > 0) composing = true;
+      await send(method, p);
+      if (failed) throw new Error("Paced native input failed; remaining steps cancelled.");
+      if (sequential) nextAt = performance.now() + timing[i];
+    }
+    if (sequential) await waitUntil(nextAt);
+    await Promise.all(pending);
+    await checkTarget();
+    if (failed) throw new Error("Paced native input failed; remaining steps cancelled.");
+    held.clear();
+    composing = false;
+    return { startAt, ...sequential ? { delaysMs } : { scheduleMs }, dispatchedAtMs, latenessMs };
+  } finally {
+    await Promise.all(pending);
+    if (!navigated && ownsTarget()) {
+      const tab = await chrome.tabs.get(tabId).catch(() => null);
+      if (tab && tab.url === initialUrl && !tab.pendingUrl && tab.status !== "loading") {
+        await Promise.allSettled([
+          ...[...held.values()].map(({ text, unmodifiedText, autoRepeat, ...p }) => sendDebuggerCommand({ tabId }, "Input.dispatchKeyEvent", { ...p, type: "keyUp" }, 5e3)),
+          ...composing ? [sendDebuggerCommand({ tabId }, "Input.imeSetComposition", { text: "", selectionStart: 0, selectionEnd: 0 }, 5e3)] : []
+        ]);
+      }
+    }
+    chrome.tabs.onUpdated.removeListener(onUpdated);
+    chrome.tabs.onRemoved.removeListener(onRemoved);
+  }
+}
 async function handleCdp(cmd, leaseKey, guard) {
   if (!cmd.cdpMethod) return { id: cmd.id, ok: false, error: "Missing cdpMethod" };
   if (!CDP_ALLOWLIST.has(cmd.cdpMethod)) {
@@ -4375,6 +4501,9 @@ async function handleCdp(cmd, leaseKey, guard) {
       return pageScopedResult(cmd.id, tabId, readWebSocketStats(tabId, leaseKey));
     }
     if (cmd.cdpMethod === "OpenCLI.dispatchInputBurst") {
+      if (params.scheduleMs !== void 0 || params.delaysMs !== void 0 || params.startAt !== void 0) {
+        return pageScopedResult(cmd.id, tabId, await dispatchPacedInput(tabId, leaseKey, params, guard));
+      }
       const { commands, busyMs = 0 } = params;
       const methods = /* @__PURE__ */ new Set(["Input.dispatchKeyEvent", "Input.imeSetComposition", "Input.insertText"]);
       if (!Number.isInteger(busyMs) || busyMs < 0 || busyMs > 1e3 || !Array.isArray(commands) || commands.length < 1 || commands.length > 256 || commands.some((step) => step?.cmd !== "cdp" || !methods.has(step.args?.method) || !CDP_ALLOWLIST.has(step.args.method) || !step.args.params || typeof step.args.params !== "object" || Array.isArray(step.args.params))) {
