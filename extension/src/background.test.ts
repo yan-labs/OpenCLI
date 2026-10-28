@@ -441,6 +441,27 @@ describe('background tab isolation', () => {
     expect(chrome.debugger.sendCommand).toHaveBeenCalledWith({ tabId: 1 }, method, {});
   });
 
+  it('allows CPU throttling only through the resolved tab and still denies browser management', async () => {
+    const { chrome } = createChromeMock();
+    chrome.debugger.sendCommand = vi.fn(async () => ({}));
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    mod.__test__.setDefaultWindowMode('background');
+    mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
+    for (const rate of [4, 1]) {
+      const result = await mod.__test__.handleCommand({ id: 'cpu', action: 'cdp', session: 'twitter', surface: 'adapter', cdpMethod: 'Emulation.setCPUThrottlingRate', cdpParams: { rate } });
+      expect(result.ok).toBe(true);
+      expect(chrome.debugger.sendCommand).toHaveBeenCalledWith({ tabId: 1 }, 'Emulation.setCPUThrottlingRate', { rate });
+    }
+    chrome.debugger.sendCommand.mockClear();
+    for (const method of ['Browser.close', 'Target.createTarget']) {
+      const result = await mod.__test__.handleCommand({ id: 'denied-cpu', action: 'cdp', session: 'twitter', surface: 'adapter', cdpMethod: method });
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain('not permitted');
+    }
+    expect(chrome.debugger.sendCommand).not.toHaveBeenCalled();
+  });
+
   it('queues the bounded input sequence before awaiting replies and rejects unsafe bursts', async () => {
     const { chrome } = createChromeMock();
     const pending = deferred<Record<string, unknown>>();

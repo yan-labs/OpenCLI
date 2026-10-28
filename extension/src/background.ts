@@ -4257,6 +4257,7 @@ const CDP_ALLOWLIST = new Set([
   'Performance.getMetrics',
   'Performance.disable',
   'Runtime.getHeapUsage',
+  'Emulation.setCPUThrottlingRate',
   // Page metrics & screenshots
   'Page.getLayoutMetrics',
   'Page.captureScreenshot',
