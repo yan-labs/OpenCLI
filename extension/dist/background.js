@@ -4391,7 +4391,19 @@ async function dispatchPacedInput(tabId, leaseKey, params, guard) {
       } else composing = false;
     }
   }
-  if (held.size || composing || textLength > 8192) throw invalid();
+  if (held.size || textLength > 8192) throw invalid();
+  if (composing) {
+    const tail = commands.slice(commands.map((step) => step.args.method).lastIndexOf("Input.imeSetComposition") + 1);
+    const key = (i, name, down, modifiers = 0) => {
+      const step = tail[i];
+      const p = step?.args.params;
+      return step?.args.method === "Input.dispatchKeyEvent" && p.key === name && (down ? ["keyDown", "rawKeyDown"].includes(p.type) : p.type === "keyUp") && (p.modifiers ?? 0) === modifiers && !p.text && !p.unmodifiedText && !p.autoRepeat;
+    };
+    const press = tail.length === 2 && ["Enter", "Backspace"].some((name) => key(0, name, true) && key(1, name, false));
+    const selectAll = tail.length === 4 && [["Meta", 4], ["Control", 2]].some(([name, mask]) => key(0, name, true, mask) && key(1, "a", true, mask) && key(2, "a", false, mask) && key(3, name, false));
+    if (!press && !selectAll) throw invalid();
+  }
+  composing = false;
   const lease = automationSessions.get(leaseKey);
   if (!lease?.owned || lease.preferredTabId !== tabId) throw new Error("Paced input requires the original owned lease target.");
   let navigated = false;

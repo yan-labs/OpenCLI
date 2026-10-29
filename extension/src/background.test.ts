@@ -576,6 +576,37 @@ describe('background tab isolation', () => {
     vi.useRealTimers();
   });
 
+  it('allows only balanced original IME interruptions and leaves observation/cancel to the caller', async () => {
+    const { chrome } = createChromeMock();
+    chrome.debugger.sendCommand = vi.fn(async () => ({}));
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    mod.__test__.setDefaultWindowMode('background');
+    mod.__test__.setSession(adapterKey('paced'), { windowId: 1, owned: true, preferredTabId: 1 });
+    const step = (method: string, params: object) => ({ cmd: 'cdp', args: { method, params } });
+    const prefix = step('Input.imeSetComposition', { text: 'ni', selectionStart: 2, selectionEnd: 2 });
+    const key = (type: string, key: string, modifiers = 0) => step('Input.dispatchKeyEvent', { type, key, modifiers });
+    const press = (name: string) => [key('rawKeyDown', name), key('keyUp', name)];
+    const select = (modifier: string, mask: number) => [key('rawKeyDown', modifier, mask), key('rawKeyDown', 'a', mask), key('keyUp', 'a', mask), key('keyUp', modifier)];
+    const run = (commands: unknown[]) => mod.__test__.handleCommand({ id: 'partial', action: 'cdp', session: 'paced', surface: 'adapter', cdpMethod: 'OpenCLI.dispatchInputBurst', cdpParams: { commands, delaysMs: commands.map(() => 0) } });
+    for (const suffix of [press('Enter'), press('Backspace'), select('Meta', 4), select('Control', 2)]) {
+      chrome.debugger.sendCommand.mockClear();
+      const result = await run([prefix, ...suffix]);
+      expect(result.ok).toBe(true);
+      const inputs = chrome.debugger.sendCommand.mock.calls.filter(([, method]) => method.startsWith('Input.'));
+      expect(inputs.map(([, method, params]) => ({ method, params }))).toEqual([prefix, ...suffix].map(s => s.args));
+      // No automatic cancellation or empty commit: the original caller first reads composing.
+      expect(inputs.some(([, method]) => method === 'Input.insertText')).toBe(false);
+    }
+    for (const suffix of [[], press('Escape'), press('a'), [key('rawKeyDown', 'Enter')], select('Meta', 2), [...press('Enter'), ...press('ArrowRight')]]) {
+      chrome.debugger.sendCommand.mockClear();
+      expect((await run([prefix, ...suffix])).ok).toBe(false);
+      expect(chrome.debugger.sendCommand).not.toHaveBeenCalled();
+    }
+    // Explicit conditional cancellation remains valid as its own bounded native sequence.
+    expect((await run([step('Input.imeSetComposition', { text: '', selectionStart: 0, selectionEnd: 0 }), step('Input.insertText', { text: '' })])).ok).toBe(true);
+  });
+
   it('reports real lateness and bounds slow sequential input without leaving scheduled work', async () => {
     const { chrome } = createChromeMock();
     let latency = 10;
