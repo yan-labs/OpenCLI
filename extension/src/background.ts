@@ -4364,6 +4364,7 @@ async function dispatchPacedInput(tabId: number, leaseKey: string, params: Recor
   };
   const onRemoved = (id: number) => { if (id === tabId) markNavigated('event-removed'); };
   let initialUrl: string | undefined;
+  let initialLoading = false;
   const ownsTarget = () => automationSessions.get(leaseKey) === lease && lease.owned && lease.preferredTabId === tabId;
   const check = () => {
     guard?.();
@@ -4373,13 +4374,14 @@ async function dispatchPacedInput(tabId: number, leaseKey: string, params: Recor
       throw new Error(`Paced input cancelled: lease or original page changed. [reason=${reason}]`);
     }
   };
-  const checkTarget = async () => {
+  const checkTarget = async (snapshot?: chrome.tabs.Tab) => {
     check();
-    const tab = await chrome.tabs.get(tabId);
+    const tab = snapshot ?? await chrome.tabs.get(tabId);
     if (tab.windowId !== lease.windowId) markNavigated('window');
-    else if (tab.url !== initialUrl) markNavigated('url');
+    else if (!initialUrl || tab.url !== initialUrl) markNavigated('url');
     else if (tab.pendingUrl) markNavigated('pending');
-    else if (tab.status === 'loading') markNavigated('loading');
+    else if (tab.status === 'loading' && !initialLoading) markNavigated('loading');
+    if (tab.status === 'complete') initialLoading = false;
     check();
   };
   const pending: Array<Promise<void>> = [];
@@ -4406,8 +4408,11 @@ async function dispatchPacedInput(tabId: number, leaseKey: string, params: Recor
   chrome.tabs.onUpdated.addListener(onUpdated);
   chrome.tabs.onRemoved.addListener(onRemoved);
   try {
-    initialUrl = (await chrome.tabs.get(tabId)).url;
-    await checkTarget();
+    const initialTab = await chrome.tabs.get(tabId);
+    initialUrl = initialTab.url;
+    // A committed document may still load resources; pendingUrl and subsequent events guard navigation.
+    initialLoading = initialTab.status === 'loading';
+    await checkTarget(initialTab);
     // open already attaches this owned target; fail closed if detached, never reattach mid-sequence.
     let nextAt = performance.now();
     for (let i = 0; i < commands.length; i++) {
@@ -4440,7 +4445,8 @@ async function dispatchPacedInput(tabId: number, leaseKey: string, params: Recor
     // Never release keys into a replacement document or another lease's target.
     if (!navigated && ownsTarget()) {
       const tab = await chrome.tabs.get(tabId).catch(() => null);
-      if (tab && tab.url === initialUrl && !tab.pendingUrl && tab.status !== 'loading') {
+      if (tab && initialUrl && tab.windowId === lease.windowId && tab.url === initialUrl && !tab.pendingUrl &&
+          (tab.status !== 'loading' || initialLoading)) {
         await Promise.allSettled([
           ...[...held.values()].map(({ text, unmodifiedText, autoRepeat, ...p }) =>
             executor.sendDebuggerCommand({ tabId }, 'Input.dispatchKeyEvent', { ...p, type: 'keyUp' }, 5000)),

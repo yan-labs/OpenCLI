@@ -785,6 +785,64 @@ describe('background tab isolation', () => {
     expect(chrome.tabs.onRemoved.removeListener).toHaveBeenCalledWith(chrome.tabs.onRemoved.addListener.mock.calls.at(-1)![0]);
   });
 
+  it.each(['loading', 'complete'])('accepts an already committed %s document without waiting for window load', async (status) => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    mod.__test__.setDefaultWindowMode('background');
+    mod.__test__.setSession(adapterKey('committed'), { windowId: 1, owned: true, preferredTabId: 1 });
+    const tab = await chrome.tabs.get(1);
+    tab.status = status;
+    const inputs: string[] = [];
+    chrome.debugger.sendCommand = vi.fn(async (_target, method, params) => {
+      if (method === 'Input.dispatchKeyEvent') inputs.push(params.type);
+      return {};
+    });
+    const commands = ['keyDown', 'keyUp'].map(type => ({ cmd: 'cdp', args: { method: 'Input.dispatchKeyEvent', params: { type, key: 'a' } } }));
+    const result = await mod.__test__.handleCommand({ id: 'committed', action: 'cdp', session: 'committed', surface: 'adapter', cdpMethod: 'OpenCLI.dispatchInputBurst', cdpParams: { commands, delaysMs: [0, 0] } });
+    expect(result.ok).toBe(true);
+    expect(inputs).toEqual(['keyDown', 'keyUp']);
+    expect(tab.status).toBe(status); // The fixture never rewrites Chrome's loading status.
+    expect(chrome.tabs.update).not.toHaveBeenCalled();
+    expect(chrome.debugger.sendCommand.mock.calls.every(([, method]) => method === 'Input.dispatchKeyEvent')).toBe(true);
+  });
+
+  it.each(['pending', 'empty-url', 'window', 'event-loading', 'event-url-loading', 'event-url', 'event-removed', 'lease', 'settled-then-loading', 'failure'])('keeps navigation and cleanup safe from an initially loading document: %s', async (reason) => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    mod.__test__.setDefaultWindowMode('background');
+    const session = adapterKey('loading');
+    mod.__test__.setSession(session, { windowId: 1, owned: true, preferredTabId: 1 });
+    const tab = await chrome.tabs.get(1);
+    tab.status = 'loading';
+    if (reason === 'pending') Object.assign(tab, { pendingUrl: tab.url }); // Same-URL reload before commit still targets the old document.
+    if (reason === 'empty-url') tab.url = '';
+    if (reason === 'window') tab.windowId = 2;
+    const inputs: string[] = [];
+    chrome.debugger.sendCommand = vi.fn(async (_target, method, params) => {
+      if (method !== 'Input.dispatchKeyEvent') return {};
+      inputs.push(params.type);
+      if (inputs.length === 1) {
+        if (reason === 'event-removed') chrome.tabs.onRemoved.addListener.mock.calls.at(-1)![0](1);
+        else if (reason.startsWith('event-')) chrome.tabs.onUpdated.addListener.mock.calls.at(-1)![0](1, {
+          ...(reason.includes('url') ? { url: tab.url } : {}), ...(reason.includes('loading') ? { status: 'loading' } : {}),
+        });
+        else if (reason === 'lease') mod.__test__.forgetSession(session);
+        else if (reason === 'settled-then-loading') tab.status = 'complete';
+        else if (reason === 'failure') throw new Error('native failed');
+      } else if (reason === 'settled-then-loading') tab.status = 'loading';
+      return {};
+    });
+    const commands = ['keyDown', 'keyUp', 'keyDown', 'keyUp'].map(type => ({ cmd: 'cdp', args: { method: 'Input.dispatchKeyEvent', params: { type, key: 'a' } } }));
+    const result = await mod.__test__.handleCommand({ id: 'loading', action: 'cdp', session: 'loading', surface: 'adapter', cdpMethod: 'OpenCLI.dispatchInputBurst', cdpParams: { commands, delaysMs: [0, 0, 0, 0] } });
+    expect(result.ok).toBe(false);
+    expect(inputs).toEqual(['pending', 'empty-url', 'window'].includes(reason) ? [] : ['failure', 'settled-then-loading'].includes(reason) ? ['keyDown', 'keyUp'] : ['keyDown']);
+    expect(chrome.tabs.onUpdated.removeListener).toHaveBeenCalledWith(chrome.tabs.onUpdated.addListener.mock.calls.at(-1)![0]);
+    expect(chrome.tabs.onRemoved.removeListener).toHaveBeenCalledWith(chrome.tabs.onRemoved.addListener.mock.calls.at(-1)![0]);
+    expect(chrome.tabs.update).not.toHaveBeenCalled();
+  });
+
   it('ignores unrelated events during stable native paced input', async () => {
     const { chrome } = createChromeMock();
     vi.stubGlobal('chrome', chrome);

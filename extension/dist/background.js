@@ -4422,6 +4422,7 @@ async function dispatchPacedInput(tabId, leaseKey, params, guard) {
     if (id === tabId) markNavigated("event-removed");
   };
   let initialUrl;
+  let initialLoading = false;
   const ownsTarget = () => automationSessions.get(leaseKey) === lease && lease.owned && lease.preferredTabId === tabId;
   const check = () => {
     guard?.();
@@ -4431,13 +4432,14 @@ async function dispatchPacedInput(tabId, leaseKey, params, guard) {
       throw new Error(`Paced input cancelled: lease or original page changed. [reason=${reason}]`);
     }
   };
-  const checkTarget = async () => {
+  const checkTarget = async (snapshot) => {
     check();
-    const tab = await chrome.tabs.get(tabId);
+    const tab = snapshot ?? await chrome.tabs.get(tabId);
     if (tab.windowId !== lease.windowId) markNavigated("window");
-    else if (tab.url !== initialUrl) markNavigated("url");
+    else if (!initialUrl || tab.url !== initialUrl) markNavigated("url");
     else if (tab.pendingUrl) markNavigated("pending");
-    else if (tab.status === "loading") markNavigated("loading");
+    else if (tab.status === "loading" && !initialLoading) markNavigated("loading");
+    if (tab.status === "complete") initialLoading = false;
     check();
   };
   const pending = [];
@@ -4466,8 +4468,10 @@ async function dispatchPacedInput(tabId, leaseKey, params, guard) {
   chrome.tabs.onUpdated.addListener(onUpdated);
   chrome.tabs.onRemoved.addListener(onRemoved);
   try {
-    initialUrl = (await chrome.tabs.get(tabId)).url;
-    await checkTarget();
+    const initialTab = await chrome.tabs.get(tabId);
+    initialUrl = initialTab.url;
+    initialLoading = initialTab.status === "loading";
+    await checkTarget(initialTab);
     let nextAt = performance.now();
     for (let i = 0; i < commands.length; i++) {
       const at = sequential ? nextAt : base + timing[i];
@@ -4496,7 +4500,7 @@ async function dispatchPacedInput(tabId, leaseKey, params, guard) {
     await Promise.all(pending);
     if (!navigated && ownsTarget()) {
       const tab = await chrome.tabs.get(tabId).catch(() => null);
-      if (tab && tab.url === initialUrl && !tab.pendingUrl && tab.status !== "loading") {
+      if (tab && initialUrl && tab.windowId === lease.windowId && tab.url === initialUrl && !tab.pendingUrl && (tab.status !== "loading" || initialLoading)) {
         await Promise.allSettled([
           ...[...held.values()].map(({ text, unmodifiedText, autoRepeat, ...p }) => sendDebuggerCommand({ tabId }, "Input.dispatchKeyEvent", { ...p, type: "keyUp" }, 5e3)),
           ...composing ? [sendDebuggerCommand({ tabId }, "Input.imeSetComposition", { text: "", selectionStart: 0, selectionEnd: 0 }, 5e3)] : []
