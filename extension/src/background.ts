@@ -4351,20 +4351,35 @@ async function dispatchPacedInput(tabId: number, leaseKey: string, params: Recor
   const lease = automationSessions.get(leaseKey);
   if (!lease?.owned || lease.preferredTabId !== tabId) throw new Error('Paced input requires the original owned lease target.');
   let navigated = false;
-  const onUpdated = (id: number, info: chrome.tabs.TabChangeInfo) => {
-    if (id === tabId && (info.url !== undefined || info.status === 'loading')) navigated = true;
+  let navigationReason: 'event-url' | 'event-loading' | 'event-url-loading' | 'event-removed' | 'window' | 'url' | 'pending' | 'loading' | undefined;
+  const markNavigated = (reason: NonNullable<typeof navigationReason>) => {
+    navigated = true;
+    // Keep the actual first trigger, even if the tab has settled by the next check.
+    navigationReason ??= reason;
   };
-  const onRemoved = (id: number) => { if (id === tabId) navigated = true; };
+  const onUpdated = (id: number, info: chrome.tabs.TabChangeInfo) => {
+    if (id === tabId && (info.url !== undefined || info.status === 'loading')) {
+      markNavigated(info.url !== undefined ? (info.status === 'loading' ? 'event-url-loading' : 'event-url') : 'event-loading');
+    }
+  };
+  const onRemoved = (id: number) => { if (id === tabId) markNavigated('event-removed'); };
   let initialUrl: string | undefined;
   const ownsTarget = () => automationSessions.get(leaseKey) === lease && lease.owned && lease.preferredTabId === tabId;
   const check = () => {
     guard?.();
-    if (navigated || !ownsTarget()) throw new Error('Paced input cancelled: lease or original page changed.');
+    if (navigated || !ownsTarget()) {
+      const currentLease = automationSessions.get(leaseKey);
+      const reason = navigationReason ?? (!currentLease ? 'lease-missing' : currentLease !== lease ? 'lease-replaced' : !lease.owned ? 'lease-unowned' : 'tab');
+      throw new Error(`Paced input cancelled: lease or original page changed. [reason=${reason}]`);
+    }
   };
   const checkTarget = async () => {
     check();
     const tab = await chrome.tabs.get(tabId);
-    if (tab.windowId !== lease.windowId || tab.url !== initialUrl || tab.pendingUrl || tab.status === 'loading') navigated = true;
+    if (tab.windowId !== lease.windowId) markNavigated('window');
+    else if (tab.url !== initialUrl) markNavigated('url');
+    else if (tab.pendingUrl) markNavigated('pending');
+    else if (tab.status === 'loading') markNavigated('loading');
     check();
   };
   const pending: Array<Promise<void>> = [];

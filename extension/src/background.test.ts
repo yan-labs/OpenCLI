@@ -734,6 +734,80 @@ describe('background tab isolation', () => {
     expect(chrome.debugger.sendCommand).not.toHaveBeenCalled();
   });
 
+  it.each([
+    'event-url', 'event-loading', 'event-url-loading', 'event-removed',
+    'window', 'url', 'pending', 'loading',
+    'lease-missing', 'lease-replaced', 'lease-unowned', 'tab',
+  ])('reports the exact safe paced cancellation reason: %s', async (reason) => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    mod.__test__.setDefaultWindowMode('background');
+    const session = adapterKey('diagnostic');
+    mod.__test__.setSession(session, { windowId: 1, owned: true, preferredTabId: 1 });
+    const lease = mod.__test__.getSession(session)!;
+    const canary = crypto.randomUUID();
+    const tab = await chrome.tabs.get(1);
+    tab.url = `https://fixture.invalid/${canary}?token=${canary}`;
+    tab.title = canary;
+    const inputs: string[] = [];
+    chrome.debugger.sendCommand = vi.fn(async (_target, method, params) => {
+      if (method !== 'Input.dispatchKeyEvent') return {};
+      inputs.push(params.type);
+      if (inputs.length === 1) {
+        const updated = chrome.tabs.onUpdated.addListener.mock.calls.at(-1)![0];
+        if (reason.startsWith('event-')) {
+          if (reason === 'event-removed') chrome.tabs.onRemoved.addListener.mock.calls.at(-1)![0](1);
+          else updated(1, { ...(reason.includes('url') ? { url: tab.url } : {}), ...(reason.includes('loading') ? { status: 'loading' } : {}) });
+          // Later snapshots/events must not overwrite the actual first event category.
+          updated(1, { status: 'loading' });
+          updated(1, { status: 'complete' });
+        } else if (reason === 'window') tab.windowId = 2;
+        else if (reason === 'url') tab.url += '/changed';
+        else if (reason === 'pending') Object.assign(tab, { pendingUrl: `https://fixture.invalid/${canary}` });
+        else if (reason === 'loading') tab.status = 'loading';
+        else if (reason === 'lease-missing') mod.__test__.forgetSession(session);
+        else if (reason === 'lease-replaced') mod.__test__.setSession(session, { windowId: 1, owned: true, preferredTabId: 1 });
+        else if (reason === 'lease-unowned') lease.owned = false;
+        else lease.preferredTabId = 2;
+      }
+      return {};
+    });
+    const commands = ['keyDown', 'keyUp'].map(type => ({ cmd: 'cdp', args: { method: 'Input.dispatchKeyEvent', params: { type, key: 'a', ...(type === 'keyDown' ? { text: canary } : {}) } } }));
+    const result = await mod.__test__.handleCommand({ id: 'diagnostic', action: 'cdp', session: 'diagnostic', surface: 'adapter', cdpMethod: 'OpenCLI.dispatchInputBurst', cdpParams: { commands, delaysMs: [0, 0] } });
+    expect(result).toEqual({ id: 'diagnostic', ok: false, error: `Paced input cancelled: lease or original page changed. [reason=${reason}]` });
+    // The original extension receipt has no errorCode; the runner category stays compatible.
+    expect(result.errorCode).toBeUndefined();
+    expect(result.error).toMatch(/Paced input cancelled|lease or original page changed|original owned lease target/i);
+    expect(JSON.stringify(result)).not.toContain(canary);
+    expect(inputs).toEqual(['keyDown']);
+    expect(chrome.tabs.onUpdated.removeListener).toHaveBeenCalledWith(chrome.tabs.onUpdated.addListener.mock.calls.at(-1)![0]);
+    expect(chrome.tabs.onRemoved.removeListener).toHaveBeenCalledWith(chrome.tabs.onRemoved.addListener.mock.calls.at(-1)![0]);
+  });
+
+  it('ignores unrelated events during stable native paced input', async () => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    mod.__test__.setDefaultWindowMode('background');
+    mod.__test__.setSession(adapterKey('stable'), { windowId: 1, owned: true, preferredTabId: 1 });
+    const sent: string[] = [];
+    chrome.debugger.sendCommand = vi.fn(async (_target, method, params) => {
+      if (method !== 'Input.dispatchKeyEvent') return {};
+      sent.push(params.type);
+      const updated = chrome.tabs.onUpdated.addListener.mock.calls.at(-1)![0];
+      updated(2, { url: 'https://foreign.invalid', status: 'loading' });
+      chrome.tabs.onRemoved.addListener.mock.calls.at(-1)![0](2);
+      updated(1, { title: 'changed', status: 'complete' });
+      return {};
+    });
+    const commands = ['keyDown', 'keyUp'].map(type => ({ cmd: 'cdp', args: { method: 'Input.dispatchKeyEvent', params: { type, key: 'a' } } }));
+    const result = await mod.__test__.handleCommand({ id: 'stable', action: 'cdp', session: 'stable', surface: 'adapter', cdpMethod: 'OpenCLI.dispatchInputBurst', cdpParams: { commands, delaysMs: [0, 0] } });
+    expect(result.ok).toBe(true);
+    expect(sent).toEqual(['keyDown', 'keyUp']);
+    expect(result.error).toBeUndefined();
+  });
+
   it('keeps unrelated CDP methods denied', async () => {
     const { chrome } = createChromeMock();
     vi.stubGlobal('chrome', chrome);

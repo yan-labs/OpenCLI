@@ -4408,22 +4408,36 @@ async function dispatchPacedInput(tabId, leaseKey, params, guard) {
   const lease = automationSessions.get(leaseKey);
   if (!lease?.owned || lease.preferredTabId !== tabId) throw new Error("Paced input requires the original owned lease target.");
   let navigated = false;
+  let navigationReason;
+  const markNavigated = (reason) => {
+    navigated = true;
+    navigationReason ??= reason;
+  };
   const onUpdated = (id, info) => {
-    if (id === tabId && (info.url !== void 0 || info.status === "loading")) navigated = true;
+    if (id === tabId && (info.url !== void 0 || info.status === "loading")) {
+      markNavigated(info.url !== void 0 ? info.status === "loading" ? "event-url-loading" : "event-url" : "event-loading");
+    }
   };
   const onRemoved = (id) => {
-    if (id === tabId) navigated = true;
+    if (id === tabId) markNavigated("event-removed");
   };
   let initialUrl;
   const ownsTarget = () => automationSessions.get(leaseKey) === lease && lease.owned && lease.preferredTabId === tabId;
   const check = () => {
     guard?.();
-    if (navigated || !ownsTarget()) throw new Error("Paced input cancelled: lease or original page changed.");
+    if (navigated || !ownsTarget()) {
+      const currentLease = automationSessions.get(leaseKey);
+      const reason = navigationReason ?? (!currentLease ? "lease-missing" : currentLease !== lease ? "lease-replaced" : !lease.owned ? "lease-unowned" : "tab");
+      throw new Error(`Paced input cancelled: lease or original page changed. [reason=${reason}]`);
+    }
   };
   const checkTarget = async () => {
     check();
     const tab = await chrome.tabs.get(tabId);
-    if (tab.windowId !== lease.windowId || tab.url !== initialUrl || tab.pendingUrl || tab.status === "loading") navigated = true;
+    if (tab.windowId !== lease.windowId) markNavigated("window");
+    else if (tab.url !== initialUrl) markNavigated("url");
+    else if (tab.pendingUrl) markNavigated("pending");
+    else if (tab.status === "loading") markNavigated("loading");
     check();
   };
   const pending = [];
