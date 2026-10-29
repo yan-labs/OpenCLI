@@ -4095,6 +4095,46 @@ describe('dedicated automation window', () => {
     mod.__test__.applyDedicatedCommandFields(key, { id: 'x', action: 'exec', windowMode: 'dedicated', ...fields });
   };
 
+  it('times only opted-in mouse stages without exposing parameters or changing native order', async () => {
+    vi.doUnmock('./cdp');
+    const h = dedicatedHarness();
+    vi.stubGlobal('chrome', h.chrome);
+    const mod = await import('./background');
+    const key = browserKey('timing-test');
+    useDedicated(mod, key);
+    const tabId = await mod.__test__.resolveTabId(undefined, key, 'https://fixture.invalid/');
+    const messages: string[] = [];
+    const log = vi.spyOn(console, 'log').mockImplementation((...args) => { messages.push(args.join(' ')); });
+    const pending = deferred<unknown>();
+    h.chrome.debugger.sendCommand = vi.fn((_target: unknown, method: string) =>
+      method === 'Input.dispatchMouseEvent' ? pending.promise : Promise.resolve({}));
+    let settled = false;
+    const run = mod.__test__.handleCommand({ id: 'secret-id', action: 'cdp', session: 'timing-test',
+      surface: 'browser', windowMode: 'dedicated', cdpMethod: 'Input.dispatchMouseEvent',
+      cdpParams: { type: 'mouseMoved', x: 13, y: 27, opencliMouseTiming: true, secret: 'canary-secret' } })
+      .then(result => { settled = true; return result; });
+    await vi.waitFor(() => expect(h.chrome.debugger.sendCommand).toHaveBeenCalledWith(
+      { tabId }, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: 13, y: 27, secret: 'canary-secret' }));
+    expect(settled).toBe(false);
+    expect(messages.at(-1)).toBe('[opencli-mouse-timing] cdp start 0.000');
+    expect(h.chrome.debugger.sendCommand).toHaveBeenLastCalledWith({ tabId }, 'Input.dispatchMouseEvent',
+      { type: 'mouseMoved', x: 13, y: 27, secret: 'canary-secret' });
+    pending.resolve({});
+    expect((await run).ok).toBe(true);
+    for (const stage of ['window', 'target', 'attach', 'cdp', 'identity']) {
+      expect(messages.filter(m => m.startsWith(`[opencli-mouse-timing] ${stage} start `))).toHaveLength(1);
+      expect(messages.filter(m => m.startsWith(`[opencli-mouse-timing] ${stage} end `))).toHaveLength(1);
+    }
+    expect(messages.some(m => m.startsWith('[opencli-mouse-timing] guard end '))).toBe(true);
+    expect(messages.every(m => /^\[opencli-mouse-timing\] (window|target|guard|attach|cdp|identity) (start|end) \d+\.\d{3}$/.test(m))).toBe(true);
+    messages.length = 0;
+    expect((await mod.__test__.handleCommand({ id: 'ordinary', action: 'cdp', session: 'timing-test',
+      surface: 'browser', windowMode: 'dedicated', cdpMethod: 'Input.dispatchMouseEvent',
+      cdpParams: { type: 'mouseMoved', x: 1, y: 2 } })).ok).toBe(true);
+    expect(messages).toEqual([]);
+    log.mockRestore();
+  });
+
   it('creates its own window unfocused at the requested bounds and never touches the person\'s window', async () => {
     const h = dedicatedHarness();
     vi.stubGlobal('chrome', h.chrome);

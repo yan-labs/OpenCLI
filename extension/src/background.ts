@@ -3353,9 +3353,34 @@ async function fetchDaemonVersion(): Promise<string | null> {
 
 // ─── Command dispatcher ─────────────────────────────────────────────
 
+type MouseTimingStage = 'window' | 'target' | 'guard' | 'attach' | 'cdp' | 'identity';
+function mouseTiming(cmd: Command): boolean {
+  return cmd.action === 'cdp' && cmd.cdpMethod === 'Input.dispatchMouseEvent'
+    && cmd.cdpParams?.opencliMouseTiming === true;
+}
+function mouseTimingLog(stage: MouseTimingStage, state: 'start' | 'end', elapsedMs: number): void {
+  console.log(`[opencli-mouse-timing] ${stage} ${state} ${Math.max(0, elapsedMs).toFixed(3)}`);
+}
+function timedMouseStage<T>(enabled: boolean, stage: MouseTimingStage, run: () => Promise<T>): Promise<T> {
+  if (!enabled) return run();
+  const started = performance.now();
+  mouseTimingLog(stage, 'start', 0);
+  try {
+    const result = run();
+    void result.then(
+      () => mouseTimingLog(stage, 'end', performance.now() - started),
+      () => mouseTimingLog(stage, 'end', performance.now() - started),
+    );
+    return result;
+  } catch (err) {
+    mouseTimingLog(stage, 'end', performance.now() - started);
+    throw err;
+  }
+}
+
 async function handleCommand(cmd: Command): Promise<Result> {
   // Reconcile before acquiring/using any window. Relayout must capture its own before snapshot.
-  if (cmd.action !== 'sessions') await reconcileDedicatedWindows();
+  if (cmd.action !== 'sessions') await timedMouseStage(mouseTiming(cmd), 'window', () => reconcileDedicatedWindows());
   // Session-independent actions — handle before session resolution.
   if (cmd.action === 'sessions') return handleSessions(cmd);
 
@@ -3384,8 +3409,14 @@ async function handleCommand(cmd: Command): Promise<Result> {
   activeCommands.set(leaseKey, commands);
   resetWindowIdleTimer(leaseKey);
   const guard: CommandGuard = () => {
-    if (inflight.invalidated) {
-      throw new CommandFailure('command_reclaimed', 'Command was invalidated when its session lease was reclaimed.');
+    const timing = mouseTiming(cmd);
+    const started = timing ? performance.now() : 0;
+    try {
+      if (inflight.invalidated) {
+        throw new CommandFailure('command_reclaimed', 'Command was invalidated when its session lease was reclaimed.');
+      }
+    } finally {
+      if (timing) mouseTimingLog('guard', 'end', performance.now() - started);
     }
   };
   try {
@@ -4464,8 +4495,11 @@ async function handleCdp(cmd: Command, leaseKey: string, guard?: CommandGuard): 
   if (!CDP_ALLOWLIST.has(cmd.cdpMethod)) {
     return { id: cmd.id, ok: false, error: `CDP method not permitted: ${cmd.cdpMethod}` };
   }
-  const cmdTabId = await resolveCommandTabId(cmd);
-  const tabId = await resolveTabId(cmdTabId, leaseKey, undefined, guard);
+  const timing = mouseTiming(cmd);
+  const tabId = await timedMouseStage(timing, 'target', async () => {
+    const cmdTabId = await resolveCommandTabId(cmd);
+    return resolveTabId(cmdTabId, leaseKey, undefined, guard);
+  });
   try {
     const aggressive = getSurfaceFromKey(leaseKey) === 'browser';
     const params = cmd.cdpParams ?? {};
@@ -4517,27 +4551,28 @@ async function handleCdp(cmd: Command, leaseKey: string, guard?: CommandGuard): 
       if (failure?.status === 'rejected') throw failure.reason;
       return pageScopedResult(cmd.id, tabId, results.map(result => result.status === 'fulfilled' ? result.value ?? null : null));
     }
-    await executor.ensureAttached(tabId, aggressive);
+    await timedMouseStage(timing, 'attach', () => executor.ensureAttached(tabId, aggressive));
     const routeFrameId = typeof params.frameId === 'string' && params.sessionId === 'target'
       ? params.frameId
       : undefined;
     const routeTargetUrl = typeof params.targetUrl === 'string' ? params.targetUrl : undefined;
-    const data = routeFrameId
-      ? await executor.sendCommandInFrameTarget(tabId, routeFrameId, cmd.cdpMethod, stripOpenCliFrameRoutingParams(params, true), aggressive, commandCdpTimeoutMs(cmd) ?? 30_000, routeTargetUrl)
-      : await executor.sendDebuggerCommand(
+    const data = await timedMouseStage(timing, 'cdp', () => routeFrameId
+      ? executor.sendCommandInFrameTarget(tabId, routeFrameId, cmd.cdpMethod!, stripOpenCliFrameRoutingParams(params, true, timing), aggressive, commandCdpTimeoutMs(cmd) ?? 30_000, routeTargetUrl)
+      : executor.sendDebuggerCommand(
         { tabId },
-        cmd.cdpMethod,
-        stripOpenCliFrameRoutingParams(params, false),
+        cmd.cdpMethod!,
+        stripOpenCliFrameRoutingParams(params, false, timing),
         commandCdpTimeoutMs(cmd),
-      );
-    return pageScopedResult(cmd.id, tabId, data);
+      ));
+    return timedMouseStage(timing, 'identity', () => pageScopedResult(cmd.id, tabId, data));
   } catch (err) {
     return errorResult(cmd.id, err);
   }
 }
 
-function stripOpenCliFrameRoutingParams(params: Record<string, unknown>, stripFrameId: boolean): Record<string, unknown> {
+function stripOpenCliFrameRoutingParams(params: Record<string, unknown>, stripFrameId: boolean, timing = false): Record<string, unknown> {
   const { sessionId, frameId, targetUrl, ...rest } = params;
+  if (timing) delete rest.opencliMouseTiming;
   if (!stripFrameId && frameId !== undefined) return { ...rest, frameId };
   return rest;
 }
