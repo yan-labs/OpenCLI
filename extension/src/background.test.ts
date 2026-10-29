@@ -460,6 +460,44 @@ describe('background tab isolation', () => {
     expect((await run('OpenCLI.subscribeEvents')).ok).toBe(false);
   });
 
+  it('limits media emulation to one native color scheme or an empty reset on the resolved tab', async () => {
+    const { chrome } = createChromeMock();
+    chrome.debugger.sendCommand = vi.fn(async () => ({}));
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    mod.__test__.setDefaultWindowMode('background');
+    mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
+    const run = (cdpParams: any) => mod.__test__.handleCommand({ id: 'media', action: 'cdp', session: 'twitter', surface: 'adapter', cdpMethod: 'Emulation.setEmulatedMedia', cdpParams });
+    for (const params of [
+      { features: [{ name: 'prefers-color-scheme', value: 'dark' }] },
+      { features: [{ name: 'prefers-color-scheme', value: 'light' }] },
+      { features: [] },
+    ]) {
+      expect((await run(params)).ok).toBe(true);
+      expect(chrome.debugger.sendCommand).toHaveBeenLastCalledWith({ tabId: 1 }, 'Emulation.setEmulatedMedia', params);
+    }
+    chrome.debugger.sendCommand.mockClear();
+    for (const params of [
+      undefined, null, {}, [], 'dark', { features: null }, { features: {} },
+      { features: [], media: '' }, { features: [], media: 'print' }, { features: [], extra: true },
+      { features: [null] }, { features: ['dark'] }, { features: [{}] },
+      { features: [{ name: 'prefers-reduced-motion', value: 'reduce' }] },
+      { features: [{ name: 'prefers-color-scheme', value: 'no-preference' }] },
+      { features: [{ name: 'prefers-color-scheme', value: 'DARK' }] },
+      { features: [{ name: 'prefers-color-scheme', value: 1 }] },
+      { features: [{ name: 'prefers-color-scheme', value: 'dark', extra: true }] },
+      { features: Array(2).fill({ name: 'prefers-color-scheme', value: 'dark' }) },
+    ]) {
+      const result = await run(params);
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain('Invalid media emulation');
+    }
+    for (const cdpMethod of ['Browser.close', 'Target.createTarget', 'Emulation.setEmulatedVisionDeficiency']) {
+      expect((await mod.__test__.handleCommand({ id: 'media-denied', action: 'cdp', session: 'twitter', surface: 'adapter', cdpMethod, cdpParams: {} })).ok).toBe(false);
+    }
+    expect(chrome.debugger.sendCommand).not.toHaveBeenCalled();
+  });
+
   it('allows CPU throttling only through the resolved tab and still denies browser management', async () => {
     const { chrome } = createChromeMock();
     chrome.debugger.sendCommand = vi.fn(async () => ({}));

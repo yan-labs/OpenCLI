@@ -4337,6 +4337,7 @@ const CDP_ALLOWLIST = /* @__PURE__ */ new Set([
   "Performance.disable",
   "Runtime.getHeapUsage",
   "Emulation.setCPUThrottlingRate",
+  "Emulation.setEmulatedMedia",
   // Page metrics & screenshots
   "Page.getLayoutMetrics",
   "Page.captureScreenshot",
@@ -4502,6 +4503,13 @@ async function handleCdp(cmd, leaseKey, guard) {
   try {
     const aggressive = getSurfaceFromKey(leaseKey) === "browser";
     const params = cmd.cdpParams ?? {};
+    if (cmd.cdpMethod === "Emulation.setEmulatedMedia") {
+      const features = params.features;
+      const feature = Array.isArray(features) ? features[0] : void 0;
+      if (typeof params !== "object" || Array.isArray(params) || Object.keys(params).some((key) => key !== "features") || !Array.isArray(features) || features.length > 1 || features.length === 1 && (!feature || typeof feature !== "object" || Array.isArray(feature) || Object.keys(feature).some((key) => !["name", "value"].includes(key)) || feature.name !== "prefers-color-scheme" || !["light", "dark"].includes(feature.value))) {
+        throw new Error("Invalid media emulation: only prefers-color-scheme light/dark or empty features reset permitted.");
+      }
+    }
     if (["OpenCLI.startWebSocketStats", "OpenCLI.readWebSocketStats", "OpenCLI.stopWebSocketStats"].includes(cmd.cdpMethod)) {
       if (cmd.cdpMethod === "OpenCLI.startWebSocketStats") {
         await ensureAttached(tabId, aggressive);
