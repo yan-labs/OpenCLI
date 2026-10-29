@@ -68,8 +68,7 @@ const step = (type, x, y, button, buttons) => ({
 });
 
 async function main() {
-  if (process.argv.slice(2).some(arg => arg !== '--drag') || process.argv.slice(2).length > 1) throw new Error('usage');
-  const drag = process.argv.includes('--drag');
+  if (process.argv.length !== 2) throw new Error('usage');
   const session = `mouse-timing-${randomBytes(8).toString('hex')}`;
   const cli = '/Users/kcsx/.nvm/versions/node/v26.12.1/bin/opencli';
   const server = createServer((_req, res) => {
@@ -77,13 +76,21 @@ async function main() {
     res.end('<!doctype html><title>Mouse timing fixture</title><style>html,body{margin:0;width:100%;height:100%}</style>');
   });
   const output = { fixture: 'local-owned', runs: [], released: false };
-  let opened = false;
-  let unknown = false;
   if (!process.stdin.isTTY) {
     console.error('diagnostic requires a terminal for safe unknown-outcome cleanup');
     process.exitCode = 1;
     return;
   }
+  const input = createInterface({ input: process.stdin, output: process.stderr });
+  const question = prompt => new Promise(resolve => {
+    if (input.closed) return resolve('');
+    const closed = () => resolve('');
+    input.once('close', closed);
+    input.question(prompt, answer => { input.removeListener('close', closed); resolve(answer); });
+  });
+  let opened = false;
+  let unknown = false;
+  let serverListening = false;
   async function browser(...args) {
     return exec(cli, ['browser', session, '--window', 'dedicated', ...args], { maxBuffer: 2 * 1024 * 1024 });
   }
@@ -127,20 +134,25 @@ async function main() {
   }
   try {
     await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+    serverListening = true;
     // An unsuccessful open can also have an unknown outcome: do not close blindly.
     unknown = true;
     await browser('open', `http://127.0.0.1:${server.address().port}/`);
     opened = true;
     unknown = false;
     const first = await runBatch([step('mouseMoved', 30, 30, 'none', 0)], 1);
-    if (drag && first) {
-      await runBatch([
-        step('mousePressed', 30, 30, 'left', 1),
-        step('mouseMoved', 40, 40, 'left', 1),
-        step('mouseMoved', 50, 50, 'left', 1),
-        { cmd: 'wait', args: { seconds: 0.2 } },
-        step('mouseReleased', 50, 50, 'left', 0),
-      ], 4);
+    if (first) {
+      console.log(JSON.stringify({ state: 'first-returned', stages: output.runs.at(-1).stages }));
+      const answer = await question('If necessary, enter drag to send one pressed sequence; otherwise press Enter: ');
+      if (answer === 'drag') {
+        await runBatch([
+          step('mousePressed', 30, 30, 'left', 1),
+          step('mouseMoved', 40, 40, 'left', 1),
+          step('mouseMoved', 50, 50, 'left', 1),
+          { cmd: 'wait', args: { seconds: 0.2 } },
+          step('mouseReleased', 50, 50, 'left', 0),
+        ], 4);
+      }
     }
   } catch { output.error = unknown ? 'unknown-outcome' : 'setup-failed'; }
   finally {
@@ -158,12 +170,7 @@ async function main() {
       // Retain this owned target until the runner verifies pending=0 and explicitly
       // authorizes closing this same session; no input is ever resent.
       console.error('unknown-stop: verify pending=0, then enter close to release this owned fixture');
-      const input = createInterface({ input: process.stdin, output: process.stderr });
-      const answer = await new Promise(resolve => {
-        input.once('close', () => resolve(''));
-        input.question('> ', resolve);
-      });
-      input.close();
+      const answer = await question('> ');
       if (answer === 'close') {
         try {
           await browser('close');
@@ -174,16 +181,19 @@ async function main() {
         console.log(JSON.stringify({ state: 'unknown-cleanup', released: output.released }));
       }
       if (!output.released) console.error('cleanup-unconfirmed: owned fixture retained');
-      else {
+      else if (serverListening) {
         server.closeAllConnections();
         await new Promise(resolve => server.close(resolve));
       }
       process.exitCode = 1;
     } else {
-      server.closeAllConnections();
-      await new Promise(resolve => server.close(resolve));
+      if (serverListening) {
+        server.closeAllConnections();
+        await new Promise(resolve => server.close(resolve));
+      }
       if (output.error || !output.released || output.runs.some(r => r.state !== 'returned' || r.stages === null)) process.exitCode = 1;
     }
+    input.close();
   }
 }
 
