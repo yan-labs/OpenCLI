@@ -850,6 +850,26 @@ describe('cdp response body capture', () => {
     expect(entries[1].responsePreview).toBe('base64:AAEC');
   });
 
+  it('timestamps transaction completion and only successfully decoded JSON bodies', async () => {
+    const mock = createBodyCaptureMock({ onCommand: (_target, method, params) => method === 'Network.getResponseBody'
+      ? { body: params.requestId === 'valid' ? 'eyJvayI6dHJ1ZX0=' : 'not-json', base64Encoded: params.requestId === 'valid' }
+      : undefined });
+    vi.stubGlobal('chrome', mock.chrome);
+    const mod = await import('./cdp');
+    mod.registerListeners();
+    await mod.startNetworkCapture(1, '/api/records/transactions');
+    for (const requestId of ['valid', 'invalid']) {
+      const url = 'https://example.com/api/records/transactions-v2';
+      await mock.fire('Network.requestWillBeSent', { requestId, request: { url, method: 'POST' } });
+      await mock.fire('Network.loadingFinished', { requestId });
+    }
+    const entries = await mod.readNetworkCapture(1);
+    expect(entries[0].requestFinishedAt).toBeGreaterThanOrEqual(entries[0].timestamp);
+    expect(entries[0].responseJsonParsedAt).toBeGreaterThanOrEqual(entries[0].requestFinishedAt!);
+    expect(entries[1].requestFinishedAt).toBeGreaterThanOrEqual(entries[1].timestamp);
+    expect(entries[1].responseJsonParsedAt).toBeUndefined();
+  });
+
   it('flags a failed body fetch explicitly instead of reporting an empty body', async () => {
     const mock = createBodyCaptureMock({
       onCommand: (_target, method) => {

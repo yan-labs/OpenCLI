@@ -256,6 +256,8 @@ type NetworkCaptureEntry = {
   /** Human-readable reason the body is unavailable (CDP error, re-attach, budget, request failure). */
   responseBodyError?: string;
   timestamp: number;
+  requestFinishedAt?: number;
+  responseJsonParsedAt?: number;
 };
 
 type NetworkCaptureState = {
@@ -1470,6 +1472,15 @@ function captureResponseBody(
       entry.responsePreview = result.base64Encoded ? `base64:${stored}` : stored;
       entry.responseBodyFullSize = fullSize;
       entry.responseBodyTruncated = truncated;
+      if (!truncated && /\/api\/records\/transactions/.test(new URL(entry.url).pathname)) {
+        try {
+          const text = result.base64Encoded
+            ? new TextDecoder().decode(Uint8Array.from(atob(result.body), c => c.charCodeAt(0)))
+            : result.body;
+          JSON.parse(text);
+          entry.responseJsonParsedAt = Date.now();
+        } catch { /* The caller must treat an unavailable parse time as unknown. */ }
+      }
       delete entry.responseBodyUnavailable;
       delete entry.responseBodyError;
       if (counted) state.storedBodyChars += stored.length;
@@ -1714,6 +1725,7 @@ export function registerListeners(): void {
       if (!entry) return;
       // Fetch now, while Chrome still buffers the body. Failures are recorded
       // on the entry (responseBodyUnavailable/responseBodyError), not swallowed.
+      if (/\/api\/records\/transactions/.test(new URL(entry.url).pathname)) entry.requestFinishedAt = Date.now();
       await captureResponseBody(tabId, state, requestId, entry);
       return;
     }

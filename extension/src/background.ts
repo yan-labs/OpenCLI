@@ -4293,6 +4293,7 @@ const CDP_ALLOWLIST = new Set([
   'Runtime.getHeapUsage',
   'Emulation.setCPUThrottlingRate',
   'Emulation.setEmulatedMedia',
+  'Emulation.setFocusEmulationEnabled',
   // Page metrics & screenshots
   'Page.getLayoutMetrics',
   'Page.captureScreenshot',
@@ -4503,6 +4504,11 @@ async function handleCdp(cmd: Command, leaseKey: string, guard?: CommandGuard): 
   try {
     const aggressive = getSurfaceFromKey(leaseKey) === 'browser';
     const params = cmd.cdpParams ?? {};
+    if (cmd.cdpMethod === 'Emulation.setFocusEmulationEnabled' &&
+        (typeof params !== 'object' || Array.isArray(params) ||
+         Object.keys(params).length !== 1 || typeof params.enabled !== 'boolean')) {
+      throw new Error('Invalid focus emulation: enabled must be a boolean.');
+    }
     if (cmd.cdpMethod === 'Emulation.setEmulatedMedia') {
       const features = params.features;
       const feature = Array.isArray(features) ? features[0] : undefined;

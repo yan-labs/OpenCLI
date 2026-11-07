@@ -4,6 +4,27 @@ const DAEMON_WS_URL = `ws://${DAEMON_HOST}:${DAEMON_PORT}/ext`;
 const DAEMON_PING_URL = `http://${DAEMON_HOST}:${DAEMON_PORT}/ping`;
 
 const attached = /* @__PURE__ */ new Set();
+const viewports = /* @__PURE__ */ new Map();
+async function applyViewport(tabId, viewport) {
+  await sendDebuggerCommand({ tabId }, "Emulation.setDeviceMetricsOverride", {
+    ...viewport,
+    mobile: false,
+    deviceScaleFactor: 1
+  });
+}
+async function setViewport(tabId, viewport) {
+  if (viewport && (!Number.isSafeInteger(viewport.width) || viewport.width <= 0 || !Number.isSafeInteger(viewport.height) || viewport.height <= 0)) {
+    throw new Error("Viewport width and height must be positive safe integers");
+  }
+  await ensureAttached(tabId);
+  if (viewport) {
+    await applyViewport(tabId, viewport);
+    viewports.set(tabId, viewport);
+  } else {
+    await sendDebuggerCommand({ tabId }, "Emulation.clearDeviceMetricsOverride");
+    viewports.delete(tabId);
+  }
+}
 const webSocketStats = /* @__PURE__ */ new Map();
 async function startWebSocketStats(tabId, owner, params) {
   const { origin, pathPrefix } = params;
@@ -95,6 +116,26 @@ function recordWebSocketEvent(tabId, method, params) {
     state.sockets.delete(id);
   }
 }
+const consoleCaptures = /* @__PURE__ */ new Map();
+function readConsoleCapture(tabId) {
+  const capture = consoleCaptures.get(tabId);
+  return capture ? { ...capture, messages: [...capture.messages] } : { captureSupported: false, startedAt: null, messages: [] };
+}
+function recordConsoleEvent(tabId, method, params) {
+  const capture = consoleCaptures.get(tabId);
+  if (!capture) return;
+  let type;
+  let text;
+  if (method === "Runtime.consoleAPICalled") {
+    type = params?.type === "warn" ? "warning" : String(params?.type ?? "log");
+    text = (params?.args ?? []).map((arg) => arg.value !== void 0 ? typeof arg.value === "string" ? arg.value : JSON.stringify(arg.value) : String(arg.description ?? arg.unserializableValue ?? arg.type ?? "")).join(" ");
+  } else if (method === "Runtime.exceptionThrown") {
+    type = "error";
+    text = String(params?.exceptionDetails?.exception?.description ?? params?.exceptionDetails?.text ?? "Uncaught exception");
+  } else return;
+  capture.messages.push({ type, text: text.slice(0, 8192), timestamp: Number(params?.timestamp) || Date.now() });
+  if (capture.messages.length > 500) capture.messages.shift();
+}
 const tabFrameContexts = /* @__PURE__ */ new Map();
 const tabAllContexts = /* @__PURE__ */ new Map();
 const tabLiveSessionIds = /* @__PURE__ */ new Map();
@@ -151,7 +192,7 @@ async function sendDebuggerCommand(target, method, params, timeoutMs = CDP_COMMA
 }
 function isDebuggableUrl$1(url) {
   if (!url) return true;
-  return url.startsWith("http://") || url.startsWith("https://") || url === "about:blank" || url.startsWith("data:");
+  return url.startsWith("http://") || url.startsWith("https://") || (url === "about:blank" || url.startsWith("about:blank#")) || url.startsWith("data:");
 }
 async function ensureAttached(tabId, aggressiveRetry = false) {
   try {
@@ -224,10 +265,16 @@ async function ensureAttached(tabId, aggressiveRetry = false) {
     throw new Error(`attach failed: ${lastError}${hint}`);
   }
   attached.add(tabId);
+  const capture = { captureSupported: false, startedAt: Date.now(), messages: [] };
+  consoleCaptures.set(tabId, capture);
   try {
     await sendDebuggerCommand({ tabId }, "Runtime.enable");
+    capture.captureSupported = true;
   } catch {
+    capture.startedAt = null;
   }
+  const viewport = viewports.get(tabId);
+  if (viewport) await applyViewport(tabId, viewport);
   if (preservedNetworkCapture) {
     try {
       await sendDebuggerCommand({ tabId }, "Network.enable");
@@ -261,38 +308,39 @@ async function evaluate(tabId, expression, aggressiveRetry = false, timeoutMs = 
 const evaluateAsync = evaluate;
 async function screenshot(tabId, options = {}) {
   await ensureAttached(tabId);
+  const persistentViewport = viewports.get(tabId);
   const format = options.format ?? "png";
   const fullPage = options.fullPage === true;
   const overrideWidth = options.width && options.width > 0 ? Math.ceil(options.width) : void 0;
   const overrideHeight = !fullPage && options.height && options.height > 0 ? Math.ceil(options.height) : void 0;
   const needsOverride = fullPage || overrideWidth !== void 0 || overrideHeight !== void 0;
-  if (needsOverride) {
-    if (overrideWidth !== void 0 && fullPage) {
+  try {
+    if (needsOverride) {
+      if (overrideWidth !== void 0 && fullPage) {
+        await sendDebuggerCommand({ tabId }, "Emulation.setDeviceMetricsOverride", {
+          mobile: false,
+          width: overrideWidth,
+          height: 0,
+          deviceScaleFactor: 1
+        });
+      }
+      let finalWidth = overrideWidth ?? persistentViewport?.width ?? 0;
+      let finalHeight = overrideHeight ?? persistentViewport?.height ?? 0;
+      if (fullPage) {
+        const metrics = await sendDebuggerCommand({ tabId }, "Page.getLayoutMetrics");
+        const size = metrics.cssContentSize || metrics.contentSize;
+        if (size) {
+          if (finalWidth === 0) finalWidth = Math.ceil(size.width);
+          finalHeight = Math.ceil(size.height);
+        }
+      }
       await sendDebuggerCommand({ tabId }, "Emulation.setDeviceMetricsOverride", {
         mobile: false,
-        width: overrideWidth,
-        height: 0,
+        width: finalWidth,
+        height: finalHeight,
         deviceScaleFactor: 1
       });
     }
-    let finalWidth = overrideWidth ?? 0;
-    let finalHeight = overrideHeight ?? 0;
-    if (fullPage) {
-      const metrics = await sendDebuggerCommand({ tabId }, "Page.getLayoutMetrics");
-      const size = metrics.cssContentSize || metrics.contentSize;
-      if (size) {
-        if (finalWidth === 0) finalWidth = Math.ceil(size.width);
-        finalHeight = Math.ceil(size.height);
-      }
-    }
-    await sendDebuggerCommand({ tabId }, "Emulation.setDeviceMetricsOverride", {
-      mobile: false,
-      width: finalWidth,
-      height: finalHeight,
-      deviceScaleFactor: 1
-    });
-  }
-  try {
     const params = { format };
     if (format === "jpeg" && options.quality !== void 0) {
       params.quality = Math.max(0, Math.min(100, options.quality));
@@ -301,7 +349,8 @@ async function screenshot(tabId, options = {}) {
     return result.data;
   } finally {
     if (needsOverride) {
-      await sendDebuggerCommand({ tabId }, "Emulation.clearDeviceMetricsOverride").catch(() => {
+      if (persistentViewport) await applyViewport(tabId, persistentViewport);
+      else await sendDebuggerCommand({ tabId }, "Emulation.clearDeviceMetricsOverride").catch(() => {
       });
     }
   }
@@ -656,6 +705,7 @@ function registerFrameTracking() {
     const tabId = source.tabId;
     if (!tabId) return;
     const eventSessionId = source.sessionId;
+    recordConsoleEvent(tabId, method, params);
     if (method === "Runtime.executionContextCreated") {
       const context = params.context;
       if (context?.auxData?.frameId) {
@@ -738,6 +788,7 @@ function registerFrameTracking() {
     }
   });
   chrome.tabs.onRemoved.addListener((tabId) => {
+    consoleCaptures.delete(tabId);
     tabFrameContexts.delete(tabId);
     tabAllContexts.delete(tabId);
     tabIframeTargets.delete(tabId);
@@ -901,6 +952,14 @@ function captureResponseBody(tabId, state, requestId, entry) {
       entry.responsePreview = result.base64Encoded ? `base64:${stored}` : stored;
       entry.responseBodyFullSize = fullSize;
       entry.responseBodyTruncated = truncated;
+      if (!truncated && /\/api\/records\/transactions/.test(new URL(entry.url).pathname)) {
+        try {
+          const text = result.base64Encoded ? new TextDecoder().decode(Uint8Array.from(atob(result.body), (c) => c.charCodeAt(0))) : result.body;
+          JSON.parse(text);
+          entry.responseJsonParsedAt = Date.now();
+        } catch {
+        }
+      }
       delete entry.responseBodyUnavailable;
       delete entry.responseBodyError;
       if (counted) state.storedBodyChars += stored.length;
@@ -944,9 +1003,6 @@ async function readNetworkCapture(tabId) {
   state.generation += 1;
   return entries;
 }
-function hasActiveNetworkCapture(tabId) {
-  return networkCaptures.has(tabId);
-}
 function clearContextsForSession(tabId, sessionId) {
   const frameCtxs = tabFrameContexts.get(tabId);
   if (frameCtxs) {
@@ -987,6 +1043,7 @@ function clearFrameTargetsForTab(tabId) {
 }
 async function detach(tabId) {
   webSocketStats.delete(tabId);
+  consoleCaptures.delete(tabId);
   clearFrameTargetsForTab(tabId);
   if (!attached.has(tabId)) return;
   attached.delete(tabId);
@@ -1002,7 +1059,9 @@ async function detach(tabId) {
 }
 function registerListeners() {
   chrome.tabs.onRemoved.addListener((tabId) => {
+    viewports.delete(tabId);
     webSocketStats.delete(tabId);
+    consoleCaptures.delete(tabId);
     attached.delete(tabId);
     networkCaptures.delete(tabId);
     tabFrameContexts.delete(tabId);
@@ -1014,6 +1073,8 @@ function registerListeners() {
   chrome.debugger.onDetach.addListener((source) => {
     if (source.tabId) {
       webSocketStats.delete(source.tabId);
+      const capture = consoleCaptures.get(source.tabId);
+      if (capture) capture.captureSupported = false;
       attached.delete(source.tabId);
       networkCaptures.delete(source.tabId);
       tabFrameContexts.delete(source.tabId);
@@ -1090,6 +1151,7 @@ function registerListeners() {
       if (stateEntryIndex === void 0) return;
       const entry = state.entries[stateEntryIndex];
       if (!entry) return;
+      if (/\/api\/records\/transactions/.test(new URL(entry.url).pathname)) entry.requestFinishedAt = Date.now();
       await captureResponseBody(tabId, state, requestId, entry);
       return;
     }
@@ -1232,6 +1294,7 @@ async function executeWithJournal(cmd, execute) {
   }
 }
 
+const sessionViewports = /* @__PURE__ */ new Map();
 let ws = null;
 let reconnectTimer = null;
 let reconnectAttempts = 0;
@@ -3667,6 +3730,8 @@ async function handleCommand(cmd) {
         return await handleTabs(cmd, leaseKey, guard);
       case "cookies":
         return await handleCookies(cmd);
+      case "viewport":
+        return await handleViewport(cmd, leaseKey, guard);
       case "screenshot":
         return await handleScreenshot(cmd, leaseKey, guard);
       case "close-window":
@@ -3681,6 +3746,10 @@ async function handleCommand(cmd) {
         return await handleBind(cmd, leaseKey, guard);
       case "network-capture-start":
         return await handleNetworkCaptureStart(cmd, leaseKey, guard);
+      case "console-read": {
+        const tabId = await resolveTabId(await resolveCommandTabId(cmd), leaseKey, void 0, guard);
+        return pageScopedResult(cmd.id, tabId, readConsoleCapture(tabId));
+      }
       case "network-capture-read":
         return await handleNetworkCaptureRead(cmd, leaseKey, guard);
       case "wait-download":
@@ -3707,7 +3776,7 @@ const BLANK_PAGE = "about:blank";
 const DEFAULT_NAVIGATE_TIMEOUT_MS = 15e3;
 function isDebuggableUrl(url) {
   if (!url) return true;
-  return url.startsWith("http://") || url.startsWith("https://") || url === "about:blank" || url.startsWith("data:");
+  return url.startsWith("http://") || url.startsWith("https://") || (url === "about:blank" || url.startsWith("about:blank#")) || url.startsWith("data:");
 }
 function isSafeNavigationUrl(url) {
   return url.startsWith("http://") || url.startsWith("https://");
@@ -3804,6 +3873,12 @@ async function resolveCommandTabId(cmd) {
 async function resolveTab(tabId, leaseKey, initialUrl, guard) {
   const resolved = await resolveTabForLease(tabId, leaseKey, initialUrl, guard);
   guard?.();
+  const viewport = sessionViewports.get(leaseKey);
+  if (viewport) {
+    await setViewport(resolved.tabId, { width: viewport.width, height: viewport.height });
+    viewport.tabs.add(resolved.tabId);
+    guard?.();
+  }
   if (getWindowMode(leaseKey) !== "dedicated") return resolved;
   return applyDedicatedSessionPolicy(leaseKey, resolved, guard);
 }
@@ -4076,22 +4151,20 @@ function preferOwnedTab(leaseKey, tabId, guard) {
 }
 async function handleNavigate(cmd, leaseKey, guard) {
   if (!cmd.url) return { id: cmd.id, ok: false, error: "Missing url" };
-  if (!isSafeNavigationUrl(cmd.url)) {
+  if (cmd.url !== BLANK_PAGE && !isSafeNavigationUrl(cmd.url)) {
     return { id: cmd.id, ok: false, error: "Blocked URL scheme -- only http:// and https:// are allowed" };
   }
   const cmdTabId = await resolveCommandTabId(cmd);
-  const resolved = await resolveTab(cmdTabId, leaseKey, cmd.url, guard);
+  const resolved = await resolveTab(cmdTabId, leaseKey, BLANK_PAGE, guard);
   guard?.();
   const tabId = resolved.tabId;
   const beforeTab = resolved.tab ?? await chrome.tabs.get(tabId);
   const beforeNormalized = normalizeUrlForComparison(beforeTab.url);
   const targetUrl = cmd.url;
+  await ensureAttached(tabId);
   const alreadyAtTarget = isTargetUrl(beforeTab.url, targetUrl);
   if (alreadyAtTarget && beforeTab.status === "complete") {
     return pageScopedResult(cmd.id, tabId, { title: beforeTab.title, url: beforeTab.url, timedOut: false });
-  }
-  if (!hasActiveNetworkCapture(tabId)) {
-    await detach(tabId);
   }
   let rejectedNavigation;
   if (!alreadyAtTarget) {
@@ -4366,6 +4439,7 @@ const CDP_ALLOWLIST = /* @__PURE__ */ new Set([
   "Runtime.getHeapUsage",
   "Emulation.setCPUThrottlingRate",
   "Emulation.setEmulatedMedia",
+  "Emulation.setFocusEmulationEnabled",
   // Page metrics & screenshots
   "Page.getLayoutMetrics",
   "Page.captureScreenshot",
@@ -4552,6 +4626,9 @@ async function handleCdp(cmd, leaseKey, guard) {
   try {
     const aggressive = getSurfaceFromKey(leaseKey) === "browser";
     const params = cmd.cdpParams ?? {};
+    if (cmd.cdpMethod === "Emulation.setFocusEmulationEnabled" && (typeof params !== "object" || Array.isArray(params) || Object.keys(params).length !== 1 || typeof params.enabled !== "boolean")) {
+      throw new Error("Invalid focus emulation: enabled must be a boolean.");
+    }
     if (cmd.cdpMethod === "Emulation.setEmulatedMedia") {
       const features = params.features;
       const feature = Array.isArray(features) ? features[0] : void 0;
@@ -4666,6 +4743,35 @@ async function handleSessions(cmd) {
   }
   return { id: cmd.id, ok: true, data: entries };
 }
+async function handleViewport(cmd, leaseKey, guard) {
+  if (cmd.op !== "set" && cmd.op !== "reset") return { id: cmd.id, ok: false, error: "Viewport op must be set or reset" };
+  if (cmd.op === "set") {
+    if (!Number.isSafeInteger(cmd.width) || cmd.width <= 0 || !Number.isSafeInteger(cmd.height) || cmd.height <= 0) {
+      return { id: cmd.id, ok: false, error: "Viewport width and height must be positive safe integers" };
+    }
+    const previous = sessionViewports.get(leaseKey);
+    const viewport = { width: cmd.width, height: cmd.height, tabs: previous?.tabs ?? /* @__PURE__ */ new Set() };
+    const tabId = automationSessions.get(leaseKey)?.preferredTabId;
+    if (tabId != null) {
+      await setViewport(tabId, { width: viewport.width, height: viewport.height });
+      guard?.();
+      viewport.tabs.add(tabId);
+    }
+    sessionViewports.set(leaseKey, viewport);
+    return { id: cmd.id, ok: true, data: { supported: true, viewport: { width: viewport.width, height: viewport.height, deviceScaleFactor: 1 } } };
+  }
+  await resetSessionViewport(leaseKey);
+  return { id: cmd.id, ok: true, data: { supported: true, viewport: null } };
+}
+async function resetSessionViewport(leaseKey) {
+  const viewport = sessionViewports.get(leaseKey);
+  if (!viewport) return;
+  for (const tabId of viewport.tabs) {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (tab) await setViewport(tabId, null);
+  }
+  sessionViewports.delete(leaseKey);
+}
 async function handleCloseWindow(cmd, leaseKey) {
   const sessionName = automationSessions.get(leaseKey)?.session ?? getSessionFromKey(leaseKey);
   await releaseLease(leaseKey, "explicit close");
@@ -4769,6 +4875,7 @@ async function handleClipboard(cmd) {
 }
 async function releaseLease(leaseKey, reason = "released") {
   releaseWebSocketStats(leaseKey);
+  await resetSessionViewport(leaseKey);
   activeCommands.delete(leaseKey);
   const session = automationSessions.get(leaseKey);
   if (!session) {

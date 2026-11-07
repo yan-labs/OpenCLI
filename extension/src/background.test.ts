@@ -498,6 +498,25 @@ describe('background tab isolation', () => {
     expect(chrome.debugger.sendCommand).not.toHaveBeenCalled();
   });
 
+  it('limits focus emulation to a boolean on the resolved session tab', async () => {
+    const { chrome } = createChromeMock();
+    chrome.debugger.sendCommand = vi.fn(async () => ({}));
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    mod.__test__.setDefaultWindowMode('background');
+    mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
+    const run = (cdpParams: any) => mod.__test__.handleCommand({ id: 'focus', action: 'cdp', session: 'twitter', surface: 'adapter', cdpMethod: 'Emulation.setFocusEmulationEnabled', cdpParams });
+    for (const enabled of [true, false]) {
+      expect((await run({ enabled })).ok).toBe(true);
+      expect(chrome.debugger.sendCommand).toHaveBeenLastCalledWith({ tabId: 1 }, 'Emulation.setFocusEmulationEnabled', { enabled });
+    }
+    chrome.debugger.sendCommand.mockClear();
+    for (const params of [undefined, null, {}, [], 'true', { enabled: 1 }, { enabled: 'false' }, { enabled: false, frameId: 'other' }, { enabled: true, extra: true }]) {
+      expect((await run(params)).ok).toBe(false);
+    }
+    expect(chrome.debugger.sendCommand).not.toHaveBeenCalled();
+  });
+
   it('allows CPU throttling only through the resolved tab and still denies browser management', async () => {
     const { chrome } = createChromeMock();
     chrome.debugger.sendCommand = vi.fn(async () => ({}));
