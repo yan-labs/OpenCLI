@@ -17,10 +17,13 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { PKG_VERSION } from './version.js';
 
 const CACHE_DIR = path.join(os.homedir(), '.opencli');
 const CACHE_FILE = path.join(CACHE_DIR, 'update-check.json');
+// Source checkout root: this file runs from <root>/dist/src/update-check.js
+const SOURCE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24h
 const EXTENSION_STALE_MS = 7 * 24 * 60 * 60 * 1000; // 7d
 const NPM_REGISTRY_URL = 'https://raw.githubusercontent.com/yan-labs/OpenCLI/main/package.json';
@@ -103,7 +106,7 @@ function buildUpdateNotices({ cliVersion, cache, now }: NoticeInputs): NoticeLin
   if (cache.forkLatestVersion && isNewer(cache.forkLatestVersion, cliVersion)) {
     lines.cli =
       `\n  Update available: v${cliVersion} → v${cache.forkLatestVersion}\n` +
-      `  Run: cd /Users/yan/PROJECT/kcsx/macmini/OpenCLI && git pull && npm run build\n`;
+      `  Run: cd ${SOURCE_ROOT} && git pull && npm run build\n`;
   }
   const { currentExtensionVersion, forkLatestExtensionVersion, extensionLastSeenAt } = cache;
   if (
