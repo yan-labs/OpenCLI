@@ -8,7 +8,7 @@
  * - Notice appears AFTER command output, not before (same as npm/gh/yarn)
  * - Never delays or blocks the CLI command
  *
- * Cache is shared between the CLI process (writes latestVersion / latestExtensionVersion
+ * Cache is shared between the CLI process (writes forkLatestVersion / forkLatestExtensionVersion
  * via background fetch) and the daemon process (writes currentExtensionVersion /
  * extensionLastSeenAt via `recordExtensionVersion` on each hello). Writes use a
  * read-merge-write pattern so neither side clobbers the other.
@@ -23,15 +23,15 @@ const CACHE_DIR = path.join(os.homedir(), '.opencli');
 const CACHE_FILE = path.join(CACHE_DIR, 'update-check.json');
 const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24h
 const EXTENSION_STALE_MS = 7 * 24 * 60 * 60 * 1000; // 7d
-const NPM_REGISTRY_URL = 'https://registry.npmjs.org/@jackwener/opencli/latest';
-const GITHUB_RELEASES_URL = 'https://api.github.com/repos/jackwener/OpenCLI/releases?per_page=20';
+const NPM_REGISTRY_URL = 'https://raw.githubusercontent.com/yan-labs/OpenCLI/main/package.json';
+const GITHUB_RELEASES_URL = 'https://api.github.com/repos/yan-labs/OpenCLI/releases?per_page=20';
 
 interface UpdateCache {
   // CLI npm fetch fields — present once `checkForUpdateBackground` has succeeded.
   // Optional because the daemon may write the cache first via `recordExtensionVersion`.
   lastCheck?: number;
-  latestVersion?: string;
-  latestExtensionVersion?: string;
+  forkLatestVersion?: string;
+  forkLatestExtensionVersion?: string;
   // Daemon hello fields.
   currentExtensionVersion?: string;
   extensionLastSeenAt?: number;
@@ -100,22 +100,22 @@ interface NoticeLines {
 function buildUpdateNotices({ cliVersion, cache, now }: NoticeInputs): NoticeLines {
   if (!cache) return {};
   const lines: NoticeLines = {};
-  if (cache.latestVersion && isNewer(cache.latestVersion, cliVersion)) {
+  if (cache.forkLatestVersion && isNewer(cache.forkLatestVersion, cliVersion)) {
     lines.cli =
-      `\n  Update available: v${cliVersion} → v${cache.latestVersion}\n` +
-      `  Run: npm install -g @jackwener/opencli\n`;
+      `\n  Update available: v${cliVersion} → v${cache.forkLatestVersion}\n` +
+      `  Run: cd /Users/yan/PROJECT/kcsx/macmini/OpenCLI && git pull && npm run build\n`;
   }
-  const { currentExtensionVersion, latestExtensionVersion, extensionLastSeenAt } = cache;
+  const { currentExtensionVersion, forkLatestExtensionVersion, extensionLastSeenAt } = cache;
   if (
     currentExtensionVersion &&
-    latestExtensionVersion &&
+    forkLatestExtensionVersion &&
     extensionLastSeenAt &&
     now - extensionLastSeenAt < EXTENSION_STALE_MS &&
-    isNewer(latestExtensionVersion, currentExtensionVersion)
+    isNewer(forkLatestExtensionVersion, currentExtensionVersion)
   ) {
     lines.extension =
-      `\n  Extension update available: v${currentExtensionVersion} → v${latestExtensionVersion}\n` +
-      `  Download: https://github.com/jackwener/opencli/releases\n`;
+      `\n  Extension update available: v${currentExtensionVersion} → v${forkLatestExtensionVersion}\n` +
+      `  Download: https://github.com/yan-labs/OpenCLI/releases\n`;
   }
   return lines;
 }
@@ -178,7 +178,7 @@ async function fetchLatestExtensionVersion(): Promise<string | undefined> {
 }
 
 /**
- * Kick off a background fetch to npm registry. Writes to cache for next run.
+ * Kick off a background fetch to the fork repository. Writes to cache for next run.
  * Fully non-blocking — never awaited.
  */
 export function checkForUpdateBackground(): void {
@@ -198,8 +198,8 @@ export function checkForUpdateBackground(): void {
       const data = await res.json() as { version?: string };
       if (typeof data.version === 'string') {
         const extVersion = await fetchLatestExtensionVersion();
-        const updates: Partial<UpdateCache> = { lastCheck: Date.now(), latestVersion: data.version };
-        if (extVersion) updates.latestExtensionVersion = extVersion;
+        const updates: Partial<UpdateCache> = { lastCheck: Date.now(), forkLatestVersion: data.version };
+        if (extVersion) updates.forkLatestExtensionVersion = extVersion;
         writeCacheMerge(updates);
       }
     } catch {
@@ -226,7 +226,7 @@ export function recordExtensionVersion(version: string): void {
  * Used by `opencli doctor` to report extension updates.
  */
 export function getCachedLatestExtensionVersion(): string | undefined {
-  return _cache?.latestExtensionVersion;
+  return _cache?.forkLatestExtensionVersion;
 }
 
 export {

@@ -50,13 +50,18 @@ describe('buildUpdateNotices', () => {
     expect(buildUpdateNotices({ cliVersion: '1.0.0', cache: null, now })).toEqual({});
   });
 
-  it('emits a CLI notice when registry version is newer', () => {
+  it('ignores legacy upstream version cache', () => {
+    expect(buildUpdateNotices({ cliVersion: '1.0.0', cache: { latestVersion: '2.0.3' } as any, now })).toEqual({});
+  });
+
+  it('emits a CLI notice when fork version is newer', () => {
     const lines = buildUpdateNotices({
       cliVersion: '1.0.0',
-      cache: { lastCheck: now, latestVersion: '1.0.1' },
+      cache: { lastCheck: now, forkLatestVersion: '1.0.1' },
       now,
     });
     expect(lines.cli).toContain('v1.0.0 → v1.0.1');
+    expect(lines.cli).toContain('cd /Users/yan/PROJECT/kcsx/macmini/OpenCLI && git pull && npm run build');
     expect(lines.extension).toBeUndefined();
   });
 
@@ -65,8 +70,8 @@ describe('buildUpdateNotices', () => {
       cliVersion: '1.0.0',
       cache: {
         lastCheck: now,
-        latestVersion: '1.0.0',
-        latestExtensionVersion: '2.1.0',
+        forkLatestVersion: '1.0.0',
+        forkLatestExtensionVersion: '2.1.0',
         currentExtensionVersion: '2.0.0',
         extensionLastSeenAt: now - 60_000,
       },
@@ -74,6 +79,7 @@ describe('buildUpdateNotices', () => {
     });
     expect(lines.cli).toBeUndefined();
     expect(lines.extension).toContain('v2.0.0 → v2.1.0');
+    expect(lines.extension).toContain('https://github.com/yan-labs/OpenCLI/releases');
   });
 
   it('skips the extension notice when lastSeenAt is older than the stale window', () => {
@@ -81,8 +87,8 @@ describe('buildUpdateNotices', () => {
       cliVersion: '1.0.0',
       cache: {
         lastCheck: now,
-        latestVersion: '1.0.0',
-        latestExtensionVersion: '2.1.0',
+        forkLatestVersion: '1.0.0',
+        forkLatestExtensionVersion: '2.1.0',
         currentExtensionVersion: '2.0.0',
         extensionLastSeenAt: now - EXTENSION_STALE_MS - 1,
       },
@@ -96,8 +102,8 @@ describe('buildUpdateNotices', () => {
       cliVersion: '1.0.0',
       cache: {
         lastCheck: now,
-        latestVersion: '1.0.0',
-        latestExtensionVersion: '2.0.0',
+        forkLatestVersion: '1.0.0',
+        forkLatestExtensionVersion: '2.0.0',
         currentExtensionVersion: '2.0.0',
         extensionLastSeenAt: now,
       },
@@ -106,7 +112,7 @@ describe('buildUpdateNotices', () => {
     expect(lines.extension).toBeUndefined();
   });
 
-  it('does not throw when cache has only daemon-written fields and no latestVersion', () => {
+  it('does not throw when cache has only daemon-written fields and no forkLatestVersion', () => {
     const lines = buildUpdateNotices({
       cliVersion: '1.0.0',
       cache: {
@@ -124,8 +130,8 @@ describe('buildUpdateNotices', () => {
       cliVersion: '1.0.0',
       cache: {
         lastCheck: now,
-        latestVersion: '1.1.0',
-        latestExtensionVersion: '2.1.0',
+        forkLatestVersion: '1.1.0',
+        forkLatestExtensionVersion: '2.1.0',
         currentExtensionVersion: '2.0.0',
         extensionLastSeenAt: now,
       },
