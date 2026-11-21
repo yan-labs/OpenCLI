@@ -8,12 +8,12 @@ describe('getBrowserFactory', () => {
   });
 
   it('uses BrowserBridge for regular sites by default', () => {
-    expect(getBrowserFactory('xianyu')).toBe(BrowserBridge);
+    expect(getBrowserFactory()).toBe(BrowserBridge);
   });
 
   it('uses CDPBridge when OPENCLI_CDP_ENDPOINT is configured', () => {
     vi.stubEnv('OPENCLI_CDP_ENDPOINT', 'http://127.0.0.1:9333');
 
-    expect(getBrowserFactory('xianyu')).toBe(CDPBridge);
+    expect(getBrowserFactory()).toBe(CDPBridge);
   });
 });

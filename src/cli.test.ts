@@ -1,3 +1,4 @@
+import { clearAllHooks, onBeforeExecute, onAfterExecute, type HookContext } from './hooks.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -9,16 +10,12 @@ import { BrowserCommandError } from './browser/daemon-client.js';
 import type { IPage } from './types.js';
 import { TargetError } from './browser/target-errors.js';
 import { PKG_VERSION } from './version.js';
-import { classifyAdapter } from './help.js';
 
 const {
   mockBrowserConnect,
   mockBrowserClose,
   mockBindTab,
   mockSendCommand,
-  mockSetDaemonRunContext,
-  mockClearDaemonRunContext,
-  mockReleaseSessionLease,
   mockExecFileSync,
   browserState,
 } = vi.hoisted(() => ({
@@ -26,9 +23,6 @@ const {
   mockBrowserClose: vi.fn(),
   mockBindTab: vi.fn(),
   mockSendCommand: vi.fn(),
-  mockSetDaemonRunContext: vi.fn(),
-  mockClearDaemonRunContext: vi.fn(),
-  mockReleaseSessionLease: vi.fn(),
   mockExecFileSync: vi.fn(),
   browserState: { page: null as IPage | null },
 }));
@@ -49,9 +43,6 @@ vi.mock('./browser/daemon-client.js', async () => {
     ...actual,
     bindTab: mockBindTab,
     sendCommand: mockSendCommand,
-    setDaemonRunContext: mockSetDaemonRunContext,
-    clearDaemonRunContext: mockClearDaemonRunContext,
-    releaseSiteSessionLease: mockReleaseSessionLease,
   };
 });
 
@@ -63,7 +54,7 @@ vi.mock('node:child_process', async () => {
   };
 });
 
-import { createProgram, findPackageRoot, normalizeVerifyRows, renderVerifyPreview, resolveBrowserVerifyInvocation, selectFreshByTimestamp } from './cli.js';
+import { createProgram, findPackageRoot, normalizeVerifyRows, resolveBrowserVerifyInvocation, selectFreshByTimestamp } from './cli.js';
 
 describe('createProgram root help descriptions', () => {
   function descriptionFor(program: ReturnType<typeof createProgram>, name: string): string | undefined {
@@ -75,13 +66,13 @@ describe('createProgram root help descriptions', () => {
 
     expect(descriptionFor(program, 'browser')).toContain('open');
     expect(descriptionFor(program, 'browser')).toContain('type');
-    expect(descriptionFor(program, 'browser')).toContain('verify');
+    expect(descriptionFor(program, 'browser')).not.toContain('verify');
     expect(descriptionFor(program, 'browser')).not.toContain('Browser control');
     expect(descriptionFor(program, 'auth')).toBe('refresh, status');
     expect(descriptionFor(program, 'plugin')).toBe('create, install, list, uninstall, update');
-    expect(descriptionFor(program, 'adapter')).toBe('eject, reset, status');
+    expect(descriptionFor(program, 'adapter')).toBe('check, eject, init, reset, status, test');
     expect(descriptionFor(program, 'profile')).toBe('list, rename, use');
-    expect(descriptionFor(program, 'daemon')).toBe('logs, restart, status, stop');
+    expect(descriptionFor(program, 'daemon')).toBe('restart, status, stop');
     expect(descriptionFor(program, 'external')).toBeUndefined();
   });
 
@@ -121,7 +112,7 @@ describe('createProgram root help descriptions', () => {
   it('keeps leaf command descriptions unchanged', () => {
     const program = createProgram('', '');
 
-    expect(descriptionFor(program, 'list')).toBe('List all available CLI commands');
+    expect(descriptionFor(program, 'list')).toBe('Find available capabilities; inspect a command with --help -f json');
     expect(descriptionFor(program, 'doctor')).toBe('Diagnose opencli browser bridge connectivity');
   });
 
@@ -152,112 +143,10 @@ describe('createProgram root help descriptions', () => {
 
       expect(help).toContain('Site adapters (2):');
       expect(help).toContain('bilibili, youtube');
-      expect(help).toContain("opencli <site> --help -f yaml");
+      expect(help).toContain("opencli <site> --help -f json");
       expect(help).not.toMatch(/\n  bilibili\s+hot/);
       expect(help).not.toMatch(/\n  youtube\s+search/);
     } finally {
-      registry.clear();
-      for (const [key, value] of snapshot) registry.set(key, value);
-    }
-  });
-
-  it('groups adapters into App / Site buckets by domain field', () => {
-    const registry = getRegistry();
-    const snapshot = new Map(registry);
-    registry.clear();
-    try {
-      cli({
-        site: 'bilibili',
-        name: 'hot',
-        access: 'read',
-        description: 'Bilibili hot videos',
-        domain: 'www.bilibili.com',
-        strategy: Strategy.PUBLIC,
-        browser: false,
-      });
-      cli({
-        site: 'chatwise',
-        name: 'ask',
-        access: 'write',
-        description: 'Ask Chatwise desktop app',
-        domain: 'localhost',
-        strategy: Strategy.UI,
-        browser: true,
-      });
-
-      const program = createProgram('', '');
-      const help = program.helpInformation();
-
-      // Two separate sections, each with own count
-      expect(help).toContain('App adapters (1):');
-      expect(help).toMatch(/App adapters \(1\):\n {2}chatwise/);
-      expect(help).toContain('Site adapters (1):');
-      expect(help).toMatch(/Site adapters \(1\):\n {2}bilibili/);
-
-      // App adapters appear before Site adapters.
-      expect(help.indexOf('App adapters')).toBeLessThan(help.indexOf('Site adapters'));
-    } finally {
-      registry.clear();
-      for (const [key, value] of snapshot) registry.set(key, value);
-    }
-  });
-
-  it('classifies local IP domains as app adapters', () => {
-    expect(classifyAdapter('localhost')).toBe('app');
-    expect(classifyAdapter('127.0.0.1')).toBe('app');
-    expect(classifyAdapter('::1')).toBe('app');
-    expect(classifyAdapter('www.bilibili.com')).toBe('site');
-  });
-
-  it('splits list table output into App and Site sections without changing per-site rows', async () => {
-    const registry = getRegistry();
-    const snapshot = new Map(registry);
-    const stdoutSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-    const restoreStdoutSpy = () => stdoutSpy.mockImplementation(() => {});
-    registry.clear();
-    try {
-      cli({
-        site: 'antigravity',
-        name: 'history',
-        access: 'read',
-        description: 'Read Antigravity history',
-        domain: '127.0.0.1',
-        strategy: Strategy.UI,
-        browser: true,
-      });
-      cli({
-        site: 'chatwise',
-        name: 'ask',
-        access: 'write',
-        description: 'Ask Chatwise desktop app',
-        domain: 'localhost',
-        strategy: Strategy.UI,
-        browser: true,
-      });
-      cli({
-        site: 'bilibili',
-        name: 'hot',
-        access: 'read',
-        description: 'Bilibili hot videos',
-        domain: 'www.bilibili.com',
-        strategy: Strategy.PUBLIC,
-        browser: false,
-      });
-
-      const program = createProgram('', '');
-      await program.parseAsync(['node', 'opencli', 'list']);
-      const output = stdoutSpy.mock.calls.flat().join('\n');
-
-      expect(output).toContain('App adapters');
-      expect(output).toContain('Site adapters');
-      expect(output.indexOf('App adapters')).toBeLessThan(output.indexOf('Site adapters'));
-      expect(output).toMatch(/App adapters[\s\S]*antigravity[\s\S]*history \[ui\] — Read Antigravity history/);
-      expect(output).toMatch(/App adapters[\s\S]*chatwise[\s\S]*ask \[ui\] — Ask Chatwise desktop app/);
-      expect(output).toMatch(/Site adapters[\s\S]*bilibili[\s\S]*hot \[public\] — Bilibili hot videos/);
-      expect(output).toContain('3 built-in commands across 2 apps + 1 sites');
-    } finally {
-      restoreStdoutSpy();
-      stdoutSpy.mockClear();
       registry.clear();
       for (const [key, value] of snapshot) registry.set(key, value);
     }
@@ -281,28 +170,30 @@ describe('createProgram root help descriptions', () => {
         columns: ['title', 'url'],
       });
 
-      const tableProgram = createProgram('', '');
-      await tableProgram.parseAsync(['node', 'opencli', 'list']);
-      const tableOutput = stdoutSpy.mock.calls.flat().join('\n');
-      expect(tableOutput).not.toContain('App adapters');
-      expect(tableOutput).toContain('Site adapters');
-      expect(tableOutput).toContain('1 built-in commands across 0 apps + 1 sites');
-
+      const program = createProgram('', '');
+      await program.parseAsync(['node', 'opencli', 'list', '--limit', '2']);
+      const first = JSON.parse(stdoutSpy.mock.calls.flat().join('\n'));
+      expect(first.ok).toBe(true);
+      expect(first.data.commands).toHaveLength(2);
+      expect(first.data.nextOffset).toBe(2);
+      expect(first.data.total).toBeGreaterThan(2);
       stdoutSpy.mockClear();
-      const jsonProgram = createProgram('', '');
-      await jsonProgram.parseAsync(['node', 'opencli', 'list', '-f', 'json']);
-      const jsonOutput = stdoutSpy.mock.calls.flat().join('\n');
-      const rows = JSON.parse(jsonOutput);
-      expect(rows).toMatchObject([
-        {
-          site: 'bilibili',
-          name: 'hot',
-          domain: 'www.bilibili.com',
-          columns: ['title', 'url'],
-        },
-      ]);
-      expect(rows[0]).not.toHaveProperty('adapterKind');
-      expect(rows[0]).not.toHaveProperty('section');
+      const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+      try {
+        await createProgram('', '').parseAsync(['node', 'opencli', 'list', '--limit', '2', '-f', 'yaml']);
+        expect(stderrSpy.mock.calls.flat().join('')).toContain(`Showing 1-2 of ${first.data.total} commands; rerun with --offset 2 for more.`);
+        stderrSpy.mockClear();
+        await createProgram('', '').parseAsync(['node', 'opencli', 'list', 'hot', '--site', 'bilibili', '-f', 'yaml']);
+        expect(stderrSpy).not.toHaveBeenCalled();
+      } finally {
+        stderrSpy.mockRestore();
+      }
+      stdoutSpy.mockClear();
+      await createProgram('', '').parseAsync(['node', 'opencli', 'list', 'hot', '--site', 'bilibili']);
+      const result = JSON.parse(stdoutSpy.mock.calls.flat().join('\n'));
+      expect(result).toEqual({ ok: true, data: { total: 1, commands: [
+        { command: 'bilibili hot', description: 'Bilibili hot videos', access: 'read' },
+      ] } });
     } finally {
       restoreStdoutSpy();
       stdoutSpy.mockClear();
@@ -311,7 +202,7 @@ describe('createProgram root help descriptions', () => {
     }
   });
 
-  it('exposes app_adapters / site_adapters in structured help', () => {
+  it('exposes only site_adapters in structured help', () => {
     const registry = getRegistry();
     const snapshot = new Map(registry);
     const argv = process.argv;
@@ -326,29 +217,18 @@ describe('createProgram root help descriptions', () => {
         strategy: Strategy.PUBLIC,
         browser: false,
       });
-      cli({
-        site: 'chatwise',
-        name: 'ask',
-        access: 'write',
-        description: 'Ask Chatwise desktop app',
-        domain: 'localhost',
-        strategy: Strategy.UI,
-        browser: true,
-      });
 
       const program = createProgram('', '');
       process.argv = ['node', 'opencli', '--help', '-f', 'yaml'];
       const data = yaml.load(program.helpInformation()) as any;
 
-      expect(data.app_adapters.count).toBe(1);
-      expect(data.app_adapters.apps).toEqual(['chatwise']);
+      expect(data).not.toHaveProperty('app_adapters');
       expect(data.site_adapters.count).toBe(1);
       expect(data.site_adapters.sites).toEqual(['bilibili']);
       expect(data).not.toHaveProperty('external_clis');
       // Adapters must NOT leak into the core commands list
       const commandNames = data.commands.map((cmd: any) => cmd.name);
       expect(commandNames).not.toContain('bilibili');
-      expect(commandNames).not.toContain('chatwise');
     } finally {
       process.argv = argv;
       registry.clear();
@@ -416,7 +296,7 @@ describe('createProgram root help descriptions', () => {
           access: 'read',
           description: 'Bilibili hot videos',
           browser: false,
-          example: 'opencli bilibili hot -f yaml',
+          example: 'opencli bilibili hot',
           command_options: [{ name: 'limit', type: 'int', default: 20 }],
           columns: ['title', 'url'],
         },
@@ -529,12 +409,9 @@ describe('createProgram root help descriptions', () => {
 
       expect(data.namespace).toBe('browser');
       expect(data.command).toBe('opencli browser');
-      expect(data.description).toBe('Browser control — navigate, click, type, extract, wait (no LLM needed)');
+      expect(data.description).toBe('Inspect pages, interact with elements, and manage Chrome resources');
       expect(data.command_count).toBeGreaterThan(20);
-      // `--session` is now a hidden internal option; user-facing surface is the
-      // <session> positional declared via `.usage()`. Structured help drops
-      // hidden options, so namespace_options shouldn't expose it.
-      expect(data.namespace_options).not.toEqual(expect.arrayContaining([
+      expect(data.namespace_options).toEqual(expect.arrayContaining([
         expect.objectContaining({ name: 'session' }),
       ]));
       expect(data.namespace_options).toEqual(expect.arrayContaining([
@@ -544,7 +421,7 @@ describe('createProgram root help descriptions', () => {
           takes_value: 'required',
         }),
       ]));
-      expect(data.usage).toBe('opencli browser <session> <command> [options]');
+      expect(data.usage).toBe('opencli browser <command> [args] [options]');
       expect(data.global_options).toEqual(expect.arrayContaining([
         expect.objectContaining({
           name: 'version',
@@ -562,27 +439,27 @@ describe('createProgram root help descriptions', () => {
       // agents construct the correct full invocation. `name` is the leaf
       // identifier (placeholder positionals are stripped).
       expect(click).toMatchObject({
-        command: 'opencli browser <session> click',
-        usage: 'opencli browser <session> click [target] [options]',
+        command: 'opencli browser click',
+        usage: 'opencli browser click [target] [options]',
         positionals: [{ name: 'target' }],
       });
-      expect(click.command_options.map((option: any) => option.name)).toEqual(['role', 'name', 'label', 'text', 'testid', 'nth', 'tab']);
+      expect(click.command_options.map((option: any) => option.name)).toEqual(['role', 'name', 'label', 'text', 'testid', 'nth', 'tab', 'session', 'keepAlive', 'window', 'profile']);
 
       const tabList = data.commands.find((cmd: any) => cmd.name === 'tab list');
       expect(tabList).toMatchObject({
-        command: 'opencli browser <session> tab list',
-        usage: 'opencli browser <session> tab list [options]',
-        command_options: [],
+        command: 'opencli browser tab list',
+        usage: 'opencli browser tab list [options]',
+        command_options: expect.any(Array),
       });
 
       const getText = data.commands.find((cmd: any) => cmd.name === 'get text');
       expect(getText).toMatchObject({
-        command: 'opencli browser <session> get text',
+        command: 'opencli browser get text',
         positionals: [{ name: 'target' }],
       });
       expect(data.structured_help).toMatchObject({
         formats: ['yaml', 'json'],
-        usage: 'opencli browser --help -f yaml',
+        usage: 'opencli browser --help -f json',
       });
     } finally {
       process.argv = argv;
@@ -603,8 +480,8 @@ describe('createProgram root help descriptions', () => {
       expect(data).toMatchObject({
         namespace: 'browser',
         group: 'tab',
-        command: 'opencli browser <session> tab',
-        usage: 'opencli browser <session> tab <command> [args] [options]',
+        command: 'opencli browser tab',
+        usage: 'opencli browser tab <command> [args] [options]',
         command_count: 4,
       });
       expect(data.commands.map((cmd: any) => cmd.name)).toEqual([
@@ -614,15 +491,13 @@ describe('createProgram root help descriptions', () => {
         'tab select',
       ]);
       expect(data.commands.find((cmd: any) => cmd.name === 'tab close')).toMatchObject({
-        command: 'opencli browser <session> tab close',
-        usage: 'opencli browser <session> tab close [targetId] [options]',
+        command: 'opencli browser tab close',
+        usage: 'opencli browser tab close [targetId] [options]',
         positionals: [{ name: 'targetId', help: 'Target tab/page identity returned by "browser open", "browser tab new", or "browser tab list"' }],
       });
-      // session is now a hidden internal option (consumed from the <session> positional).
-      // namespace_options should only list user-facing options.
-      expect(data.namespace_options.map((option: any) => option.name)).toEqual(['window', 'keepAlive', 'idleTimeout', 'windowSlot', 'windowBounds', 'half', 'windowDisplay']);
+      expect(data.namespace_options.map((option: any) => option.name)).toEqual(['keepAlive', 'session', 'window']);
       expect(data.structured_help).toMatchObject({
-        usage: 'opencli browser <session> tab --help -f yaml',
+        usage: 'opencli browser tab --help -f json',
       });
     } finally {
       process.argv = argv;
@@ -643,16 +518,15 @@ describe('createProgram root help descriptions', () => {
       expect(data).toMatchObject({
         namespace: 'browser',
         name: 'click',
-        command: 'opencli browser <session> click',
-        usage: 'opencli browser <session> click [target] [options]',
+        command: 'opencli browser click',
+        usage: 'opencli browser click [target] [options]',
         positionals: [{ name: 'target' }],
         structured_help: {
-          usage: 'opencli browser <session> click --help -f yaml',
+          usage: 'opencli browser click --help -f json',
         },
       });
-      expect(data.command_options.map((option: any) => option.name)).toEqual(['role', 'name', 'label', 'text', 'testid', 'nth', 'tab']);
-      // session is hidden; `window` and its dedicated-mode placement siblings surface as namespace options.
-      expect(data.namespace_options.map((option: any) => option.name)).toEqual(['window', 'keepAlive', 'idleTimeout', 'windowSlot', 'windowBounds', 'half', 'windowDisplay']);
+      expect(data.command_options.map((option: any) => option.name)).toEqual(['role', 'name', 'label', 'text', 'testid', 'nth', 'tab', 'session', 'keepAlive', 'window', 'profile']);
+      expect(data.namespace_options.map((option: any) => option.name)).toEqual(['keepAlive', 'session', 'window']);
       expect(data.global_options.map((option: any) => option.name)).toContain('profile');
     } finally {
       process.argv = argv;
@@ -674,11 +548,11 @@ describe('createProgram root help descriptions', () => {
         command: 'opencli daemon',
         usage: 'opencli daemon <command> [args] [options]',
         description: 'Manage the opencli daemon',
-        command_count: 4,
+        command_count: 3,
         namespace_options: [],
-        structured_help: { usage: 'opencli daemon --help -f yaml' },
+        structured_help: { usage: 'opencli daemon --help -f json' },
       });
-      expect(data.commands.map((cmd: any) => cmd.name)).toEqual(['logs', 'restart', 'status', 'stop']);
+      expect(data.commands.map((cmd: any) => cmd.name)).toEqual(['restart', 'status', 'stop']);
       expect(data.global_options.map((option: any) => option.name)).toEqual(expect.arrayContaining(['version', 'profile']));
     } finally {
       process.argv = argv;
@@ -698,7 +572,7 @@ describe('createProgram root help descriptions', () => {
       expect(data).toMatchObject({
         namespace: 'plugin',
         command: 'opencli plugin',
-        description: 'Manage opencli plugins',
+        description: 'Manage OpenCLI plugins',
         namespace_options: [],
       });
       expect(data.commands.map((cmd: any) => cmd.name)).toEqual(['create', 'install', 'list', 'uninstall', 'update']);
@@ -726,7 +600,7 @@ describe('createProgram root help descriptions', () => {
       // applyRootSubcommandSummaries() rewrites .description() to a child-name listing;
       // structured help must surface the original product description via the snapshot.
       expect(data.description).toBe('Manage CLI adapters');
-      expect(data.commands.map((cmd: any) => cmd.name)).toEqual(['eject', 'reset', 'status']);
+      expect(data.commands.map((cmd: any) => cmd.name)).toEqual(['check', 'eject', 'init', 'reset', 'status', 'test']);
       const reset = data.commands.find((cmd: any) => cmd.name === 'reset');
       expect(reset).toMatchObject({
         usage: 'opencli adapter reset [site] [options]',
@@ -750,7 +624,7 @@ describe('createProgram root help descriptions', () => {
 
       expect(data).toMatchObject({
         namespace: 'profile',
-        description: 'Manage Browser Bridge Chrome profiles',
+        description: 'Manage Chrome profiles',
         command_count: 3,
       });
       expect(data.commands.map((cmd: any) => cmd.name)).toEqual(['list', 'rename', 'use']);
@@ -858,10 +732,10 @@ describe('selectFreshByTimestamp', () => {
   });
 });
 
-describe('browser verify', () => {
+describe('adapter test', () => {
   beforeEach(() => {
     process.exitCode = undefined;
-    mockExecFileSync.mockReset().mockReturnValue('[]');
+    mockExecFileSync.mockReset().mockReturnValue('{"ok":true,"data":[]}');
   });
 
   it('passes --trace through to the adapter subprocess', async () => {
@@ -877,11 +751,11 @@ describe('browser verify', () => {
       fs.writeFileSync(path.join(adapterDir, 'top.js'), 'export default {};\n', 'utf-8');
 
       const program = createProgram('', '');
-      await program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'verify', 'hn/top', '--no-fixture', '--trace', 'retain-on-failure']);
+      await program.parseAsync(['node', 'opencli', 'adapter', 'test', 'hn/top', '--no-fixture', '--trace', 'retain-on-failure']);
 
       expect(mockExecFileSync).toHaveBeenCalledTimes(1);
       const [, execArgs] = mockExecFileSync.mock.calls[0] as [string, string[]];
-      expect(execArgs.slice(-6)).toEqual(['hn', 'top', '--trace', 'retain-on-failure', '--format', 'json']);
+      expect(execArgs.slice(-6)).toEqual(['hn', 'top', '--format', 'json', '--trace', 'retain-on-failure']);
     } finally {
       if (originalHome === undefined) delete process.env.HOME;
       else process.env.HOME = originalHome;
@@ -891,7 +765,7 @@ describe('browser verify', () => {
     }
   });
 
-  it('uses --seed-args when no fixture args exist', async () => {
+  it('uses --args when no fixture args exist', async () => {
     const originalHome = process.env.HOME;
     const originalUserProfile = process.env.USERPROFILE;
     const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'opencli-browser-verify-seed-'));
@@ -904,7 +778,7 @@ describe('browser verify', () => {
       fs.writeFileSync(path.join(adapterDir, 'top.js'), 'export default {};\n', 'utf-8');
 
       const program = createProgram('', '');
-      await program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'verify', 'hn/top', '--no-fixture', '--seed-args', 'opencli-verify']);
+      await program.parseAsync(['node', 'opencli', 'adapter', 'test', 'hn/top', '--no-fixture', '--args', 'opencli-verify']);
 
       expect(mockExecFileSync).toHaveBeenCalledTimes(1);
       const [, execArgs] = mockExecFileSync.mock.calls[0] as [string, string[]];
@@ -918,13 +792,13 @@ describe('browser verify', () => {
     }
   });
 
-  it('writes --seed-args into a starter fixture', async () => {
+  it('writes --args into a starter fixture', async () => {
     const originalHome = process.env.HOME;
     const originalUserProfile = process.env.USERPROFILE;
     const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'opencli-browser-verify-write-seed-'));
     process.env.HOME = fakeHome;
     process.env.USERPROFILE = fakeHome;
-    mockExecFileSync.mockReturnValue(JSON.stringify([{ title: 'ok' }]));
+    mockExecFileSync.mockReturnValue(JSON.stringify({ok:true,data:[{title:'ok'}]}));
 
     try {
       const adapterDir = path.join(fakeHome, '.opencli', 'clis', 'hn');
@@ -932,7 +806,7 @@ describe('browser verify', () => {
       fs.writeFileSync(path.join(adapterDir, 'top.js'), 'export default {};\n', 'utf-8');
 
       const program = createProgram('', '');
-      await program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'verify', 'hn/top', '--write-fixture', '--seed-args', 'opencli-verify']);
+      await program.parseAsync(['node', 'opencli', 'adapter', 'test', 'hn/top', '--write-fixture', '--args', 'opencli-verify']);
 
       const fixtureFile = path.join(fakeHome, '.opencli', 'sites', 'hn', 'verify', 'top.json');
       const fixture = JSON.parse(fs.readFileSync(fixtureFile, 'utf-8'));
@@ -947,13 +821,13 @@ describe('browser verify', () => {
     }
   });
 
-  it('fails before fixture handling when output row shape is not agent-native', async () => {
+  it('accepts nested business data without imposing a row-shape workflow', async () => {
     const originalHome = process.env.HOME;
     const originalUserProfile = process.env.USERPROFILE;
     const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'opencli-browser-verify-shape-'));
     process.env.HOME = fakeHome;
     process.env.USERPROFILE = fakeHome;
-    mockExecFileSync.mockReturnValue(JSON.stringify([{ title: 'ok', author: { user_id: 'u1' } }]));
+    mockExecFileSync.mockReturnValue(JSON.stringify({ok:true,data:[{title:'ok',author:{user_id:'u1'}}]}));
     const consoleLogSpy = vi.mocked(console.log);
     consoleLogSpy.mockClear();
 
@@ -963,12 +837,11 @@ describe('browser verify', () => {
       fs.writeFileSync(path.join(adapterDir, 'top.js'), 'export default {};\n', 'utf-8');
 
       const program = createProgram('', '');
-      await program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'verify', 'hn/top', '--no-fixture']);
+      await program.parseAsync(['node', 'opencli', 'adapter', 'test', 'hn/top', '--no-fixture']);
 
-      expect(process.exitCode).toBe(1);
+      expect(process.exitCode).toBeUndefined();
       const output = consoleLogSpy.mock.calls.map((args) => args.join(' ')).join('\n');
-      expect(output).toContain('Adapter output violates row shape conventions');
-      expect(output).toContain('author.user_id');
+      expect(JSON.parse(output).data.result[0].author.user_id).toBe('u1');
     } finally {
       consoleLogSpy.mockClear();
       if (originalHome === undefined) delete process.env.HOME;
@@ -1065,8 +938,8 @@ describe('profile list', () => {
     await program.parseAsync(['node', 'opencli', 'profile', 'list']);
 
     const output = stdoutSpy.mock.calls.flat().join('\n');
-    expect(output).toContain('stale');
-    expect(output).toContain('opencli daemon restart');
+    expect(JSON.parse(output).data.daemonStale).toBe(true);
+    expect(JSON.parse(output).data.daemonRunning).toBe(true);
     expect(output).not.toContain('No Browser Bridge profiles connected');
   });
 
@@ -1090,7 +963,7 @@ describe('profile list', () => {
     await program.parseAsync(['node', 'opencli', 'profile', 'list']);
 
     const output = stdoutSpy.mock.calls.flat().join('\n');
-    expect(output).toContain('No Browser Bridge profiles connected');
+    expect(JSON.parse(output).data.profiles).toEqual([]);
     expect(output).not.toContain('opencli daemon restart');
   });
 });
@@ -1106,12 +979,6 @@ describe('browser tab targeting commands', () => {
   beforeEach(() => {
     process.exitCode = undefined;
     process.env.OPENCLI_CACHE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'opencli-browser-tab-state-'));
-    // Isolate browser-profiles.json (read via OPENCLI_CONFIG_DIR, see
-    // src/browser/profile.ts) from the real ~/.opencli. Without this, a
-    // machine with a saved default profile leaks its real defaultContextId
-    // into mockBrowserConnect calls as `preferredContextId`, breaking every
-    // exact-match assertion below.
-    process.env.OPENCLI_CONFIG_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'opencli-browser-tab-profile-'));
     consoleLogSpy.mockClear();
     stderrSpy.mockClear();
     mockBrowserConnect.mockClear();
@@ -1124,9 +991,6 @@ describe('browser tab targeting commands', () => {
       title: 'Inbox',
     });
     mockSendCommand.mockReset().mockResolvedValue({ closed: true });
-    mockSetDaemonRunContext.mockClear();
-    mockClearDaemonRunContext.mockClear();
-    mockReleaseSessionLease.mockReset().mockResolvedValue(undefined);
 
     browserState.page = {
       goto: vi.fn().mockResolvedValue(undefined),
@@ -1165,16 +1029,14 @@ describe('browser tab targeting commands', () => {
     } as unknown as IPage;
   });
 
-  afterEach(() => {
-    delete process.env.OPENCLI_CONFIG_DIR;
-  });
-
   function lastJsonLog(): any {
     const calls = consoleLogSpy.mock.calls;
     if (calls.length === 0) throw new Error('Expected at least one console.log call');
     const last = calls[calls.length - 1][0];
     if (typeof last !== 'string') throw new Error(`Expected string arg to console.log, got ${typeof last}`);
-    return JSON.parse(last);
+    const envelope = JSON.parse(last);
+    expect(typeof envelope.ok).toBe('boolean');
+    return envelope.ok ? envelope.data : envelope;
   }
 
   it('binds the current Chrome tab into a browser session', async () => {
@@ -1198,7 +1060,7 @@ describe('browser tab targeting commands', () => {
     await program.parseAsync(['node', 'opencli', 'browser', 'state']);
 
     expect(mockBrowserConnect).not.toHaveBeenCalled();
-    expect(stderrSpy.mock.calls.flat().join('')).toContain('<session> is a required positional argument');
+    expect(lastJsonLog().error).toMatchObject({ code: 'usage_error' });
   });
 
   it('runs browser commands against an explicit session', async () => {
@@ -1206,36 +1068,8 @@ describe('browser tab targeting commands', () => {
 
     await program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'state']);
 
-    // Dedicated is the default now: automation gets its own OpenCLI-owned window
-    // (created unfocused, placed off-screen when possible) unless the caller opts
-    // into a different mode explicitly.
-    expect(mockBrowserConnect).toHaveBeenCalledWith({ timeout: 45, session: 'test', surface: 'browser', windowMode: 'dedicated' });
+    expect(mockBrowserConnect).toHaveBeenCalledWith({ timeout: 45, session: 'test', surface: 'browser', windowMode: 'foreground', requireExistingSession: true });
     expect(browserState.page?.snapshot).toHaveBeenCalled();
-    expect(mockSetDaemonRunContext).toHaveBeenCalledWith(expect.objectContaining({
-      runId: expect.stringMatching(/^run_/), command: 'browser state', access: 'read',
-    }));
-    const runId = mockSetDaemonRunContext.mock.calls.at(-1)?.[0].runId;
-    expect(mockClearDaemonRunContext).toHaveBeenCalledWith(runId);
-    expect(mockReleaseSessionLease).toHaveBeenCalledWith({ runId, session: 'test', surface: 'browser' });
-  });
-
-  it.each([
-    { flags: ['--keep-alive'], env: '25', expected: -1 },
-    { flags: ['--idle-timeout', '42'], env: 'never', expected: 42 },
-    { flags: [], env: 'never', expected: -1 },
-    { flags: [], env: '25', expected: 25 },
-  ])('passes idle settings with CLI priority: $flags / $env', async ({ flags, env, expected }) => {
-    vi.stubEnv('OPENCLI_BROWSER_IDLE_TIMEOUT', env);
-    try {
-      const program = createProgram('', '');
-      const { rewriteBrowserArgv } = await import('./cli-argv-preprocess.js');
-      await program.parseAsync(['node', 'opencli', ...rewriteBrowserArgv([
-        'browser', 'test', 'open', 'https://example.com', ...flags,
-      ])]);
-      expect(mockBrowserConnect).toHaveBeenCalledWith(expect.objectContaining({ idleTimeout: expected }));
-    } finally {
-      vi.unstubAllEnvs();
-    }
   });
 
   it('passes browser --window through Commander options without relying on env pre-processing', async () => {
@@ -1243,27 +1077,8 @@ describe('browser tab targeting commands', () => {
 
     await program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', '--window', 'background', 'state']);
 
-    expect(mockBrowserConnect).toHaveBeenCalledWith({ timeout: 45, session: 'test', surface: 'browser', windowMode: 'background' });
+    expect(mockBrowserConnect).toHaveBeenCalledWith({ timeout: 45, session: 'test', surface: 'browser', windowMode: 'background', requireExistingSession: true });
     expect(browserState.page?.snapshot).toHaveBeenCalled();
-  });
-
-  it('OPENCLI_WINDOW overrides the dedicated default but loses to an explicit --window flag', async () => {
-    // Uses objectContaining rather than an exact match: this test only cares
-    // about windowMode precedence, so it shouldn't be coupled to the exact
-    // connect() payload the other cases in this block assert on.
-    process.env.OPENCLI_WINDOW = 'active';
-    try {
-      const program = createProgram('', '');
-      await program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'state']);
-      expect(mockBrowserConnect).toHaveBeenCalledWith(expect.objectContaining({ windowMode: 'active' }));
-
-      mockBrowserConnect.mockClear();
-      const program2 = createProgram('', '');
-      await program2.parseAsync(['node', 'opencli', 'browser', '--session', 'test', '--window', 'foreground', 'state']);
-      expect(mockBrowserConnect).toHaveBeenCalledWith(expect.objectContaining({ windowMode: 'foreground' }));
-    } finally {
-      delete process.env.OPENCLI_WINDOW;
-    }
   });
 
   it('passes the opt-in AX source to browser state', async () => {
@@ -1340,7 +1155,7 @@ describe('browser tab targeting commands', () => {
       format: 'png',
     });
     expect(browserState.page?.screenshot).not.toHaveBeenCalled();
-    expect(consoleLogSpy).toHaveBeenLastCalledWith('annotated-base64-shot');
+    expect(lastJsonLog()).toBe('annotated-base64-shot');
   });
 
   it('allows history navigation in a bound session', async () => {
@@ -1355,35 +1170,6 @@ describe('browser tab targeting commands', () => {
     await program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'back']);
 
     expect(browserState.page?.evaluate).toHaveBeenCalledWith('history.back()');
-    expect(mockSetDaemonRunContext).toHaveBeenCalledWith(expect.objectContaining({
-      command: 'browser back', access: 'write',
-    }));
-  });
-
-  it('treats a batch as write when any nested command writes', async () => {
-    const program = createProgram('', '');
-
-    await program.parseAsync([
-      'node', 'opencli', 'browser', '--session', 'test', 'batch', '--commands',
-      JSON.stringify([{ cmd: 'state' }, { cmd: 'click', args: { target: '#save' } }]),
-    ]);
-
-    expect(mockSetDaemonRunContext).toHaveBeenCalledWith(expect.objectContaining({
-      command: 'browser batch', access: 'write',
-    }));
-  });
-
-  it('keeps an all-read batch parallel-safe', async () => {
-    const program = createProgram('', '');
-
-    await program.parseAsync([
-      'node', 'opencli', 'browser', '--session', 'test', 'batch', '--commands',
-      JSON.stringify([{ cmd: 'state' }, { cmd: 'wait', args: { seconds: 0 } }]),
-    ]);
-
-    expect(mockSetDaemonRunContext).toHaveBeenCalledWith(expect.objectContaining({
-      command: 'browser batch', access: 'read',
-    }));
   });
 
   it('unbinds a session through the daemon close-window command', async () => {
@@ -1460,7 +1246,7 @@ describe('browser tab targeting commands', () => {
     expect(process.exitCode).toBeDefined();
     expect(browserState.page?.setActivePage).not.toHaveBeenCalled();
     expect(browserState.page?.evaluate).not.toHaveBeenCalled();
-    expect(stderrSpy.mock.calls.flat().join('\n')).toContain('Target tab tab-stale is not part of the current browser session');
+    expect(consoleLogSpy.mock.calls.flat().join('\n')).toContain('Target tab tab-stale is not part of the current browser session');
   });
 
   it('lists tabs with target IDs via browser tab list', async () => {
@@ -1469,8 +1255,8 @@ describe('browser tab targeting commands', () => {
     await program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'tab', 'list']);
 
     expect(browserState.page?.tabs).toHaveBeenCalledTimes(1);
-    expect(consoleLogSpy.mock.calls.flat().join('\n')).toContain('"page": "tab-1"');
-    expect(consoleLogSpy.mock.calls.flat().join('\n')).toContain('"page": "tab-2"');
+    expect(consoleLogSpy.mock.calls.flat().join('\n')).toContain('"page":"tab-1"');
+    expect(consoleLogSpy.mock.calls.flat().join('\n')).toContain('"page":"tab-2"');
   });
 
   it('creates a new tab and prints its target ID', async () => {
@@ -1479,7 +1265,72 @@ describe('browser tab targeting commands', () => {
     await program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'tab', 'new', 'https://three.example']);
 
     expect(browserState.page?.newTab).toHaveBeenCalledWith('https://three.example');
-    expect(consoleLogSpy.mock.calls.flat().join('\n')).toContain('"page": "tab-3"');
+    expect(consoleLogSpy.mock.calls.flat().join('\n')).toContain('"page":"tab-3"');
+  });
+
+  afterEach(() => clearAllHooks());
+
+  it('awaits browser hooks before connecting and exposes positional URL and final output', async () => {
+    let release!: () => void;
+    let entered!: () => void;
+    const ready = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let beforeContext: HookContext | undefined;
+    onBeforeExecute(async context => { beforeContext = context; context.marker = 'shared'; entered(); await gate; });
+    const after = vi.fn(); onAfterExecute(after);
+    const running = createProgram('', '').parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'open', 'https://example.com/path']);
+    await ready;
+    expect(mockBrowserConnect).not.toHaveBeenCalled();
+    expect(beforeContext).toMatchObject({ command: 'browser/open', args: { url: 'https://example.com/path', session: 'test' } });
+    release(); await running;
+    expect(after).toHaveBeenCalledTimes(1);
+    expect(after.mock.calls[0][0]).toBe(beforeContext);
+    expect(after.mock.calls[0][0]).toMatchObject({ marker: 'shared', startedAt: expect.any(Number), finishedAt: expect.any(Number) });
+    expect(after.mock.calls[0][1]).toEqual(lastJsonLog());
+  });
+
+  it.each(['bind', 'unbind'])('emits both lifecycle hooks for session command %s', async name => {
+    const before = vi.fn((_context: HookContext) => { expect(mockBrowserConnect).not.toHaveBeenCalled(); });
+    const after = vi.fn(); onBeforeExecute(before); onAfterExecute(after);
+    await createProgram('', '').parseAsync(['node', 'opencli', 'browser', '--session', 'test', name]);
+    expect(before).toHaveBeenCalledTimes(1);
+    expect(before.mock.calls[0]?.[0]).toMatchObject({ command: `browser/${name}`, args: { session: 'test' } });
+    expect(after).toHaveBeenCalledTimes(1);
+    expect(after.mock.calls[0][1]).toEqual(lastJsonLog());
+  });
+
+  it('emits nested native Chrome command names and positional arguments', async () => {
+    const before = vi.fn(); const after = vi.fn(); onBeforeExecute(before); onAfterExecute(after);
+    await createProgram('', '').parseAsync(['node', 'opencli', 'browser', 'chrome', 'call', 'tabs.query', '[{}]']);
+    expect(before.mock.calls[0][0]).toMatchObject({ command: 'browser/chrome/call', args: { method: 'tabs.query', args: '[{}]' } });
+    expect(after).toHaveBeenCalledTimes(1);
+    expect(after.mock.calls[0][1]).toEqual({ closed: true });
+  });
+
+  it('reports handled native validation failures to the after hook', async () => {
+    const after = vi.fn(); onAfterExecute(after);
+    await createProgram('', '').parseAsync(['node', 'opencli', 'browser', 'chrome', 'call', 'tabs.query', 'invalid-json']);
+    expect(mockSendCommand).not.toHaveBeenCalled();
+    expect(after).toHaveBeenCalledTimes(1);
+    expect(after.mock.calls[0][0]).toMatchObject({ error: { code: 'invalid_args' }, finishedAt: expect.any(Number) });
+  });
+
+  it('reports browser connection failure to the after hook', async () => {
+    mockBrowserConnect.mockRejectedValueOnce(new Error('offline browser'));
+    const after = vi.fn(); onAfterExecute(after);
+    await createProgram('', '').parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'open', 'https://example.com']);
+    expect(after).toHaveBeenCalledTimes(1);
+    expect(after.mock.calls[0][0]).toMatchObject({ error: { message: 'offline browser' } });
+    expect(browserState.page?.goto).not.toHaveBeenCalled();
+  });
+
+  it('preserves the non-blocking contract when a browser hook throws', async () => {
+    onBeforeExecute(() => { throw new Error('plugin failed'); });
+    const after = vi.fn(); onAfterExecute(after);
+    await createProgram('', '').parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'open', 'https://example.com']);
+    expect(browserState.page?.goto).toHaveBeenCalledWith('https://example.com');
+    expect(after).toHaveBeenCalledTimes(1);
+    expect(after.mock.calls[0][0].error).toBeUndefined();
   });
 
   it('prints the resolved target ID when browser open creates or navigates a tab', async () => {
@@ -1487,54 +1338,9 @@ describe('browser tab targeting commands', () => {
 
     await program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'open', 'https://example.com']);
 
-    expect(browserState.page?.goto).toHaveBeenCalledWith('https://example.com', { timeoutMs: 15000 });
-    expect(consoleLogSpy.mock.calls.flat().join('\n')).toContain('"url": "https://one.example"');
-    expect(consoleLogSpy.mock.calls.flat().join('\n')).toContain('"page": "tab-1"');
-  });
-
-  describe('browser open navigation timeout resolution (--timeout > OPENCLI_NAV_TIMEOUT_MS > default)', () => {
-    const ORIGINAL_ENV_VALUE = process.env.OPENCLI_NAV_TIMEOUT_MS;
-
-    afterEach(() => {
-      if (ORIGINAL_ENV_VALUE === undefined) delete process.env.OPENCLI_NAV_TIMEOUT_MS;
-      else process.env.OPENCLI_NAV_TIMEOUT_MS = ORIGINAL_ENV_VALUE;
-    });
-
-    it('uses the built-in default (15000ms) when neither --timeout nor the env var is set', async () => {
-      delete process.env.OPENCLI_NAV_TIMEOUT_MS;
-      const program = createProgram('', '');
-
-      await program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'open', 'https://example.com']);
-
-      expect(browserState.page?.goto).toHaveBeenCalledWith('https://example.com', { timeoutMs: 15000 });
-    });
-
-    it('uses OPENCLI_NAV_TIMEOUT_MS when set and --timeout is absent', async () => {
-      process.env.OPENCLI_NAV_TIMEOUT_MS = '42000';
-      const program = createProgram('', '');
-
-      await program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'open', 'https://example.com']);
-
-      expect(browserState.page?.goto).toHaveBeenCalledWith('https://example.com', { timeoutMs: 42000 });
-    });
-
-    it('prefers the --timeout flag over OPENCLI_NAV_TIMEOUT_MS when both are set', async () => {
-      process.env.OPENCLI_NAV_TIMEOUT_MS = '42000';
-      const program = createProgram('', '');
-
-      await program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'open', 'https://example.com', '--timeout', '60000']);
-
-      expect(browserState.page?.goto).toHaveBeenCalledWith('https://example.com', { timeoutMs: 60000 });
-    });
-
-    it('falls back to the default and warns on an invalid --timeout value', async () => {
-      delete process.env.OPENCLI_NAV_TIMEOUT_MS;
-      const program = createProgram('', '');
-
-      await program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'open', 'https://example.com', '--timeout', 'not-a-number']);
-
-      expect(browserState.page?.goto).toHaveBeenCalledWith('https://example.com', { timeoutMs: 15000 });
-    });
+    expect(browserState.page?.goto).toHaveBeenCalledWith('https://example.com');
+    expect(consoleLogSpy.mock.calls.flat().join('\n')).toContain('"url":"https://one.example"');
+    expect(consoleLogSpy.mock.calls.flat().join('\n')).toContain('"page":"tab-1"');
   });
 
   it('lists cross-origin frames via browser frames', async () => {
@@ -1543,8 +1349,8 @@ describe('browser tab targeting commands', () => {
     await program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'frames']);
 
     expect(browserState.page?.frames).toHaveBeenCalledTimes(1);
-    expect(consoleLogSpy.mock.calls.flat().join('\n')).toContain('"frameId": "frame-1"');
-    expect(consoleLogSpy.mock.calls.flat().join('\n')).toContain('"url": "https://x.example/embed"');
+    expect(consoleLogSpy.mock.calls.flat().join('\n')).toContain('"frameId":"frame-1"');
+    expect(consoleLogSpy.mock.calls.flat().join('\n')).toContain('"url":"https://x.example/embed"');
   });
 
   it('routes browser eval --frame through frame-targeted evaluation', async () => {
@@ -1577,7 +1383,7 @@ describe('browser tab targeting commands', () => {
     expect(browserState.page?.selectTab).toHaveBeenCalledWith('tab-2');
     expect(browserState.page?.setActivePage).toHaveBeenCalledWith('tab-2');
     expect(browserState.page?.evaluate).toHaveBeenCalledWith('document.title');
-    expect(consoleLogSpy.mock.calls.flat().join('\n')).toContain('"selected": "tab-2"');
+    expect(consoleLogSpy.mock.calls.flat().join('\n')).toContain('"selected":"tab-2"');
   });
 
   it('clears a saved default target when it is no longer present in the current session', async () => {
@@ -1623,7 +1429,7 @@ describe('browser tab targeting commands', () => {
     await program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'tab', 'close', 'tab-2']);
 
     expect(browserState.page?.closeTab).toHaveBeenCalledWith('tab-2');
-    expect(consoleLogSpy.mock.calls.flat().join('\n')).toContain('"closed": "tab-2"');
+    expect(consoleLogSpy.mock.calls.flat().join('\n')).toContain('"closed":"tab-2"');
   });
 
   it('rejects closing a stale tab target ID that is no longer in the current session', async () => {
@@ -1638,126 +1444,13 @@ describe('browser tab targeting commands', () => {
 
     expect(process.exitCode).toBeDefined();
     expect(browserState.page?.closeTab).not.toHaveBeenCalled();
-    expect(stderrSpy.mock.calls.flat().join('\n')).toContain('Target tab tab-stale is not part of the current browser session');
+    expect(consoleLogSpy.mock.calls.flat().join('\n')).toContain('Target tab tab-stale is not part of the current browser session');
   });
 
-  it('browser analyze merges HttpOnly cookie names from page.getCookies and drains stale capture before verdict', async () => {
-    browserState.page = {
-      goto: vi.fn().mockResolvedValue(undefined),
-      wait: vi.fn().mockResolvedValue(undefined),
-      setActivePage: vi.fn(),
-      getActivePage: vi.fn().mockReturnValue('tab-1'),
-      getCurrentUrl: vi.fn().mockResolvedValue('https://target.example'),
-      startNetworkCapture: vi.fn().mockResolvedValue(true),
-      getCookies: vi.fn().mockResolvedValue([{ name: 'cf_clearance', value: 'x', domain: '.target.example' }]),
-      evaluate: vi.fn().mockResolvedValue({
-        cookieNames: [],
-        initialState: {
-          __INITIAL_STATE__: false,
-          __NUXT__: false,
-          __NEXT_DATA__: false,
-          __APOLLO_STATE__: false,
-        },
-        title: 'Target',
-        finalUrl: 'https://target.example/',
-      }),
-      tabs: vi.fn().mockResolvedValue([{ index: 0, page: 'tab-1', url: 'https://target.example', title: 'Target', active: true }]),
-      readNetworkCapture: vi.fn()
-        .mockResolvedValueOnce([
-          {
-            url: 'https://stale.example/api/old',
-            method: 'GET',
-            responseStatus: 200,
-            responseContentType: 'application/json',
-            responsePreview: '{"stale":true}',
-          },
-        ])
-        .mockResolvedValueOnce([
-          {
-            url: 'https://target.example/api/items',
-            method: 'GET',
-            responseStatus: 200,
-            responseContentType: 'application/json',
-            responsePreview: '{"items":[{"title":"A","id":"1"}]}',
-          },
-        ]),
-    } as unknown as IPage;
-
-    const program = createProgram('', '');
-    await program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'analyze', 'https://target.example/']);
-
-    const out = lastJsonLog();
-    expect(browserState.page?.readNetworkCapture).toHaveBeenCalledTimes(2);
-    expect(out.pattern.pattern).toBe('A');
-    expect(out.api_candidates[0].url).toBe('https://target.example/api/items');
-    expect(out.api_candidates[0].verdict).toBe('likely_data');
-    expect(out.anti_bot.evidence).toContain('cookie:cf_clearance');
-  });
-
-  it('browser analyze falls back to interceptor buffer when network capture is unsupported', async () => {
-    let bufferReads = 0;
-    browserState.page = {
-      goto: vi.fn().mockResolvedValue(undefined),
-      wait: vi.fn().mockResolvedValue(undefined),
-      setActivePage: vi.fn(),
-      getActivePage: vi.fn().mockReturnValue('tab-1'),
-      getCurrentUrl: vi.fn().mockResolvedValue('https://target.example'),
-      startNetworkCapture: vi.fn().mockResolvedValue(false),
-      getCookies: vi.fn().mockResolvedValue([{ name: 'cf_clearance', value: 'x', domain: '.target.example' }]),
-      evaluate: vi.fn().mockImplementation(async (arg: string) => {
-        if (typeof arg === 'string' && arg.includes('document.cookie')) {
-          return {
-            cookieNames: [],
-            initialState: {
-              __INITIAL_STATE__: false,
-              __NUXT__: false,
-              __NEXT_DATA__: false,
-              __APOLLO_STATE__: false,
-            },
-            title: 'Target',
-            finalUrl: 'https://target.example/',
-          };
-        }
-        if (typeof arg === 'string' && arg.includes('window.__opencli_net = []')) {
-          bufferReads += 1;
-          if (bufferReads === 1) {
-            return JSON.stringify([
-              {
-                url: 'https://stale.example/api/old',
-                method: 'GET',
-                status: 200,
-                size: 12,
-                ct: 'application/json',
-                body: { stale: true },
-              },
-            ]);
-          }
-          return JSON.stringify([
-            {
-              url: 'https://target.example/waf',
-              method: 'GET',
-              status: 403,
-              size: 17,
-              ct: 'text/html',
-              body: 'Cloudflare Ray ID',
-            },
-          ]);
-        }
-        return undefined;
-      }),
-      tabs: vi.fn().mockResolvedValue([{ index: 0, page: 'tab-1', url: 'https://target.example', title: 'Target', active: true }]),
-      readNetworkCapture: vi.fn().mockResolvedValue([]),
-    } as unknown as IPage;
-
-    const program = createProgram('', '');
-    await program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'analyze', 'https://target.example/']);
-
-    const out = lastJsonLog();
-    expect(browserState.page?.readNetworkCapture).toHaveBeenCalledTimes(2);
-    expect(bufferReads).toBe(2);
-    expect(out.anti_bot.vendor).toBe('cloudflare');
-    expect(out.anti_bot.evidence).toContain('cookie:cf_clearance');
-    expect(out.anti_bot.evidence).toContain('body:https://target.example/waf');
+  it('state diagnostics reports page facts without navigating or probing endpoints', async () => {
+    browserState.page!.evaluate = vi.fn().mockResolvedValue({title:'Fixture',url:'https://fixture.test',initialState:['__NEXT_DATA__']});
+    await createProgram('', '').parseAsync(['node','opencli','browser','state','--session','test','--diagnostics']);
+    expect(lastJsonLog()).toMatchObject({diagnostics:{title:'Fixture',initialState:['__NEXT_DATA__']}});
   });
 
   it('browser wait xhr starts capture, injects interceptor on fallback, and ignores stale ring entries', async () => {
@@ -1903,370 +1596,8 @@ describe('browser tab targeting commands', () => {
 
     const out = lastJsonLog();
     expect(out.error.code).toBe('download_not_seen');
-    expect(out.download.elapsedMs).toBe(900);
+    expect(out.error.download.elapsedMs).toBe(900);
     expect(process.exitCode).toBeDefined();
-  });
-});
-
-describe('browser sessions command', () => {
-  const consoleLogSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-
-  beforeEach(() => {
-    process.exitCode = undefined;
-    consoleLogSpy.mockClear();
-    mockSendCommand.mockReset();
-  });
-
-  function allLogs(): string {
-    return consoleLogSpy.mock.calls.map((c) => String(c[0])).join('\n');
-  }
-
-  it('marks the active tab with a leading "*" and appends [dedicated:<slot>] for a dedicated-slot entry, in table format', async () => {
-    mockSendCommand.mockResolvedValueOnce([
-      { session: 'semrush', surface: 'browser', kind: 'lease', windowId: 1234, groupTitle: 'semrush', url: 'https://semrush.com/report', dedicatedSlot: 'semrush', tabActive: true, keepAlive: true, idleDeadlineAt: 0 },
-      { session: 'plain', surface: 'browser', kind: 'lease', windowId: 5, groupTitle: 'plain', url: 'https://example.com', dedicatedSlot: null, tabActive: false },
-    ]);
-    const program = createProgram('', '');
-
-    await program.parseAsync(['node', 'opencli', 'browser', 'sessions']);
-
-    const logs = allLogs();
-    const semrushLine = logs.split('\n').find((l) => l.includes('semrush') && l.includes('win1234'))!;
-    expect(semrushLine).toMatch(/^\*/);
-    expect(semrushLine).toContain('[dedicated:semrush]');
-    expect(semrushLine).toContain('[keep-alive]');
-    const plainLine = logs.split('\n').find((l) => l.includes('plain') && l.includes('win5'))!;
-    expect(plainLine).not.toContain('[dedicated:');
-    expect(plainLine.startsWith('*')).toBe(false);
-  });
-
-  it('passes dedicatedSlot/tabActive through unchanged in json format', async () => {
-    const entries = [
-      { session: 'semrush', surface: 'browser', kind: 'lease', windowId: 1234, dedicatedSlot: 'semrush', tabActive: true },
-    ];
-    mockSendCommand.mockResolvedValueOnce(entries);
-    const program = createProgram('', '');
-
-    await program.parseAsync(['node', 'opencli', 'browser', 'sessions', '-f', 'json']);
-
-    const out = JSON.parse(String(consoleLogSpy.mock.calls.at(-1)?.[0]));
-    expect(out).toEqual(entries);
-  });
-});
-
-describe('browser window command', () => {
-  const consoleLogSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-
-  beforeEach(() => {
-    process.exitCode = undefined;
-    consoleLogSpy.mockClear();
-    mockSendCommand.mockReset();
-  });
-
-  function lastJsonLog(): any {
-    const calls = consoleLogSpy.mock.calls;
-    if (calls.length === 0) throw new Error('Expected at least one console.log call');
-    const last = calls[calls.length - 1][0];
-    if (typeof last !== 'string') throw new Error(`Expected string arg to console.log, got ${typeof last}`);
-    return JSON.parse(last);
-  }
-
-  function allLogs(): string {
-    return consoleLogSpy.mock.calls.map((c) => String(c[0])).join('\n');
-  }
-
-  const sampleWindowInfo = {
-    slot: 'semrush',
-    windowId: 1234,
-    exists: true,
-    bounds: { left: 0, top: 0, width: 1280, height: 900 },
-    placement: { source: 'display', displayName: '虚拟 16:9', displayPattern: '虚拟', displayFound: true },
-    onDisplay: true,
-    activeTab: { owner: 'lease', session: 'semrush', url: 'https://semrush.com/report' },
-    tabs: { total: 2, leases: 1, placeholders: 1, automation: 0, foreign: 0 },
-    sessions: ['semrush'],
-    autoSelect: true,
-    foreignTabPolicy: 'evict',
-  };
-
-  it('relayout routes to the extension and emits machine-readable old/new positions', async () => {
-    const data = { changed: 1, windows: [{ slot: 'pool-1', windowId: 50, displayId: '20', tileIndex: 0,
-      old: { bounds: { left: 0, top: 0, width: 1440, height: 900 }, state: 'maximized' },
-      new: { bounds: { left: -5120, top: 0, width: 1280, height: 950 }, state: 'normal' }, changed: true }] };
-    mockSendCommand.mockResolvedValueOnce(data);
-    await createProgram('', '').parseAsync(['node', 'opencli', 'browser', 'window', 'relayout', '-f', 'json']);
-    expect(mockSendCommand).toHaveBeenCalledWith('sessions', { op: 'window-relayout' });
-    expect(lastJsonLog()).toMatchObject(data);
-  });
-
-  describe('status', () => {
-    it('routes to sessions op=window-status and prints the data plus cliVersion (json)', async () => {
-      mockSendCommand.mockResolvedValueOnce({
-        supported: true,
-        protocol: 1,
-        capabilities: ['dedicated-window', 'window-slots'],
-        displays: [{ id: 'd1', name: '虚拟 16:9', primary: false, internal: false, bounds: { left: -2560, top: -1440, width: 2560, height: 1440 } }],
-        windows: [sampleWindowInfo],
-      });
-      const program = createProgram('', '');
-
-      await program.parseAsync(['node', 'opencli', 'browser', 'window', 'status', '-f', 'json']);
-
-      expect(mockSendCommand).toHaveBeenCalledWith('sessions', { op: 'window-status' });
-      const out = lastJsonLog();
-      expect(out.supported).toBe(true);
-      expect(out.cliVersion).toBe(PKG_VERSION);
-      expect(out.windows).toHaveLength(1);
-      expect(out.windows[0].slot).toBe('semrush');
-    });
-
-    it('defaults to table format and prints slot/window/displays information', async () => {
-      mockSendCommand.mockResolvedValueOnce({
-        supported: true,
-        displays: [{ id: 'd1', name: '虚拟 16:9', primary: false, internal: false, bounds: { left: -2560, top: -1440, width: 2560, height: 1440 } }],
-        windows: [sampleWindowInfo],
-      });
-      const program = createProgram('', '');
-
-      await program.parseAsync(['node', 'opencli', 'browser', 'window', 'status']);
-
-      const logs = allLogs();
-      expect(logs).toContain('semrush');
-      expect(logs).toContain('win1234');
-      expect(logs).toContain('Displays');
-      expect(logs).toContain('虚拟 16:9');
-    });
-
-    it('--slot filters the windows array client-side', async () => {
-      mockSendCommand.mockResolvedValueOnce({
-        supported: true,
-        displays: [],
-        windows: [sampleWindowInfo, { ...sampleWindowInfo, slot: 'similarweb', windowId: 999 }],
-      });
-      const program = createProgram('', '');
-
-      await program.parseAsync(['node', 'opencli', 'browser', 'window', 'status', '--slot', 'semrush', '-f', 'json']);
-
-      expect(mockSendCommand).toHaveBeenCalledWith('sessions', { op: 'window-status', windowSlot: 'semrush' });
-      const out = lastJsonLog();
-      expect(out.windows).toHaveLength(1);
-      expect(out.windows[0].slot).toBe('semrush');
-    });
-
-    it('prints {supported:false, reason:"extension-too-old"} and exits 0 when the extension answers with a plain array', async () => {
-      mockSendCommand.mockResolvedValueOnce([{ session: 'x', surface: 'browser', kind: 'lease' }]);
-      const program = createProgram('', '');
-
-      await program.parseAsync(['node', 'opencli', 'browser', 'window', 'status', '-f', 'json']);
-
-      expect(lastJsonLog()).toEqual({ supported: false, reason: 'extension-too-old' });
-      expect(process.exitCode).toBeUndefined();
-    });
-
-    it('prints {supported:false, reason:"bridge-unavailable"} and exits 1 when the daemon/bridge cannot be reached', async () => {
-      mockSendCommand.mockRejectedValueOnce(new Error('daemon not running'));
-      const program = createProgram('', '');
-
-      await program.parseAsync(['node', 'opencli', 'browser', 'window', 'status', '-f', 'json']);
-
-      const out = lastJsonLog();
-      expect(out.supported).toBe(false);
-      expect(out.reason).toBe('bridge-unavailable');
-      expect(out.error).toContain('daemon not running');
-      expect(process.exitCode).toBe(1);
-    });
-  });
-
-  describe('ensure', () => {
-    it('routes to sessions op=window-ensure with slot/display params and prints the data (json)', async () => {
-      mockSendCommand.mockResolvedValueOnce({ ...sampleWindowInfo, created: true, moved: false });
-      const program = createProgram('', '');
-
-      await program.parseAsync(['node', 'opencli', 'browser', 'window', 'ensure', '--slot', 'semrush', '--display', '虚拟', '-f', 'json']);
-
-      expect(mockSendCommand).toHaveBeenCalledWith('sessions', { op: 'window-ensure', windowSlot: 'semrush', windowDisplay: '虚拟' });
-      const out = lastJsonLog();
-      expect(out.created).toBe(true);
-      expect(out.moved).toBe(false);
-      expect(out.cliVersion).toBe(PKG_VERSION);
-    });
-
-    it('parses --bounds into windowBounds', async () => {
-      mockSendCommand.mockResolvedValueOnce({ ...sampleWindowInfo, created: false, moved: true });
-      const program = createProgram('', '');
-
-      await program.parseAsync(['node', 'opencli', 'browser', 'window', 'ensure', '--bounds', '0,0,1280,900', '-f', 'json']);
-
-      expect(mockSendCommand).toHaveBeenCalledWith('sessions', {
-        op: 'window-ensure',
-        windowBounds: { left: 0, top: 0, width: 1280, height: 900 },
-      });
-    });
-
-    it('rejects a malformed --bounds with a usage error, without calling sendCommand', async () => {
-      const program = createProgram('', '');
-
-      await program.parseAsync(['node', 'opencli', 'browser', 'window', 'ensure', '--bounds', 'nope', '-f', 'json']);
-
-      expect(mockSendCommand).not.toHaveBeenCalled();
-      expect(process.exitCode).toBe(2);
-    });
-
-    it('parses --foreign-tabs', async () => {
-      mockSendCommand.mockResolvedValueOnce(sampleWindowInfo);
-      const program = createProgram('', '');
-
-      await program.parseAsync(['node', 'opencli', 'browser', 'window', 'ensure', '--foreign-tabs', 'tolerate', '-f', 'json']);
-
-      expect(mockSendCommand).toHaveBeenCalledWith('sessions', { op: 'window-ensure', foreignTabPolicy: 'tolerate' });
-    });
-
-    it('rejects an invalid --foreign-tabs value', async () => {
-      const program = createProgram('', '');
-
-      await program.parseAsync(['node', 'opencli', 'browser', 'window', 'ensure', '--foreign-tabs', 'nope']);
-
-      expect(mockSendCommand).not.toHaveBeenCalled();
-      expect(process.exitCode).toBe(2);
-    });
-
-    it('prints {supported:false, reason:"extension-too-old"} and exits 0 when the extension answers with a plain array', async () => {
-      mockSendCommand.mockResolvedValueOnce([]);
-      const program = createProgram('', '');
-
-      await program.parseAsync(['node', 'opencli', 'browser', 'window', 'ensure', '-f', 'json']);
-
-      expect(lastJsonLog()).toEqual({ supported: false, reason: 'extension-too-old' });
-      expect(process.exitCode).toBeUndefined();
-    });
-  });
-
-  describe('list', () => {
-    const sampleListInfo = {
-      ...sampleWindowInfo,
-      pooled: true,
-      holders: 0,
-      busy: false,
-      idleMs: 65_000,
-      tileIndex: 0,
-    };
-
-    it('routes to sessions op=window-list and prints the data plus cliVersion (json)', async () => {
-      mockSendCommand.mockResolvedValueOnce({
-        supported: true,
-        displays: [],
-        windows: [sampleListInfo],
-        pool: { automationDisplay: '虚拟 16:9', capacity: 4, live: 1, idle: 1, free: 3, idleTtlMs: 300_000 },
-      });
-      const program = createProgram('', '');
-
-      await program.parseAsync(['node', 'opencli', 'browser', 'window', 'list', '-f', 'json']);
-
-      expect(mockSendCommand).toHaveBeenCalledWith('sessions', { op: 'window-list' });
-      const out = lastJsonLog();
-      expect(out.cliVersion).toBe(PKG_VERSION);
-      expect(out.windows).toHaveLength(1);
-      expect(out.windows[0].tileIndex).toBe(0);
-      expect(out.pool).toMatchObject({ capacity: 4, live: 1, idle: 1, free: 3, idleTtlMs: 300_000 });
-    });
-
-    it('defaults to table format and prints a compact per-window line plus a pool summary', async () => {
-      mockSendCommand.mockResolvedValueOnce({
-        supported: true,
-        displays: [],
-        windows: [sampleListInfo],
-        pool: { automationDisplay: '虚拟 16:9', capacity: 4, live: 1, idle: 1, free: 3, idleTtlMs: 300_000 },
-      });
-      const program = createProgram('', '');
-
-      await program.parseAsync(['node', 'opencli', 'browser', 'window', 'list']);
-
-      const logs = allLogs();
-      expect(logs).toContain('semrush');
-      expect(logs).toContain('win1234');
-      expect(logs).toContain('idle');
-      expect(logs).toContain('capacity=4');
-      expect(logs).toContain('free=3');
-      expect(logs).toContain('idleTtl=300s');
-    });
-
-    it('prints {supported:false, reason:"extension-too-old"} for a pre-pool extension', async () => {
-      mockSendCommand.mockResolvedValueOnce([]);
-      const program = createProgram('', '');
-
-      await program.parseAsync(['node', 'opencli', 'browser', 'window', 'list', '-f', 'json']);
-
-      expect(lastJsonLog()).toEqual({ supported: false, reason: 'extension-too-old' });
-      expect(process.exitCode).toBeUndefined();
-    });
-  });
-
-  describe('close', () => {
-    it('routes to sessions op=window-close with no params when --slot/--force are omitted', async () => {
-      mockSendCommand.mockResolvedValueOnce({ closed: ['default'], skipped: [], remaining: [] });
-      const program = createProgram('', '');
-
-      await program.parseAsync(['node', 'opencli', 'browser', 'window', 'close', '-f', 'json']);
-
-      expect(mockSendCommand).toHaveBeenCalledWith('sessions', { op: 'window-close' });
-      const out = lastJsonLog();
-      expect(out.closed).toEqual(['default']);
-      expect(out.cliVersion).toBe(PKG_VERSION);
-      expect(process.exitCode).toBeUndefined();
-    });
-
-    it('passes --slot and --force through as windowSlot/force', async () => {
-      mockSendCommand.mockResolvedValueOnce({ closed: ['semrush'], skipped: [], remaining: [] });
-      const program = createProgram('', '');
-
-      await program.parseAsync(['node', 'opencli', 'browser', 'window', 'close', '--slot', 'semrush', '--force', '-f', 'json']);
-
-      expect(mockSendCommand).toHaveBeenCalledWith('sessions', { op: 'window-close', windowSlot: 'semrush', force: true });
-    });
-
-    it('prints a readable summary in table mode', async () => {
-      mockSendCommand.mockResolvedValueOnce({
-        closed: ['default'],
-        skipped: [{ slot: 'semrush', reason: 'live lease held' }],
-        remaining: ['semrush'],
-      });
-      const program = createProgram('', '');
-
-      await program.parseAsync(['node', 'opencli', 'browser', 'window', 'close']);
-
-      const logs = allLogs();
-      expect(logs).toContain('Closed: default');
-      expect(logs).toContain('Skipped: semrush (live lease held)');
-      expect(logs).toContain('Remaining: semrush');
-    });
-
-    it('exits non-zero only when nothing was closed AND something was skipped', async () => {
-      mockSendCommand.mockResolvedValueOnce({ closed: [], skipped: [{ slot: 'semrush', reason: 'live lease held' }], remaining: ['semrush'] });
-      const program = createProgram('', '');
-
-      await program.parseAsync(['node', 'opencli', 'browser', 'window', 'close', '-f', 'json']);
-
-      expect(process.exitCode).toBe(1);
-    });
-
-    it('does not treat a partial success (some closed, some skipped) as a failure', async () => {
-      mockSendCommand.mockResolvedValueOnce({ closed: ['default'], skipped: [{ slot: 'semrush', reason: 'live lease held' }], remaining: ['semrush'] });
-      const program = createProgram('', '');
-
-      await program.parseAsync(['node', 'opencli', 'browser', 'window', 'close', '-f', 'json']);
-
-      expect(process.exitCode).toBeUndefined();
-    });
-
-    it('prints {supported:false, reason:"extension-too-old"} for a pre-pool extension', async () => {
-      mockSendCommand.mockResolvedValueOnce([]);
-      const program = createProgram('', '');
-
-      await program.parseAsync(['node', 'opencli', 'browser', 'window', 'close', '-f', 'json']);
-
-      expect(lastJsonLog()).toEqual({ supported: false, reason: 'extension-too-old' });
-      expect(process.exitCode).toBeUndefined();
-    });
   });
 });
 
@@ -2286,7 +1617,9 @@ describe('browser network command', () => {
     if (calls.length === 0) throw new Error('Expected at least one console.log call');
     const last = calls[calls.length - 1][0];
     if (typeof last !== 'string') throw new Error(`Expected string arg to console.log, got ${typeof last}`);
-    return JSON.parse(last);
+    const envelope = JSON.parse(last);
+    expect(typeof envelope.ok).toBe('boolean');
+    return envelope.ok ? envelope.data : envelope;
   }
 
   beforeEach(() => {
@@ -2545,52 +1878,6 @@ describe('browser network command', () => {
     const out = lastJsonLog();
     expect(out.entries[0].body).toEqual({ data: { user: { rest_id: '42' } } });
     expect(out.entries[0].timestamp).toMatch(/T/);
-  });
-
-  it('surfaces an unavailable response body explicitly in --raw and --detail output', async () => {
-    browserState.page!.readNetworkCapture = vi.fn().mockResolvedValue([
-      {
-        url: 'https://api.example.com/ok',
-        method: 'POST',
-        responseStatus: 200,
-        responseContentType: 'application/json',
-        responsePreview: JSON.stringify({ id: 1 }),
-        timestamp: Date.now(),
-      },
-      {
-        url: 'https://api.example.com/lost',
-        method: 'POST',
-        responseStatus: 200,
-        responseContentType: 'application/json',
-        responseBodyUnavailable: true,
-        responseBodyError: 'debugger re-attached before this response body was fetched',
-        timestamp: Date.now(),
-      },
-    ]);
-    const program = createProgram('', '');
-
-    await program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'network', '--raw']);
-
-    const raw = lastJsonLog();
-    expect(raw.body_unavailable_count).toBe(1);
-    const ok = raw.entries.find((e: any) => e.url.endsWith('/ok'));
-    const lost = raw.entries.find((e: any) => e.url.endsWith('/lost'));
-    // Successful entries keep their exact previous shape.
-    expect(ok.body).toEqual({ id: 1 });
-    expect(ok).not.toHaveProperty('body_unavailable');
-    expect(ok).not.toHaveProperty('body_error');
-    // A lost body is null + flagged, never an empty string posing as success.
-    expect(lost.body).toBeNull();
-    expect(lost.body_unavailable).toBe(true);
-    expect(lost.body_error).toMatch(/re-attached/);
-
-    consoleLogSpy.mockClear();
-    await program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'network', '--detail', lost.key]);
-
-    const detail = lastJsonLog();
-    expect(detail.body).toBeNull();
-    expect(detail.body_unavailable).toBe(true);
-    expect(detail.body_error).toMatch(/re-attached/);
   });
 
   it('--detail <key> returns the full body for the requested entry', async () => {
@@ -2968,7 +2255,9 @@ describe('browser console command', () => {
     if (calls.length === 0) throw new Error('Expected at least one console.log call');
     const last = calls[calls.length - 1][0];
     if (typeof last !== 'string') throw new Error(`Expected string arg to console.log, got ${typeof last}`);
-    return JSON.parse(last);
+    const envelope = JSON.parse(last);
+    expect(typeof envelope.ok).toBe('boolean');
+    return envelope.ok ? envelope.data : envelope;
   }
 
   it('filters console messages by level and time window', async () => {
@@ -2993,7 +2282,9 @@ describe('browser get html command', () => {
   function lastJsonLog(): any {
     const arg = lastLogArg();
     if (typeof arg !== 'string') throw new Error(`expected string arg, got ${typeof arg}`);
-    return JSON.parse(arg);
+    const envelope = JSON.parse(arg);
+    expect(typeof envelope.ok).toBe('boolean');
+    return envelope.ok ? envelope.data : envelope;
   }
 
   beforeEach(() => {
@@ -3018,7 +2309,7 @@ describe('browser get html command', () => {
 
     await program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'get', 'html']);
 
-    expect(lastLogArg()).toBe(big);
+    expect(lastJsonLog()).toBe(big);
   });
 
   it('caps output with --max and prepends a visible truncation marker', async () => {
@@ -3028,7 +2319,7 @@ describe('browser get html command', () => {
 
     await program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'get', 'html', '--max', '100']);
 
-    const out = String(lastLogArg());
+    const out = String(lastJsonLog());
     expect(out.startsWith('<!-- opencli: truncated 100 of')).toBe(true);
     expect(out.length).toBeGreaterThan(100);
     expect(out.length).toBeLessThan(big.length);
@@ -3157,7 +2448,9 @@ function installSelectorFirstTestHarness(label: string, pageOverrides: () => Par
   function lastJsonLog(): any {
     const arg = lastLogArg();
     if (typeof arg !== 'string') throw new Error(`expected string arg, got ${typeof arg}`);
-    return JSON.parse(arg);
+    const envelope = JSON.parse(arg);
+    expect(typeof envelope.ok).toBe('boolean');
+    return envelope.ok ? envelope.data : envelope;
   }
 
   beforeEach(() => {
@@ -3938,16 +3231,7 @@ describe('browser click/type commands', () => {
 
     await program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'fill', '#msg', 'expected']);
 
-    expect(lastJsonLog()).toEqual({
-      filled: true,
-      verified: false,
-      target: '#msg',
-      text: 'expected',
-      actual: 'actual',
-      length: 6,
-      matches_n: 1,
-      match_level: 'exact',
-    });
+    expect(lastJsonLog()).toMatchObject({ ok: false, error: { code: 'value_mismatch', expected: 'expected', actual: 'actual' } });
     expect(process.exitCode).toBeDefined();
   });
 
@@ -4090,56 +3374,5 @@ describe('normalizeVerifyRows', () => {
 
   it('wraps a single object as a one-row array', () => {
     expect(normalizeVerifyRows({ ok: true })).toEqual([{ ok: true }]);
-  });
-});
-
-describe('renderVerifyPreview', () => {
-  it('emits a placeholder for empty rows', () => {
-    expect(renderVerifyPreview([])).toContain('no rows');
-  });
-
-  it('prints column headers followed by row cells', () => {
-    const out = renderVerifyPreview([{ a: 'x', b: 1 }, { a: 'y', b: 2 }]);
-    const lines = out.split('\n');
-    expect(lines[0]).toContain('a');
-    expect(lines[0]).toContain('b');
-    expect(lines.some((l) => l.includes('x') && l.includes('1'))).toBe(true);
-    expect(lines.some((l) => l.includes('y') && l.includes('2'))).toBe(true);
-  });
-
-  it('truncates long cells and reports hidden rows / columns', () => {
-    const rows = Array.from({ length: 15 }, (_, i) => ({
-      a: i, b: 'x'.repeat(100), c: i, d: i, e: i, f: i, g: i, h: i,
-    }));
-    const out = renderVerifyPreview(rows, { maxRows: 5, maxCols: 3, cellMax: 10 });
-    expect(out).toContain('and 10 more row');
-    expect(out).toContain('more column');
-    // cell gets truncated
-    expect(out).toContain('xxxxxxxxxx');
-    expect(out).not.toContain('xxxxxxxxxxx'); // never 11 consecutive
-  });
-});
-
-
-describe('browser viewport command', () => {
-  beforeEach(() => {
-    process.exitCode = undefined;
-    mockBrowserConnect.mockClear();
-    mockSendCommand.mockReset().mockResolvedValue({ supported: true });
-    browserState.page = { session: 'test', tabs: vi.fn().mockResolvedValue([]) } as unknown as IPage;
-  });
-
-  it('sends set and reset to the session without requiring an open tab', async () => {
-    await createProgram('', '').parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'viewport', 'set', '390', '844']);
-    expect(mockSendCommand).toHaveBeenCalledWith('viewport', { session: 'test', surface: 'browser', op: 'set', width: 390, height: 844 });
-    await createProgram('', '').parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'viewport', 'reset']);
-    expect(mockSendCommand).toHaveBeenLastCalledWith('viewport', { session: 'test', surface: 'browser', op: 'reset' });
-  });
-
-  it.each(['0', '-1', '3.9', '9007199254740992'])('rejects width %s before connecting', async (width) => {
-    const program = createProgram('', '').exitOverride();
-    await expect(program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'viewport', 'set', width, '844'])).rejects.toThrow();
-    expect(mockBrowserConnect).not.toHaveBeenCalled();
-    expect(mockSendCommand).not.toHaveBeenCalled();
   });
 });

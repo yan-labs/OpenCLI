@@ -61,7 +61,7 @@ describe('buildUpdateNotices', () => {
       now,
     });
     expect(lines.cli).toContain('v1.0.0 → v1.0.1');
-    expect(lines.cli).toMatch(/cd .+ && git pull && npm run build/);
+    expect(lines.cli).toMatch(/cd .+ && git pull && pnpm build/);
     expect(lines.extension).toBeUndefined();
   });
 

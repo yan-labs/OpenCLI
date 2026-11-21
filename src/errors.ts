@@ -17,7 +17,7 @@
  *  75   Temporary failure, retry later  (TimeoutError)   EX_TEMPFAIL
  *  77   Permission denied / auth needed (AuthRequiredError)
  *  78   Configuration error             (ConfigError)
- * 130   Interrupted by Ctrl-C           (set by tui.ts SIGINT handler)
+ * 130   Interrupted by Ctrl-C
  */
 import type { ObservationTraceReceipt } from './observation/events.js';
 
@@ -103,11 +103,11 @@ export class ConfigError extends CliError {
 
 export class AuthRequiredError extends CliError {
   readonly domain: string;
-  constructor(domain: string, message?: string) {
+  constructor(domain: string, message?: string, hint?: string) {
     super(
       'AUTH_REQUIRED',
       message ?? `Not logged in to ${domain}`,
-      `Please open Chrome or Chromium and log in to https://${domain}`,
+      hint ?? `Please open Chrome or Chromium and log in to https://${domain}`,
       EXIT_CODES.NOPERM,
     );
     this.domain = domain;
@@ -119,7 +119,7 @@ export class TimeoutError extends CliError {
     super(
       'TIMEOUT',
       `${label} timed out after ${seconds}s`,
-      hint ?? 'Try again, or increase timeout with --timeout <seconds> (or OPENCLI_BROWSER_COMMAND_TIMEOUT for the global default)',
+      hint ?? 'Try again, or increase the global browser command timeout with OPENCLI_BROWSER_COMMAND_TIMEOUT (seconds)',
       EXIT_CODES.TEMPFAIL,
     );
   }

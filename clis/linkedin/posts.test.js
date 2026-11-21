@@ -8,15 +8,6 @@ const { activityUrl, parseMetric, parseReactionText, normalizePost } = await imp
 describe('linkedin posts adapter', () => {
   const command = getRegistry().get('linkedin/posts');
 
-  it('registers command shape', () => {
-    expect(command).toBeDefined();
-    expect(command.strategy).toBe('cookie');
-    expect(command.browser).toBe(true);
-    expect(command.columns).toContain('reactions');
-    expect(command.columns).toContain('media_urls');
-    expect(command.columns).toContain('raw_text');
-  });
-
   it('builds profile activity URL', () => {
     expect(activityUrl('https://www.linkedin.com/in/gauravsaxena1997/')).toBe('https://www.linkedin.com/in/gauravsaxena1997/recent-activity/all/');
   });

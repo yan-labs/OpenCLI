@@ -93,10 +93,12 @@ function buildProjectsExtractionScript() {
       if (!value) return '';
       try {
         const parsed = new URL(value, location.origin);
-        if (parsed.hostname.endsWith('linkedin.com') && parsed.pathname === '/safety/go/') {
+        if (parsed.username || parsed.password) return '';
+        if ((parsed.hostname === 'linkedin.com' || parsed.hostname.endsWith('.linkedin.com')) && parsed.pathname === '/safety/go/') {
           const decoded = parsed.searchParams.get('url') || '';
           try {
             const target = new URL(decoded, location.origin);
+            if (target.username || target.password) return '';
             if (target.protocol === 'http:' || target.protocol === 'https:') return target.toString();
             return '';
           } catch {
@@ -291,6 +293,7 @@ cli({
 });
 
 export const __test__ = {
+  buildProjectsExtractionScript,
   normalizeProfileUrl,
   profileProjectsUrl,
   parseProjectText,

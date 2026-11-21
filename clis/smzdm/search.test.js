@@ -9,13 +9,6 @@ function runBrowserScript(html, script, url = 'https://search.smzdm.com/?c=home&
 }
 
 describe('smzdm/search', () => {
-    it('declares read access and the enriched column set', () => {
-        expect(smzdmSearchCommand.access).toBe('read');
-        expect(smzdmSearchCommand.columns).toEqual([
-            'rank', 'title', 'price', 'mall', 'updated_at',
-            'zhi_count', 'buzhi_count', 'favorite_count', 'comments', 'url',
-        ]);
-    });
 
     it('extracts interaction metrics and update time from a search result item', () => {
         const html = `<ul><li class="feed-row-wide">

@@ -6,6 +6,7 @@
 
 | Command | Description |
 |---------|-------------|
+| `opencli douyin detail <target>` | 单条视频或图文详情（ID、HTTPS 视频链接或分享短链） |
 | `opencli douyin profile` | 获取账号信息 |
 | `opencli douyin videos` | 获取作品列表 |
 | `opencli douyin drafts` | 获取草稿列表 |
@@ -73,3 +74,7 @@ opencli douyin profile -f json
 - `publish` requires `--schedule` to be at least 2 hours later and no more than 14 days later
 - `draft` and `publish` upload the video through Douyin/ByteDance browser-authenticated APIs, so cookies in the active browser session must be valid
 - `hashtag suggest` expects a valid `cover`/`cover_uri` value produced during the publish pipeline; for normal manual use, `hashtag search` and `hashtag hot` are usually more convenient
+
+## Public content details
+
+`opencli douyin detail <target> -f json` uses your browser session on `www.douyin.com`. It returns the caption, author and sec_uid, engagement counts, UTC creation time, duration, music, media URLs and image list. The target accepts a 16–20 digit ID, a Douyin video URL, or an HTTPS `v.douyin.com` share URL. Short links follow at most six redirects within known Douyin domains. Deleted, restricted, mismatched and failed API responses produce explicit errors. Media URLs may expire.

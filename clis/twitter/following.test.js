@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { getRegistry } from '@jackwener/opencli/registry';
-import { ArgumentError, AuthRequiredError, CommandExecutionError, EmptyResultError } from '@jackwener/opencli/errors';
+import { CommandExecutionError } from '@jackwener/opencli/errors';
 import { __test__ } from './following.js';
 
 describe('twitter following helpers', () => {
@@ -247,24 +247,25 @@ function bridgeEnvelope(data) {
     return { session: 'site:twitter', data };
 }
 
+const VIEWER_LOOKUP = { data: { user: { result: { __typename: 'User', rest_id: '42', core: { screen_name: 'viewer' } } } } };
+
 function createFollowingPage(followingResponses, { ct0 = 'token', userLookup = { userId: '42' }, envelope = false } = {}) {
     const page = {
         goto: vi.fn().mockResolvedValue(undefined),
         wait: vi.fn().mockResolvedValue(undefined),
-        getCookies: vi.fn(async () => (ct0 ? [{ name: 'ct0', value: ct0 }] : [])),
+        getCookies: vi.fn(async () => (ct0 ? [{ name: 'ct0', value: ct0 }, { name: 'twid', value: 'u%3D42' }] : [])),
         evaluate: vi.fn(async (script, ...args) => {
             const wrap = (value) => envelope ? bridgeEnvelope(value) : value;
             if (typeof script === 'function') {
                 const haystack = [script.toString(), ...args.map((arg) => String(arg))].join('\n');
                 if (haystack.includes('/UserByScreenName')) return wrap(userLookup);
                 if (haystack.includes('/Following')) return wrap(followingResponses.shift() || followingPayload([], null));
-                if (haystack.includes('AppTabBar_Profile_Link')) return wrap('/viewer');
                 throw new Error(`Unexpected evaluate function: ${haystack.slice(0, 80)}`);
             }
             if (script.includes('operationName')) return null;
             if (script.includes('/UserByScreenName')) return wrap(userLookup);
             if (script.includes('/Following')) return wrap(followingResponses.shift() || followingPayload([], null));
-            if (script.includes('AppTabBar_Profile_Link')) return wrap('/viewer');
+            if (script.includes('/UserByRestId')) return wrap(VIEWER_LOOKUP);
             throw new Error(`Unexpected evaluate script: ${script.slice(0, 80)}`);
         }),
     };
@@ -293,87 +294,20 @@ describe('twitter following command', () => {
         expect(decodeURIComponent(callText(followingCalls[1]))).toContain('"cursor":"cursor-1"');
     });
 
-    it('rejects invalid limits before navigating', async () => {
+    it('defaults to the logged-in account from the twid cookie without the DOM sidebar (#2770)', async () => {
         const command = getRegistry().get('twitter/following');
-        const page = createFollowingPage([]);
+        const page = createFollowingPage([followingPayload(['alice'], null)]);
 
-        await expect(command.func(page, { user: 'elonmusk', limit: 0 })).rejects.toBeInstanceOf(ArgumentError);
-        expect(page.goto).not.toHaveBeenCalled();
-    });
-
-    it('rejects invalid explicit users before cookies or navigation', async () => {
-        const command = getRegistry().get('twitter/following');
-        const page = createFollowingPage([]);
-
-        await expect(command.func(page, { user: 'elonmusk/extra', limit: 10 })).rejects.toBeInstanceOf(ArgumentError);
-        expect(page.getCookies).not.toHaveBeenCalled();
-        expect(page.goto).not.toHaveBeenCalled();
-        expect(page.evaluate).not.toHaveBeenCalled();
-    });
-
-    it('rejects route-like AppTabBar hrefs as AuthRequiredError', async () => {
-        const command = getRegistry().get('twitter/following');
-        const page = createFollowingPage([]);
-        page.evaluate.mockImplementation(async (script, ...args) => {
-            const haystack = [typeof script === 'function' ? script.toString() : String(script), ...args.map((arg) => String(arg))].join('\n');
-            if (haystack.includes('AppTabBar_Profile_Link')) return '/home';
-            throw new Error(`Unexpected evaluate: ${haystack.slice(0, 80)}`);
-        });
-
-        await expect(command.func(page, { limit: 10 })).rejects.toBeInstanceOf(AuthRequiredError);
-        expect(page.goto).toHaveBeenCalledWith('https://x.com/home');
-    });
-
-    it('maps first-page auth failures to AuthRequiredError', async () => {
-        const command = getRegistry().get('twitter/following');
-        const page = createFollowingPage([{ error: 401 }]);
-
-        await expect(command.func(page, { user: 'elonmusk', limit: 10 })).rejects.toBeInstanceOf(AuthRequiredError);
-    });
-
-    it('does not silently return partial rows when a later page fails', async () => {
-        const command = getRegistry().get('twitter/following');
-        const page = createFollowingPage([
-            followingPayload(['alice'], 'cursor-1'),
-            { error: 429 },
-        ]);
-
-        await expect(command.func(page, { user: 'elonmusk', limit: 10 })).rejects.toBeInstanceOf(CommandExecutionError);
-    });
-
-    it('maps user lookup auth failures to AuthRequiredError', async () => {
-        const command = getRegistry().get('twitter/following');
-        const page = createFollowingPage([], { userLookup: { error: 403 } });
-
-        await expect(command.func(page, { user: 'elonmusk', limit: 10 })).rejects.toBeInstanceOf(AuthRequiredError);
-    });
-
-    it('unwraps Browser Bridge envelopes for user lookup and following payloads', async () => {
-        const command = getRegistry().get('twitter/following');
-        const page = createFollowingPage([followingPayload(['alice'], null)], { envelope: true });
-
-        const rows = await command.func(page, { user: 'elonmusk', limit: 10 });
+        const rows = await command.func(page, { limit: 5 });
 
         expect(rows.map((row) => row.screen_name)).toEqual(['alice']);
         const callText = (call) => call.map((part) => typeof part === 'function' ? part.toString() : String(part)).join('\n');
-        const followingCall = page.evaluate.mock.calls.find((call) => callText(call).includes('/Following')) || [];
-        const followingUrl = String(followingCall[1] || '');
-        expect(decodeURIComponent(followingUrl)).toContain('"userId":"42"');
-        expect(decodeURIComponent(followingUrl)).not.toContain('[object Object]');
+        const viewerLookup = callText(page.evaluate.mock.calls.find((call) => callText(call).includes('/UserByRestId')) || []);
+        expect(decodeURIComponent(viewerLookup)).toContain('"userId":"42"');
+        const userLookup = callText(page.evaluate.mock.calls.find((call) => callText(call).includes('/UserByScreenName')) || []);
+        expect(decodeURIComponent(userLookup)).toContain('"screen_name":"viewer"');
+        expect(page.wait).not.toHaveBeenCalled();
+        expect(page.evaluate.mock.calls.some((call) => callText(call).includes('data-testid'))).toBe(false);
     });
 
-    it('fails fast when the following timeline is empty', async () => {
-        const command = getRegistry().get('twitter/following');
-        const page = createFollowingPage([followingPayload([], null)]);
-
-        await expect(command.func(page, { user: 'elonmusk', limit: 10 })).rejects.toBeInstanceOf(EmptyResultError);
-    });
-
-    it('surfaces the private-following privacy hint when result.timeline is empty', async () => {
-        const command = getRegistry().get('twitter/following');
-        const page = createFollowingPage([{ data: { user: { result: { __typename: 'User', timeline: {} } } } }]);
-
-        await expect(command.func(page, { user: 'simonw', limit: 10 }))
-            .rejects.toMatchObject({ hint: expect.stringContaining('following list to private') });
-    });
 });

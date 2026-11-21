@@ -1,17 +1,9 @@
 /**
- * DBLP adapter utilities.
- *
- * dblp serves a public, unauthenticated API:
- *   - Publication search (JSON):
- *     `https://dblp.org/search/publ/api?q=<query>&format=json&h=<limit>`
- *   - Per-record metadata (XML):
- *     `https://dblp.org/rec/<key>.xml`
- *
- * The search response is well-shaped JSON, but the per-record endpoint is
- * XML. We parse it with conservative regexes (same pattern as the arxiv
- * adapter) to avoid pulling in an XML lib for this single endpoint.
+ * DBLP row normalization and record parsing. The browser transport validates
+ * XML and expands character entities before these conservative record helpers
+ * project metadata into the existing CLI schema.
  */
-import { ArgumentError, CommandExecutionError, EmptyResultError } from '@jackwener/opencli/errors';
+import { ArgumentError } from '@jackwener/opencli/errors';
 
 export const DBLP_ORIGIN = 'https://dblp.org';
 
@@ -22,66 +14,6 @@ export const DBLP_ORIGIN = 'https://dblp.org';
  * containing letters / digits / `_` / `.` / `-`.
  */
 const KEY_PATTERN = /^[a-z]+(?:\/[A-Za-z0-9_.-]+)+$/;
-
-/**
- * Wraps `fetch` with typed errors. We always set a UA per dblp's
- * polite-fetch guidance (https://dblp.org/faq/How+to+use+the+dblp+search+API.html).
- */
-async function dblpFetch(url, label, accept) {
-    let res;
-    try {
-        res = await fetch(url, {
-            headers: {
-                accept,
-                'user-agent': 'opencli-dblp/1.0 (+https://github.com/jackwener/opencli)',
-            },
-        });
-    }
-    catch (err) {
-        throw new CommandExecutionError(`${label} request failed: ${err?.message ?? err}`, 'Check that dblp.org is reachable from this network.');
-    }
-    if (!res.ok) {
-        if (res.status === 429) {
-            throw new CommandExecutionError(`${label} returned HTTP 429 (rate limited)`, 'dblp throttles clients that fetch too aggressively. Wait a few seconds and retry, or lower --limit.');
-        }
-        if (res.status === 404) {
-            throw new EmptyResultError(label, 'dblp returned 404 — the requested record may not exist.');
-        }
-        throw new CommandExecutionError(`${label} returned HTTP ${res.status}`, 'Inspect the response in a browser at the same URL for more context.');
-    }
-    return res;
-}
-
-export async function dblpFetchJson(path, label) {
-    const res = await dblpFetch(`${DBLP_ORIGIN}${path}`, label, 'application/json');
-    let body;
-    try {
-        body = await res.json();
-    }
-    catch (err) {
-        throw new CommandExecutionError(`${label} returned malformed JSON: ${err?.message ?? err}`);
-    }
-    const statusCode = String(body?.result?.status?.['@code'] ?? '').trim();
-    if (!statusCode) {
-        throw new CommandExecutionError(
-            `${label} returned JSON without result.status.@code`,
-            'dblp changed its JSON envelope or returned a partial error payload; inspect the raw response in a browser.',
-        );
-    }
-    if (statusCode !== '200') {
-        const statusText = String(body?.result?.status?.text ?? '').trim();
-        throw new CommandExecutionError(
-            `${label} returned API status ${statusCode}${statusText ? ` (${statusText})` : ''}`,
-            'dblp accepted the HTTP request but reported an API-level failure. Retry later or inspect the same query in a browser.',
-        );
-    }
-    return body;
-}
-
-export async function dblpFetchXml(path, label) {
-    const res = await dblpFetch(`${DBLP_ORIGIN}${path}`, label, 'application/xml');
-    return res.text();
-}
 
 export function coerceInt(value) {
     if (value === undefined || value === null || value === '') return NaN;

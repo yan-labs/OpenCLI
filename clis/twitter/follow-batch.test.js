@@ -5,19 +5,6 @@ import { followOne, parseBatchUsernames, parseDelayMs } from './follow-batch.js'
 import './follow-batch.js';
 
 describe('twitter follow-batch command', () => {
-    it('registers with the expected shape', () => {
-        const cmd = getRegistry().get('twitter/follow-batch');
-        expect(cmd?.func).toBeTypeOf('function');
-        expect(cmd?.columns).toEqual(['username', 'status', 'message']);
-        expect(cmd?.access).toBe('write');
-        expect(cmd?.browser).toBe(true);
-        expect(cmd?.args?.[0]).toMatchObject({
-            name: 'usernames',
-            positional: true,
-            required: true,
-        });
-        expect(cmd?.args?.find((arg) => arg.name === 'delay-ms')?.default).toBe(3000);
-    });
 
     it('parses comma-separated usernames, strips @, and deduplicates case-insensitively', () => {
         expect(parseBatchUsernames(' @karpathy, swyx,Karpathy, rauchg ')).toEqual([

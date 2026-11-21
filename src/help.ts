@@ -1,5 +1,6 @@
 import { Command, type Argument as CommanderArgument, type Option as CommanderOption } from 'commander';
 import yaml from 'js-yaml';
+import { OUTPUT_FORMATS } from './output-format.js';
 import type { Arg, CliCommand } from './registry.js';
 import { fullName } from './registry.js';
 import { formatCommandExample } from './serialization.js';
@@ -31,8 +32,8 @@ const COMMON_OPTIONS = [
     flags: '-f, --format <fmt>',
     name: 'format',
     help: 'Output format: table, plain, json, yaml, md, csv',
-    default: 'table',
-    choices: ['table', 'plain', 'json', 'yaml', 'md', 'csv'],
+    default: 'json',
+    choices: OUTPUT_FORMATS,
   },
   {
     flags: '--trace <mode>',
@@ -58,8 +59,8 @@ const BROWSER_COMMON_OPTIONS = [
   {
     flags: '--window <mode>',
     name: 'window',
-    help: 'Window mode: dedicated (default -- an OpenCLI-owned window, created unfocused and placed off your screen when a second display exists; the tab itself renders visible), background (hidden tab in your current window, never steals focus; still available for callers that want it), active (selects the tab within its window only -- keeps it un-throttled without raising the window or stealing OS focus), foreground (raise + select), isolated (background in its own window)',
-    choices: ['foreground', 'active', 'background', 'isolated', 'dedicated'],
+    help: 'Window mode: dedicated (default -- an OpenCLI-owned window, created unfocused and placed off your screen when a second display exists; the tab itself renders visible), background (the upstream background container), foreground (raise + select)',
+    choices: ['foreground', 'background', 'dedicated'],
   },
   {
     flags: '--site-session <mode>',
@@ -127,36 +128,7 @@ export function wrapCommaList(
   return lines.join('\n');
 }
 
-/**
- * Adapter category for help-text grouping.
- *
- * - `site`: web site adapter (real DNS-style domain, e.g. `www.bilibili.com`)
- * - `app`: desktop app adapter (Electron/osascript, signaled by `domain: 'localhost'`
- *   or other non-DNS/local endpoint string like `'127.0.0.1'` / `'doubao-app'`)
- *
- * Classification is derived from the adapter's `domain` field — no new schema
- * required. Adapters without a `domain` field default to `site` (most are
- * public web scrapers).
- */
-export type AdapterKind = 'site' | 'app';
-
-function isLocalIpDomain(domain: string): boolean {
-  if (domain === '::1' || domain === '[::1]') return true;
-  const parts = domain.split('.');
-  if (parts.length !== 4) return false;
-  return parts.every(part => /^\d+$/.test(part) && Number(part) >= 0 && Number(part) <= 255)
-    && Number(parts[0]) === 127;
-}
-
-export function classifyAdapter(domain: string | undefined): AdapterKind {
-  if (!domain) return 'site';
-  if (isLocalIpDomain(domain)) return 'app';
-  return domain.includes('.') ? 'site' : 'app';
-}
-
 export interface RootAdapterGroups {
-  /** Desktop-app adapters (chatgpt-app, chatwise, codex, ...) */
-  apps: readonly string[];
   /** Web-site adapters (bilibili, dianping, ...) */
   sites: readonly string[];
 }
@@ -171,13 +143,12 @@ function formatGroupSection(label: string, names: readonly string[]): string[] {
 }
 
 export function formatRootAdapterHelpText(groups: RootAdapterGroups): string {
-  const total = groups.apps.length + groups.sites.length;
+  const total = groups.sites.length;
   if (total === 0) return '';
   const lines: string[] = [''];
-  lines.push(...formatGroupSection('App adapters', groups.apps));
   lines.push(...formatGroupSection('Site adapters', groups.sites));
   lines.push("Run 'opencli list' for full command details, or 'opencli <site> --help' to inspect one site.");
-  lines.push("Agent tip: use 'opencli <site> --help -f yaml' for all command args/options in one structured response.");
+  lines.push("Agent tip: use 'opencli <site> --help -f json' for all command args/options in one structured response.");
   lines.push('');
   return lines.join('\n');
 }
@@ -362,7 +333,7 @@ export function commanderNamespaceHelpData(
     ...(opts.globalCommand ? { global_options: compactCommanderOptions(opts.globalCommand.options) } : {}),
     structured_help: {
       formats: ['yaml', 'json'],
-      usage: `${commandPath} --help -f yaml`,
+      usage: `${commandPath} --help -f json`,
     },
   };
 }
@@ -379,7 +350,7 @@ export function commanderCommandHelpData(
     ...(opts.globalCommand ? { global_options: compactCommanderOptions(opts.globalCommand.options) } : {}),
     structured_help: {
       formats: ['yaml', 'json'],
-      usage: `${commanderPath(command).join(' ')} --help -f yaml`,
+      usage: `${commanderPath(command).join(' ')} --help -f json`,
     },
   };
 }
@@ -404,7 +375,7 @@ export function commanderGroupHelpData(
     ...(opts.globalCommand ? { global_options: compactCommanderOptions(opts.globalCommand.options) } : {}),
     structured_help: {
       formats: ['yaml', 'json'],
-      usage: `${commanderPath(groupCommand).join(' ')} --help -f yaml`,
+      usage: `${commanderPath(groupCommand).join(' ')} --help -f json`,
     },
   };
 }
@@ -468,13 +439,13 @@ function compactCommand(cmd: CliCommand): Record<string, unknown> {
     ...(cmd.browser ? { browser_common_options: BROWSER_COMMON_OPTIONS.map(compactCommonOption) } : {}),
     example: formatCommandExample(cmd),
     ...(cmd.siteSession ? { siteSession: cmd.siteSession } : {}),
-    ...(cmd.defaultFormat ? { defaultFormat: cmd.defaultFormat } : {}),
+    defaultFormat: 'json',
     ...(cmd.columns?.length ? { columns: cmd.columns } : {}),
   };
 }
 
 export function rootHelpData(program: Command, groups: RootAdapterGroups): Record<string, unknown> {
-  const adapterNames = new Set<string>([...groups.apps, ...groups.sites]);
+  const adapterNames = new Set<string>([...groups.sites]);
   const commands = program.commands
     .filter(command => !adapterNames.has(command.name()))
     .map(command => ({
@@ -487,18 +458,14 @@ export function rootHelpData(program: Command, groups: RootAdapterGroups): Recor
     name: program.name(),
     description: program.description(),
     commands,
-    app_adapters: {
-      count: groups.apps.length,
-      apps: [...groups.apps].sort(sortLocale),
-    },
     site_adapters: {
       count: groups.sites.length,
       sites: [...groups.sites].sort(sortLocale),
     },
     next: [
-      'opencli <site> --help -f yaml',
-      'opencli list -f yaml',
-      'opencli <site> <command> -f yaml',
+      'opencli <site> --help -f json',
+      'opencli list <query>',
+      'opencli <site> <command>',
     ],
   };
 }
@@ -513,8 +480,8 @@ export function siteHelpData(site: string, commands: readonly CliCommand[]): Rec
     common_options: COMMON_OPTIONS.map(compactCommonOption),
     ...(unique.some(cmd => cmd.browser) ? { browser_common_options: BROWSER_COMMON_OPTIONS.map(compactCommonOption) } : {}),
     next: [
-      `opencli ${site} <command> --help -f yaml`,
-      `opencli ${site} <command> -f yaml`,
+      `opencli ${site} <command> --help -f json`,
+      `opencli ${site} <command>`,
     ],
   };
 }
@@ -576,7 +543,7 @@ export function formatSiteHelpText(site: string, commands: readonly CliCommand[]
     formatCommonOptionsHelpText(),
     ...(unique.some(cmd => cmd.browser) ? ['', formatBrowserCommonOptionsHelpText()] : []),
     '',
-    `Agent tip: use 'opencli ${site} --help -f yaml' to get all command args/options in one structured response.`,
+    `Agent tip: use 'opencli ${site} --help -f json' to get all command args/options in one structured response.`,
     '',
   ];
   return lines.join('\n');
@@ -613,12 +580,12 @@ export function formatCommandHelpText(cmd: CliCommand): string {
   meta.push(`Access: ${cmd.access}`);
   meta.push(`Browser: ${cmd.browser ? 'yes' : 'no'}`);
   if (cmd.domain) meta.push(`Domain: ${cmd.domain}`);
-  if (cmd.defaultFormat) meta.push(`Default format: ${cmd.defaultFormat}`);
+  meta.push('Default format: json');
   if (cmd.aliases?.length) meta.push(`Aliases: ${cmd.aliases.join(', ')}`);
   lines.push(meta.join(' | '));
   lines.push(`Example: ${formatCommandExample(cmd)}`);
   if (cmd.columns?.length) lines.push(`Output columns: ${cmd.columns.join(', ')}`);
-  lines.push("Agent tip: use '--help -f yaml' for structured args/options.");
+  lines.push("Agent tip: use '--help -f json' for structured args/options.");
   lines.push('');
   return lines.join('\n');
 }

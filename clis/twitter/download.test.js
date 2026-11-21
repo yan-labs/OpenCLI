@@ -92,19 +92,6 @@ describe('twitter download helpers', () => {
         mockFormatCookieHeader.mockClear();
     });
 
-    it('registers the canonical download columns', () => {
-        const cmd = getRegistry().get('twitter/download');
-        expect(cmd?.columns).toEqual(['index', 'tweet_id', 'url', 'type', 'status', 'size']);
-    });
-
-    it('makes username positional and tweet-url a flag', () => {
-        const cmd = getRegistry().get('twitter/download');
-        const usernameArg = cmd?.args?.find((a) => a.name === 'username');
-        const tweetUrlArg = cmd?.args?.find((a) => a.name === 'tweet-url');
-        expect(usernameArg?.positional).toBe(true);
-        expect(tweetUrlArg?.positional).not.toBe(true);
-    });
-
     it('builds a UserMedia URL with userId, count and cursor', () => {
         const url = buildUserMediaUrl(
             { queryId: 'QID', features: { fa: true }, fieldToggles: { fb: true } },

@@ -23,10 +23,11 @@ async function verifyXhsIdentity(page) {
     }
   `);
   const [ok, status, parsed, preview] = Array.isArray(payload) ? payload : [];
-  if (!ok) {
+  if (status === 401 || status === 403) {
     const detail = parsed?.msg ?? preview ?? `HTTP ${status ?? ''}`;
     throw new AuthRequiredError('creator.xiaohongshu.com', `Xiaohongshu creator profile requires login: ${detail}`);
   }
+  if (!ok) throw new CommandExecutionError(`Xiaohongshu creator profile failed (HTTP ${status ?? 'unknown'})`);
   const data = parsed?.data;
   if (!data) {
     throw new CommandExecutionError('Xiaohongshu creator profile returned malformed personal_info payload');

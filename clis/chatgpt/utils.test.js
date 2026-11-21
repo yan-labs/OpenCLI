@@ -4,7 +4,29 @@ import path from 'node:path';
 import { JSDOM } from 'jsdom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ArgumentError, AuthRequiredError, CommandExecutionError } from '@jackwener/opencli/errors';
-import { CHATGPT_MODEL_CHOICES, __test__, getChatGPTDetailRows, getChatGPTImageAssets, getChatGPTResponsePairCounts, getChatGPTVisibleImageUrls, getCurrentChatGPTModel, getCurrentChatGPTTool, getVisibleMessages, isGenerating, navigateToProject, openChatGPTConversation, prepareChatGPTImagePaths, selectChatGPTModel, selectChatGPTTool, sendChatGPTMessage, uploadChatGPTImages, waitForChatGPTDeepResearchResult, waitForChatGPTDetailRows, waitForChatGPTImages, waitForChatGPTResponse } from './utils.js';
+import {
+    CHATGPT_MODEL_CHOICES,
+    __test__,
+    getChatGPTDetailRows,
+    getChatGPTImageAssets,
+    getChatGPTResponsePairCounts,
+    getChatGPTVisibleImageUrls,
+    getCurrentChatGPTModel,
+    getCurrentChatGPTTool,
+    getVisibleMessages,
+    isGenerating,
+    navigateToProject,
+    openChatGPTConversation,
+    prepareChatGPTImagePaths,
+    selectChatGPTModel,
+    selectChatGPTTool,
+    sendChatGPTMessage,
+    uploadChatGPTImages,
+    waitForChatGPTDeepResearchResult,
+    waitForChatGPTDetailRows,
+    waitForChatGPTImages,
+    waitForChatGPTResponse,
+} from './utils.js';
 
 const tempDirs = [];
 
@@ -57,6 +79,12 @@ function createDomEvaluatePage(html) {
 }
 
 describe('chatgpt image wait contract', () => {
+    it.each(['local-chatgpt:synthetic', 'local-chatgpt%3Asynthetic'])('keeps a rendering draft when %s becomes a persisted ID', async id => {
+        const page = createPageMock({ location: 'https://chatgpt.com/c/persisted-test', generating: [false], imageUrls: [['blob:https://chatgpt.com/synthetic-image']] });
+        await expect(waitForChatGPTImages(page, [], 18, `https://chatgpt.com/c/${id}`)).resolves.toEqual(['blob:https://chatgpt.com/synthetic-image']);
+        expect(page.goto).not.toHaveBeenCalled();
+    });
+
     it('does not periodically reload the conversation while generation is still active', async () => {
         const convUrl = 'https://chatgpt.com/c/demo';
         const page = createPageMock({
@@ -200,7 +228,7 @@ describe('chatgpt conversation navigation', () => {
         await expect(openChatGPTConversation(page, 'https://chatgpt.com/c/abc_123-def?model=gpt-5'))
             .resolves.toBe('abc_123-def');
         expect(page.goto).toHaveBeenCalledWith('https://chatgpt.com/c/abc_123-def', { settleMs: 2000 });
-        expect(page.wait).toHaveBeenCalledWith({ selector: '#prompt-textarea, [data-testid="prompt-textarea"], [contenteditable="true"][role="textbox"]', timeout: 8 });
+        expect(page.wait).toHaveBeenCalledWith({ selector: '#prompt-textarea, [data-testid="prompt-textarea"]', timeout: 8 });
     });
 });
 
@@ -501,6 +529,7 @@ describe('chatgpt model selection validation', () => {
             nativeClick: vi.fn().mockResolvedValue(undefined),
             evaluate: vi.fn((script) => {
                 if (script === 'window.location.href') return Promise.resolve('https://chatgpt.com/c/demo');
+                if (String(script).includes("const buttons = reasoningMatches('button[data-selected-reasoning-effort]')")) return Promise.resolve({ found: false });
                 objectCall += 1;
                 if (objectCall === 1) return Promise.resolve({ isLoggedIn: true, hasLoginGate: false, hasComposer: true });
                 if (objectCall === 2) return Promise.resolve({ model: 'balanced', label: 'Balanced' });
@@ -528,6 +557,7 @@ describe('chatgpt model selection validation', () => {
             getCookies: vi.fn().mockResolvedValue([{ name: '__Secure-next-auth.session-token', value: 'cookie', domain: '.chatgpt.com' }]),
             evaluate: vi.fn((script) => {
                 if (script === 'window.location.href') return Promise.resolve('https://chatgpt.com/c/demo');
+                if (String(script).includes("const buttons = reasoningMatches('button[data-selected-reasoning-effort]')")) return Promise.resolve({ found: false });
                 if (String(script).includes('oai-last-model-config')) return Promise.resolve(true);
                 objectCall += 1;
                 if (objectCall === 1) return Promise.resolve({ isLoggedIn: true, hasLoginGate: false, hasComposer: true });
@@ -557,6 +587,7 @@ describe('chatgpt model selection validation', () => {
             getCookies: vi.fn().mockResolvedValue([{ name: '__Secure-next-auth.session-token', value: 'cookie', domain: '.chatgpt.com' }]),
             evaluate: vi.fn((script) => {
                 if (script === 'window.location.href') return Promise.resolve('https://chatgpt.com/c/demo');
+                if (String(script).includes("const buttons = reasoningMatches('button[data-selected-reasoning-effort]')")) return Promise.resolve({ found: false });
                 if (String(script).includes('oai-last-model-config')) return Promise.resolve(true);
                 objectCall += 1;
                 if (objectCall === 1) return Promise.resolve({ isLoggedIn: true, hasLoginGate: false, hasComposer: true });
@@ -586,6 +617,7 @@ describe('chatgpt model selection validation', () => {
             getCookies: vi.fn().mockResolvedValue([{ name: '__Secure-next-auth.session-token', value: 'cookie', domain: '.chatgpt.com' }]),
             evaluate: vi.fn((script) => {
                 if (script === 'window.location.href') return Promise.resolve('https://chatgpt.com/c/demo');
+                if (String(script).includes("const buttons = reasoningMatches('button[data-selected-reasoning-effort]')")) return Promise.resolve({ found: false });
                 if (String(script).includes('oai-last-model-config')) return Promise.resolve(true);
                 objectCall += 1;
                 if (objectCall === 1) return Promise.resolve({ isLoggedIn: true, hasLoginGate: false, hasComposer: true });
@@ -614,6 +646,7 @@ describe('chatgpt model selection validation', () => {
             getCookies: vi.fn().mockResolvedValue([{ name: '__Secure-next-auth.session-token', value: 'cookie', domain: '.chatgpt.com' }]),
             evaluate: vi.fn((script) => {
                 if (script === 'window.location.href') return Promise.resolve('https://chatgpt.com/c/demo');
+                if (String(script).includes("const buttons = reasoningMatches('button[data-selected-reasoning-effort]')")) return Promise.resolve({ found: false });
                 if (String(script).includes('oai-last-model-config')) return Promise.resolve(true);
                 objectCall += 1;
                 if (objectCall === 1) return Promise.resolve({ isLoggedIn: true, hasLoginGate: false, hasComposer: true });
@@ -643,6 +676,7 @@ describe('chatgpt model selection validation', () => {
             getCookies: vi.fn().mockResolvedValue([{ name: '__Secure-next-auth.session-token', value: 'cookie', domain: '.chatgpt.com' }]),
             evaluate: vi.fn((script) => {
                 if (script === 'window.location.href') return Promise.resolve('https://chatgpt.com/c/demo');
+                if (String(script).includes("const buttons = reasoningMatches('button[data-selected-reasoning-effort]')")) return Promise.resolve({ found: false });
                 objectCall += 1;
                 if (objectCall === 1) return Promise.resolve({ isLoggedIn: true, hasLoginGate: false, hasComposer: true });
                 if (objectCall === 2) return Promise.resolve({ model: 'balanced', label: 'Balanced' });
@@ -669,6 +703,7 @@ describe('chatgpt model selection validation', () => {
             getCookies: vi.fn().mockResolvedValue([{ name: '__Secure-next-auth.session-token', value: 'cookie', domain: '.chatgpt.com' }]),
             evaluate: vi.fn((script) => {
                 if (script === 'window.location.href') return Promise.resolve('https://chatgpt.com/c/demo');
+                if (String(script).includes("const buttons = reasoningMatches('button[data-selected-reasoning-effort]')")) return Promise.resolve({ found: false });
                 objectCall += 1;
                 if (objectCall === 1) return Promise.resolve({ isLoggedIn: true, hasLoginGate: false, hasComposer: true });
                 if (objectCall === 2) return Promise.resolve({ model: 'balanced', label: 'Balanced' });
@@ -904,6 +939,7 @@ describe('chatgpt model selection validation', () => {
             nativeClick: vi.fn().mockResolvedValue(undefined),
             evaluate: vi.fn((script) => {
                 if (script === 'window.location.href') return Promise.resolve('https://chatgpt.com/c/demo');
+                if (String(script).includes("const buttons = reasoningMatches('button[data-selected-reasoning-effort]')")) return Promise.resolve({ found: false });
                 objectCall += 1;
                 if (objectCall === 1) return Promise.resolve({ isLoggedIn: true, hasLoginGate: false, hasComposer: true });
                 if (objectCall === 2) return Promise.resolve({ model: 'balanced', label: 'Balanced' });
@@ -1376,7 +1412,7 @@ describe('chatgpt send selectors', () => {
             nativeClick: vi.fn().mockResolvedValue(undefined),
             nativeType: vi.fn().mockResolvedValue(undefined),
             evaluate: vi.fn((script) => {
-                if (script.includes('findComposer')) return Promise.resolve({ ready: true, x: 12, y: 34 });
+                if (script.includes('findComposer') && !script.includes('sendBtn')) return Promise.resolve({ ready: true, x: 12, y: 34 });
                 if (script.includes('sendBtnFound')) {
                     expect(script).toContain('data-testid=\\\"send-button\\\"');
                     return Promise.resolve({ sendBtnFound: true });
@@ -1397,7 +1433,7 @@ describe('chatgpt send selectors', () => {
             wait: vi.fn().mockResolvedValue(undefined),
             nativeType: vi.fn().mockResolvedValue(undefined),
             evaluate: vi.fn((script) => {
-                if (script.includes('findComposer')) return Promise.resolve({ ready: true, x: 12, y: 34 });
+                if (script.includes('findComposer') && !script.includes('sendBtn')) return Promise.resolve({ ready: true, x: 12, y: 34 });
                 if (script.includes('sendBtnFound')) {
                     expect(script).toContain('#composer-submit-button:not([disabled])');
                     return Promise.resolve({ sendBtnFound: true });
@@ -1669,6 +1705,23 @@ describe('chatgpt generated image detection', () => {
 });
 
 describe('chatgpt image upload helper', () => {
+    it('recognizes exact visible attachment labels inside the composer, not history or hidden chips', async () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'opencli-chatgpt-'));
+        tempDirs.push(dir);
+        const filePath = path.join(dir, 'cat.png');
+        fs.writeFileSync(filePath, 'fake-png');
+        for (const state of ['ready', 'hidden', 'wrong-name', 'history']) {
+            const dom = new JSDOM(`<main><section id="history"></section><form><div role="group" aria-label="${state === 'wrong-name' ? 'not-cat.png' : 'cat.png'}" style="${state === 'hidden' ? 'display:none' : ''}"></div><div id="prompt-textarea" contenteditable="true"></div></form></main>`, { url: 'https://chatgpt.com/new', runScripts: 'outside-only' });
+            const chip = dom.window.document.querySelector('[role="group"]');
+            chip.getBoundingClientRect = () => ({ width: 100, height: 30 });
+            if (state === 'history') dom.window.document.querySelector('#history').append(chip);
+            const page = { setFileInput: vi.fn(), wait: vi.fn(), sleep: vi.fn(), evaluate: vi.fn(script => dom.window.eval(script)) };
+            const result = await uploadChatGPTImages(page, [filePath]);
+            expect(result.ok, state).toBe(state === 'ready');
+            dom.window.close();
+        }
+    });
+
     it('validates local images without a browser page', async () => {
         const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'opencli-chatgpt-'));
         tempDirs.push(dir);
@@ -1752,6 +1805,7 @@ describe('chatgpt image upload helper', () => {
             }),
         };
 
+        page.evaluateOnce = page.evaluate;
         const result = await uploadChatGPTImages(page, [filePath]);
 
         expect(result).toEqual({ ok: true, files: [filePath] });
@@ -1908,10 +1962,6 @@ describe('chatgpt project file upload helper', () => {
         expect(__test__.mimeFromFilePath('/tmp/unknown.xyz')).toBe('application/octet-stream');
     });
 
-    it('exposes PROJECT_LINK_SELECTOR for project link extraction', () => {
-        expect(__test__.PROJECT_LINK_SELECTOR).toBe('a[href*="/g/g-p-"]');
-    });
-
     it('extracts visible project anchors from the sidebar without React Fiber internals', async () => {
         const dom = new JSDOM(`
             <!doctype html>
@@ -2025,7 +2075,7 @@ describe('chatgpt project file upload helper', () => {
         expect(sourcesTab.dataset.clicked).toBe('true');
     });
 
-    it('projects file upload uses dialog file input selectors and waits for filename confirmation', async () => {
+    it.each(['No element found', 'Page.fileChooserOpened not received within 5s'])('project upload falls back on %s and waits for filename confirmation', async (message) => {
         const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'opencli-chatgpt-'));
         tempDirs.push(dir);
         const filePath = path.join(dir, 'report.pdf');
@@ -2035,7 +2085,7 @@ describe('chatgpt project file upload helper', () => {
             goto: vi.fn().mockResolvedValue(undefined),
             wait: vi.fn().mockResolvedValue(undefined),
             nativeType: vi.fn(),
-            setFileInput: vi.fn().mockRejectedValue(new Error('No element found')),
+            setFileInput: vi.fn().mockRejectedValue(new Error(message)),
             evaluate: vi.fn((script) => {
                 const s = String(script);
                 // getPageState returns a specific object
@@ -2140,5 +2190,78 @@ describe('chatgpt project file upload helper', () => {
             ok: false,
             reason: expect.stringContaining('project knowledge surface'),
         });
+    });
+});
+
+describe('chatgpt October 2026 redesign markup', () => {
+    it('keeps identical turns while deduplicating nested markup and reading the role suffix', async () => {
+        const page = createDomEvaluatePage([0, 1].map(index => `
+            <article data-testid="conversation-turn-${index}" data-chatgpt-search-unit-key="assistant-topic-${index}:user">
+                <div data-message-author-role="user"><div class="markdown">Again</div></div>
+            </article>
+            <article data-chatgpt-search-unit-key="turn-${index}:assistant">
+                <div data-message-author-role="assistant"><div class="markdown">Same answer</div></div>
+            </article>
+        `).join(''));
+        for (const node of page.dom.window.document.querySelectorAll('*')) {
+            node.getBoundingClientRect = () => ({ width: 120, height: 36 });
+        }
+        try {
+            const rows = await getVisibleMessages(page, { textOnly: true });
+            expect(rows.map(row => [row.Role, row.Text])).toEqual([
+                ['User', 'Again'], ['Assistant', 'Same answer'],
+                ['User', 'Again'], ['Assistant', 'Same answer'],
+            ]);
+        } finally { page.dom.window.close(); }
+    });
+
+    it('reads search-unit turns and strips tool chips from the user prompt', async () => {
+        const page = createDomEvaluatePage(`
+            <div data-chatgpt-search-unit-key="fallback-turn-0:0:user">
+              <div data-user-message-bubble="true">
+                <div data-search-result-target="">
+                  <p><span data-prompt-link-href="chatgpt-system-hint://search" data-prompt-link-label="Web search">Web search</span>find the release date</p>
+                </div>
+                <button aria-label="Copy message">copy</button>
+              </div>
+            </div>
+            <div data-chatgpt-search-unit-key="fallback-turn-0:2:assistant">
+              <h4 data-conversation-role="assistant">ChatGPT said:</h4>
+              <div data-markdown-copy="contents"><p>It shipped on 6 May 2025.</p></div>
+            </div>
+        `);
+        for (const node of page.dom.window.document.querySelectorAll('*')) {
+            node.getBoundingClientRect = () => ({ width: 120, height: 36 });
+        }
+
+        await expect(getVisibleMessages(page, { textOnly: true })).resolves.toEqual([
+            { Index: 1, Role: 'User', Text: 'find the release date', Html: '' },
+            { Index: 2, Role: 'Assistant', Text: 'It shipped on 6 May 2025.', Html: '' },
+        ]);
+    });
+
+    it('reads Deep Research sources from report_message citations', () => {
+        const payload = makeDeepResearchPayload();
+        const state = JSON.parse(payload.mapping.report_node.message.metadata.chatgpt_sdk.widget_state);
+        state.report_message.metadata = {
+            citations: [{ metadata: { title: 'Cited E', url: 'https://example.com/e#:~:text=quote' } }],
+        };
+        payload.mapping.report_node.message.metadata.chatgpt_sdk.widget_state = JSON.stringify(state);
+
+        const result = __test__.extractDeepResearchFromConversationPayload(payload);
+
+        expect(result.sources).toEqual([{ title: 'Cited E', url: 'https://example.com/e' }]);
+    });
+
+    it('ignores conversation sub-resource responses in network capture', () => {
+        const result = __test__.extractDeepResearchFromNetworkEntries([
+            { url: 'https://chatgpt.com/backend-api/conversation/requested123/stream_status', responsePreview: '{"status":"done"}' },
+            {
+                url: 'https://chatgpt.com/backend-api/conversation/requested123',
+                responsePreview: JSON.stringify(makeDeepResearchPayload(makeDeepResearchReport(), { conversationId: 'requested123' })),
+            },
+        ], { expectedConversationId: 'requested123' });
+
+        expect(result.status).toBe('completed');
     });
 });

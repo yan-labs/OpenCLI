@@ -1,3 +1,4 @@
+import { dblpFetchSearch, dblpFetchXml } from './browser.js';
 // dblp author — resolve an author name to a PID and list their publications
 // newest first.
 //
@@ -19,8 +20,6 @@ import { ArgumentError, CommandExecutionError, EmptyResultError } from '@jackwen
 import {
     DBLP_ORIGIN,
     decodeXmlEntities,
-    dblpFetchJson,
-    dblpFetchXml,
     extractRecordKey,
     recordXmlToRow,
     requireBoundedInt,
@@ -61,14 +60,15 @@ cli({
     description: 'List dblp publications by a given author (newest first; resolves to top PID match)',
     domain: 'dblp.org',
     strategy: Strategy.PUBLIC,
-    browser: false,
+    browser: true,
+    navigateBefore: false,
     args: [
         { name: 'author', positional: true, required: false, help: 'Author name (e.g. "Yoshua Bengio"). Optional when --pid is given.' },
         { name: 'pid', help: 'Canonical dblp PID (e.g. "56/953"). Bypasses author search.' },
         { name: 'limit', type: 'int', default: 20, help: 'Max publications (1-200)' },
     ],
     columns: ['rank', 'key', 'title', 'authors', 'venue', 'year', 'type', 'doi', 'pid', 'url'],
-    func: async (args) => {
+    func: async (page, args) => {
         const limit = requireBoundedInt(args.limit, 20, 200);
         const pidArg = args.pid != null ? String(args.pid).trim() : '';
         let pid = '';
@@ -84,8 +84,8 @@ cli({
         }
         else {
             const name = requireQuery(args.author, 'author');
-            const json = await dblpFetchJson(
-                `/search/author/api?q=${encodeURIComponent(name)}&format=json&h=20`,
+            const json = await dblpFetchSearch(page,
+                `/search/author/api?q=${encodeURIComponent(name)}&format=xml&h=20`,
                 'dblp author search',
             );
             const raw = json?.result?.hits?.hit;
@@ -106,7 +106,7 @@ cli({
             }
             resolvedName = decodeXmlEntities(String(top?.info?.author ?? '')).trim();
         }
-        const xml = await dblpFetchXml(`/pid/${pid}.xml`, `dblp pid ${pid}`);
+        const xml = await dblpFetchXml(page, `/pid/${pid}.xml`, `dblp pid ${pid}`);
         const records = splitRecords(xml);
         if (!records.length) {
             throw new EmptyResultError(

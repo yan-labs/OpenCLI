@@ -40,27 +40,6 @@ const SEARCH = fx('search.json');
 const DETAIL = fx('series-detail.json');
 const SCORE = fx('series-score.json');
 
-describe('dongchedi adapter — registration', () => {
-    const names = ['search', 'series', 'models', 'specs', 'score', 'koubei'];
-    it('registers all commands as PUBLIC (no browser)', () => {
-        for (const n of names) {
-            const cmd = getRegistry().get(`dongchedi/${n}`);
-            expect(cmd, n).toBeTruthy();
-            expect(cmd.strategy, n).toBe(Strategy.PUBLIC);
-            expect(cmd.browser, n).toBe(false);
-            expect(cmd.access, n).toBe('read');
-        }
-    });
-    it('declares the expected columns', () => {
-        expect(getRegistry().get('dongchedi/search').columns).toEqual(SEARCH_COLUMNS);
-        expect(getRegistry().get('dongchedi/series').columns).toEqual(SERIES_COLUMNS);
-        expect(getRegistry().get('dongchedi/models').columns).toEqual(MODELS_COLUMNS);
-        expect(getRegistry().get('dongchedi/specs').columns).toEqual(SPECS_COLUMNS);
-        expect(getRegistry().get('dongchedi/score').columns).toEqual(SCORE_COLUMNS);
-        expect(getRegistry().get('dongchedi/koubei').columns).toEqual(KOUBEI_COLUMNS);
-    });
-});
-
 describe('dongchedi adapter — utils', () => {
     it('extractPageProps pulls pageProps from a __NEXT_DATA__ blob', () => {
         const html = `<html><body><script id="__NEXT_DATA__" type="application/json">${JSON.stringify({ props: { pageProps: { hello: 'world' } } })}</script></body></html>`;

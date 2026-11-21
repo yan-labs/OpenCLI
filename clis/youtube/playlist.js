@@ -61,22 +61,36 @@ cli({
         const channelName = secondaryInfo?.videoOwner?.videoOwnerRenderer?.title?.runs?.[0]?.text || '';
 
         const tabs = data.contents?.twoColumnBrowseResultsRenderer?.tabs || [];
-        let listContents = tabs[0]?.tabRenderer?.content?.sectionListRenderer?.contents?.[0]?.itemSectionRenderer?.contents?.[0]?.playlistVideoListRenderer?.contents || [];
-
+        const tab = tabs.find(item => item.tabRenderer?.selected)?.tabRenderer || tabs[0]?.tabRenderer;
+        const sections = tab?.content?.sectionListRenderer?.contents || [];
+        let listContents = sections.flatMap(section => (section.itemSectionRenderer?.contents || [])
+          .flatMap(item => item.playlistVideoListRenderer?.contents || [item]));
         const extractVideos = ${extractPlaylistVideos.toString()};
-
+        const nextToken = items => {
+          for (let i = items.length - 1; i >= 0; i--) {
+            const token = items[i].continuationItemRenderer?.continuationEndpoint?.continuationCommand?.token
+              || items[i].continuationItemViewModel?.continuationCommand?.innertubeCommand?.continuationCommand?.token;
+            if (token) return token;
+          }
+          return null;
+        };
         let videos = extractVideos(listContents);
-
-        let contItem = listContents[listContents.length - 1];
-        while (videos.length < limit && contItem?.continuationItemRenderer) {
-          const token = contItem.continuationItemRenderer?.continuationEndpoint?.continuationCommand?.token;
-          if (!token) break;
+        const seenTokens = new Set();
+        let token = nextToken(listContents);
+        let stalledPages = 0;
+        while (videos.length < limit && token) {
+          if (seenTokens.has(token)) return { error: 'YouTube playlist repeated a continuation token' };
+          if (seenTokens.size >= limit + 2) return { error: 'YouTube playlist continuation budget exhausted' };
+          seenTokens.add(token);
           const contData = await fetchBrowse(apiKey, { context, continuation: token });
-          if (contData.error) break;
-          const newItems = contData.onResponseReceivedActions?.[0]?.appendContinuationItemsAction?.continuationItems || [];
+          if (contData.error) return contData;
+          const newItems = contData.onResponseReceivedActions?.flatMap(action => action.appendContinuationItemsAction?.continuationItems || []) || [];
           if (!newItems.length) break;
-          videos = videos.concat(extractVideos(newItems));
-          contItem = newItems[newItems.length - 1];
+          const nextVideos = extractVideos(newItems, videos.length);
+          videos = videos.concat(nextVideos);
+          token = nextToken(newItems);
+          stalledPages = nextVideos.length ? 0 : stalledPages + 1;
+          if (token && stalledPages >= 2) return { error: 'YouTube playlist continuation made no progress' };
         }
 
         return { title, channelName, stats, videos: videos.slice(0, limit) };

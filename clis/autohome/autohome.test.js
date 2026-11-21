@@ -26,20 +26,6 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const CATALOG = readFileSync(join(__dirname, '__fixtures__/catalog.html'), 'utf8');
 const KOUBEI = JSON.parse(readFileSync(join(__dirname, '__fixtures__/koubei.json'), 'utf8'));
 
-describe('autohome adapter — registration', () => {
-    it('registers brand + score as PUBLIC (no browser)', () => {
-        for (const n of ['brand', 'score']) {
-            const cmd = getRegistry().get(`autohome/${n}`);
-            expect(cmd, n).toBeTruthy();
-            expect(cmd.strategy, n).toBe(Strategy.PUBLIC);
-            expect(cmd.browser, n).toBe(false);
-            expect(cmd.access, n).toBe('read');
-        }
-        expect(getRegistry().get('autohome/brand').columns).toEqual(BRAND_COLUMNS);
-        expect(getRegistry().get('autohome/score').columns).toEqual(SCORE_COLUMNS);
-    });
-});
-
 describe('autohome adapter — utils', () => {
     it('resolveBrandInitial maps brands and letters', () => {
         expect(resolveBrandInitial('宝马')).toBe('B');

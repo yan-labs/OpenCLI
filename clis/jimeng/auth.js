@@ -24,6 +24,10 @@ const WHOAMI_PROBE = `(async () => {
 async function verifyJimengIdentity(page) {
   await page.goto('https://jimeng.jianying.com/ai-tool/generate?type=image&workspace=0');
   await page.wait(2);
+  return probeJimengIdentity(page);
+}
+
+async function probeJimengIdentity(page) {
   const probe = await page.evaluate(WHOAMI_PROBE);
   if (probe?.kind === 'auth') throw new AuthRequiredError('jimeng.jianying.com', probe.detail);
   if (probe?.kind === 'http') throw new CommandExecutionError(`HTTP ${probe.httpStatus} from Jimeng passport`);
@@ -38,9 +42,5 @@ registerSiteAuthCommands({
   loginUrl: 'https://jimeng.jianying.com/',
   columns: ['user_id', 'screen_name'],
   verify: verifyJimengIdentity,
-  poll: async (page) => {
-    const probe = await page.evaluate(WHOAMI_PROBE);
-    if (!probe?.ok) throw new AuthRequiredError('jimeng.jianying.com', 'Waiting for Jimeng login');
-    return { user_id: probe.user_id, screen_name: probe.screen_name };
-  },
+  poll: probeJimengIdentity,
 });

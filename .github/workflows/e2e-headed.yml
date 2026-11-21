@@ -2,7 +2,7 @@ name: E2E Headed Chrome
 
 on:
   # E2E removed from `pull_request` to keep PR feedback under ~2 minutes; PR-time
-  # protection is the CI workflow (typecheck / unit / lint / adapter / build).
+  # protection is the CI workflow (build / offline tests / lint / CLI contracts).
   # E2E still guards `main` directly, runs nightly, and on release tag push so
   # protocol/CDP/extension contract regressions are caught before they ship.
   push:
@@ -55,11 +55,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # Linux runs the extension smoke and macOS runs the full real-site e2e
-      # suite; both need a real Chrome. Windows runs only the browser-free
-      # transport gate, and the setup-chrome action hangs on Windows anyway.
+      # Only the real extension contract needs Chrome.
       - name: Setup Chrome
-        if: runner.os != 'Windows'
+        if: runner.os == 'Linux'
         uses: ./.github/actions/setup-chrome
         id: setup-chrome
 
@@ -67,6 +65,7 @@ jobs:
         run: npm run build
 
       - name: Build extension
+        if: runner.os == 'Linux'
         run: npm run build --prefix extension
 
       # Real-browser extension smoke: Linux under xvfb is the one hosted
@@ -89,21 +88,6 @@ jobs:
       # disconnect, profile fallback, graceful shutdown) end to end with the
       # actual daemon binary — no browser required, so this is the blocking
       # gate on EVERY OS, including macOS and Windows.
-      - name: Run daemon transport contract E2E
-        run: npx vitest run --project e2e-fixed-port tests/e2e/daemon-transport.test.ts --reporter=verbose
-
-      - name: Run E2E tests (Linux, via xvfb)
-        if: runner.os == 'Linux'
-        env:
-          OPENCLI_AX_E2E: '0'
-        run: |
-          xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" \
-            npx vitest run tests/e2e/ --reporter=verbose
-
-      # Real-site adapter e2e stays on Linux/macOS; Windows runs the two
-      # deterministic gates above (unit coverage in ci.yml already spans it).
-      - name: Run E2E tests (macOS)
-        if: runner.os == 'macOS'
-        env:
-          OPENCLI_AX_E2E: '0'
-        run: npx vitest run tests/e2e/ --reporter=verbose
+      # The same serial project also covers real CLI tab selection against a fake daemon.
+      - name: Run CLI tab and daemon transport contracts
+        run: npx vitest run --project e2e-fixed-port --reporter=verbose

@@ -47,7 +47,7 @@ OPENCLI_NO_RATE=1 opencli bilibili comments BV1WtAGzYEBm
 3. Create `~/.opencli/plugins/rate-limiter/index.js`:
 
    ```js
-   import { onAfterExecute } from '@jackwener/opencli/hooks'
+   import { onAfterExecute } from '@jackwener/opencli/registry'
 
    const BROWSER_DOMAINS = [
      'xiaohongshu', 'weibo', 'bilibili', 'douyin', 'tiktok',
@@ -86,7 +86,7 @@ Plugins are plain JS/TS files in `~/.opencli/plugins/<name>/`. A plugin file mus
 
 ```js
 // ~/.opencli/plugins/my-plugin/index.js
-import { onAfterExecute } from '@jackwener/opencli/hooks'
+import { onAfterExecute } from '@jackwener/opencli/registry'
 
 onAfterExecute(async (ctx) => {
   // ctx.command — e.g. "bilibili/comments"
@@ -97,3 +97,19 @@ onAfterExecute(async (ctx) => {
 ```
 
 See [hooks.ts](../../src/hooks.ts) for the full `HookContext` type.
+
+## Browser command hooks
+
+Browser page actions, session `bind`/`unbind`, and native Chrome commands emit the
+same before/after lifecycle hooks as site commands. Names include `browser/open`,
+`browser/bind`, and `browser/chrome/call`. `ctx.args` includes named positional
+arguments (for example, `ctx.args.url` for `browser open`) and inherited options
+such as `session` and `profile`. The before hook is awaited before connection or
+browser work begins.
+
+The after hook receives the same context, a completion timestamp, and the last
+emitted result. Reported command failures populate `ctx.error`, including errors
+handled by the command's output layer. Streaming commands emit the after hook
+when they finish, with their last result. Hook exceptions remain warnings and do
+not stop commands; these hooks support observation and cooperative pacing, not
+a security policy that can veto execution.

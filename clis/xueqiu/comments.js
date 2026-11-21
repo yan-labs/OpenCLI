@@ -2,6 +2,7 @@ import { cli, Strategy } from '@jackwener/opencli/registry';
 import { ArgumentError, AuthRequiredError, CommandExecutionError, EmptyResultError } from '@jackwener/opencli/errors';
 import { log } from '@jackwener/opencli/logger';
 import { isRecord } from '@jackwener/opencli/utils';
+import { responseSummary } from './utils.js';
 const XUEQIU_SYMBOL_PATTERN = /^(?:[A-Z]{2}\d{5,6}|\d{4,6}|[A-Z]{1,5}(?:[.-][A-Z]{1,2})?)$/;
 const FAILURE_REASON_BY_KIND = {
     auth: 'auth failure',
@@ -40,7 +41,7 @@ function buildPaginationStopMessage(requestNumber, collected, target, reason) {
         + `collected ${collected}/${target} items, `
         + `reason: ${reason}`;
 }
-function throwFirstPageFailure(kind, symbol) {
+function throwFirstPageFailure(kind, symbol, response) {
     if (kind === 'auth' || kind === 'anti-bot') {
         throw new AuthRequiredError('xueqiu.com', 'Stock discussions require login or challenge clearance');
     }
@@ -50,7 +51,7 @@ function throwFirstPageFailure(kind, symbol) {
     if (kind === 'empty') {
         throw new EmptyResultError(`xueqiu/comments ${symbol}`, `No discussion data found for ${symbol}`);
     }
-    throw new CommandExecutionError(`Unexpected response while loading xueqiu comments for ${symbol}`, 'Run the command again with --verbose to inspect the raw site response.');
+    throw new CommandExecutionError(`Unexpected response while loading xueqiu comments for ${symbol} (${responseSummary(response)})`, 'Inspect /query/v1/symbol/search/status in browser Network; share a sanitized response shape without cookies or tokens.');
 }
 /**
  * Extract the raw item list from one classified JSON payload.
@@ -90,6 +91,7 @@ export function classifyXueqiuCommentsResponse(response) {
     if (/login required|unauthorized|unauthorised|forbidden|not logged in|need login/.test(responseText)) {
         return { kind: 'auth' };
     }
+    if (response.status < 200 || response.status >= 300) return { kind: 'incompatible' };
     if (/invalid symbol|invalid code|bad symbol/.test(envelopeText)) {
         return { kind: 'argument' };
     }
@@ -207,12 +209,10 @@ export async function fetchCommentsPage(page, symbol, pageNumber, pageSize) {
         const contentType = response.headers.get('content-type') || '';
         const text = await response.text();
         let json = null;
-        if (contentType.includes('application/json')) {
-          try {
-            json = JSON.parse(text);
-          } catch {
-            json = null;
-          }
+        try {
+          json = JSON.parse(text);
+        } catch {
+          json = null;
         }
         return {
           status: response.status,
@@ -229,7 +229,9 @@ export async function fetchCommentsPage(page, symbol, pageNumber, pageSize) {
         };
       }
     })()
-  `);
+  `).catch(() => {
+        throw new CommandExecutionError('Xueqiu discussion page request failed (network, CSP or browser context)');
+    });
 }
 /**
  * Collect enough stock discussion rows to satisfy the requested limit.
@@ -248,7 +250,7 @@ export async function collectCommentRows(options) {
         const response = await options.fetchPage(requestNumber, options.pageSize);
         const classified = classifyXueqiuCommentsResponse(response);
         if (requestNumber === 1 && classified.kind !== 'unknown') {
-            throwFirstPageFailure(classified.kind, options.symbol);
+            throwFirstPageFailure(classified.kind, options.symbol, response);
         }
         else if (classified.kind === 'empty') {
             break;
@@ -263,7 +265,7 @@ export async function collectCommentRows(options) {
             .filter(row => row.id);
         if (pageRows.length === 0) {
             if (requestNumber === 1) {
-                throw new CommandExecutionError(`Unexpected response while loading xueqiu comments for ${options.symbol}`, 'Run the command again with --verbose to inspect the raw site response.');
+                throw new CommandExecutionError(`Unexpected response while loading xueqiu comments for ${options.symbol} (${responseSummary(response)})`, 'Inspect /query/v1/symbol/search/status in browser Network; share a sanitized response shape without cookies or tokens.');
             }
             if (classified.kind === 'unknown') {
                 warn(buildPaginationStopMessage(requestNumber, rows.length, options.limit, describeFailureKind(classified.kind)));

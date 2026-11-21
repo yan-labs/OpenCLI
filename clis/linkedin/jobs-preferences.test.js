@@ -8,13 +8,6 @@ const { inferOpenToWork, normalizePreferences } = await import('./jobs-preferenc
 describe('linkedin jobs-preferences adapter', () => {
   const command = getRegistry().get('linkedin/jobs-preferences');
 
-  it('registers command shape', () => {
-    expect(command).toBeDefined();
-    expect(command.strategy).toBe('cookie');
-    expect(command.browser).toBe(true);
-    expect(command.columns).toContain('open_to_work');
-  });
-
   it('infers Open to Work visible states conservatively', () => {
     expect(inferOpenToWork('Open to work turned off')).toBe('off');
     expect(inferOpenToWork('Open to work turned on visible to recruiters')).toBe('on');

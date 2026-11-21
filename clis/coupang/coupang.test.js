@@ -61,35 +61,6 @@ describe('coupang utils — product id validation', () => {
     });
 });
 
-describe('coupang adapter registry shape', () => {
-    it('search has product_id column for round-trip into product', () => {
-        const search = getRegistry().get('coupang/search');
-        expect(search).toBeDefined();
-        expect(search.access).toBe('read');
-        expect(search.columns).toContain('product_id');
-        // Listing pairs with detail: id-shaped column present.
-        const idShaped = search.columns.find((c) => /_id$|^id$/.test(c));
-        expect(idShaped).toBe('product_id');
-    });
-
-    it('product cmd is a registered read adapter that pairs with search', () => {
-        const product = getRegistry().get('coupang/product');
-        expect(product).toBeDefined();
-        expect(product.access).toBe('read');
-        expect(product.columns).toContain('product_id');
-        expect(product.columns).toContain('title');
-        expect(product.columns).toContain('price');
-        expect(product.columns).toContain('seller');
-        expect(product.columns).toContain('rating');
-    });
-
-    it('add-to-cart remains write-class', () => {
-        const cart = getRegistry().get('coupang/add-to-cart');
-        expect(cart).toBeDefined();
-        expect(cart.access).toBe('write');
-    });
-});
-
 describe('coupang search — typed errors (no silent fallback)', () => {
     it('rejects empty query with ArgumentError', async () => {
         const search = getRegistry().get('coupang/search');

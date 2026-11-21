@@ -13,39 +13,6 @@ function createPageMock(evaluateResult = []) {
 }
 
 describe('duckduckgo search', () => {
-  it('should register as a valid command', () => {
-    expect(command).toBeDefined();
-    expect(command.site).toBe('duckduckgo');
-    expect(command.name).toBe('search');
-    expect(command.access).toBe('read');
-    expect(command.browser).toBe(true);
-    expect(command.strategy).toBe('public');
-    expect(command.domain).toBe('html.duckduckgo.com');
-  });
-
-  it('should define keyword positional arg', () => {
-    const kwArg = command.args.find(a => a.name === 'keyword');
-    expect(kwArg).toBeDefined();
-    expect(kwArg.positional).toBe(true);
-    expect(kwArg.required).toBe(true);
-  });
-
-  it('should define limit arg with default 10', () => {
-    const limitArg = command.args.find(a => a.name === 'limit');
-    expect(limitArg).toBeDefined();
-    expect(limitArg.type).toBe('int');
-    expect(limitArg.default).toBe(10);
-  });
-
-  it('should define columns for output', () => {
-    expect(command.columns).toContain('rank');
-    expect(command.columns).toContain('title');
-    expect(command.columns).toContain('url');
-    expect(command.columns).toContain('snippet');
-    expect(command.columns).toContain('displayUrl');
-    expect(command.columns).toContain('icon');
-    expect(command.columns).toContain('resultType');
-  });
 
   it('rejects empty query and out-of-range pagination before navigation', async () => {
     const page = createPageMock();

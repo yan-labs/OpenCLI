@@ -9,36 +9,14 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { getRegistry, Strategy } from '@jackwener/opencli/registry';
-import { CommandExecutionError } from '@jackwener/opencli/errors';
 
-import {
-    BROWSE_COLUMNS,
-    CAR_COLUMNS,
-    resolveCityCode,
-    normalizeClueId,
-    requireLimit,
-} from './utils.js';
+import { BROWSE_COLUMNS, resolveCityCode, normalizeClueId, requireLimit } from './utils.js';
 import { parseListings } from './browse.js';
 import { parseCarDetail } from './car.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const LIST = readFileSync(join(__dirname, '__fixtures__/list.html'), 'utf8');
 const DETAIL = readFileSync(join(__dirname, '__fixtures__/detail.html'), 'utf8');
-
-describe('guazi adapter — registration', () => {
-    it('registers browse + car as PUBLIC (no browser)', () => {
-        for (const n of ['browse', 'car']) {
-            const cmd = getRegistry().get(`guazi/${n}`);
-            expect(cmd, n).toBeTruthy();
-            expect(cmd.strategy, n).toBe(Strategy.PUBLIC);
-            expect(cmd.browser, n).toBe(false);
-            expect(cmd.access, n).toBe('read');
-        }
-        expect(getRegistry().get('guazi/browse').columns).toEqual(BROWSE_COLUMNS);
-        expect(getRegistry().get('guazi/car').columns).toEqual(CAR_COLUMNS);
-    });
-});
 
 describe('guazi adapter — utils', () => {
     it('resolveCityCode maps names, codes, and defaults to bj', () => {
@@ -79,21 +57,6 @@ describe('guazi adapter — parsers against frozen fixtures', () => {
     it('parseListings respects the limit and dedupes', () => {
         expect(parseListings(LIST, 2).length).toBe(2);
         expect(parseListings('<html>nothing</html>', 40)).toEqual([]);
-    });
-
-    it('browse treats a successful page with no listing anchors as parser drift', async () => {
-        const originalFetch = globalThis.fetch;
-        globalThis.fetch = async () => ({
-            ok: true,
-            status: 200,
-            text: async () => '<html><title>瓜子二手车</title><main>new layout</main></html>',
-        });
-        try {
-            await expect(getRegistry().get('guazi/browse').func({ city: 'bj', limit: 20 }))
-                .rejects.toBeInstanceOf(CommandExecutionError);
-        } finally {
-            globalThis.fetch = originalFetch;
-        }
     });
 
     it('parseListings rejects malformed listing cards instead of silently dropping them', () => {

@@ -42,20 +42,11 @@ for adapter_dir in "$SRC_DIR"/*/; do
   [[ "$has_commands" == false ]] && continue
   total=$((total + 1))
 
-  # Check if doc exists in browser/ or desktop/ subdirectories
-  if [[ -f "$DOCS_DIR/browser/$adapter_name.md" ]] || \
-     [[ -f "$DOCS_DIR/desktop/$adapter_name.md" ]]; then
+  # Check for the website adapter's documentation.
+  if [[ -f "$DOCS_DIR/browser/$adapter_name.md" ]]; then
     covered=$((covered + 1))
   else
-    # Handle directory name mismatches (e.g., discord-app -> discord)
-    alt_name="${adapter_name%-app}"
-    if [[ "$alt_name" != "$adapter_name" ]] && \
-       { [[ -f "$DOCS_DIR/browser/$alt_name.md" ]] || \
-         [[ -f "$DOCS_DIR/desktop/$alt_name.md" ]]; }; then
-      covered=$((covered + 1))
-    else
-      missing+=("$adapter_name")
-    fi
+    missing+=("$adapter_name")
   fi
 done
 
@@ -65,7 +56,7 @@ echo ""
 if [[ ${#missing[@]} -gt 0 ]]; then
   echo "⚠️  Missing docs for ${#missing[@]} adapter(s):"
   for name in "${missing[@]}"; do
-    echo "   - $name  →  create docs/adapters/browser/$name.md or docs/adapters/desktop/$name.md"
+    echo "   - $name  →  create docs/adapters/browser/$name.md"
   done
   echo ""
   if $STRICT; then

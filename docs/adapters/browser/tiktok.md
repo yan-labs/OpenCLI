@@ -9,7 +9,7 @@
 | `opencli tiktok profile` | Get user profile info |
 | `opencli tiktok search` | Search videos |
 | `opencli tiktok explore` | Trending videos from explore page |
-| `opencli tiktok user` | Get recent videos from a user via page-context APIs |
+| `opencli tiktok user` | Get recent videos from page-rendered profile responses |
 | `opencli tiktok following` | List accounts you follow |
 | `opencli tiktok friends` | Friend suggestions |
 | `opencli tiktok live` | Browse live streams |
@@ -94,12 +94,19 @@ Same video columns as `explore`, plus:
 
 | Column | Type | Notes |
 |--------|------|-------|
-| `source` | string | `profile-api`, `bootstrap`, or lower-authority `search-fallback` |
+| `source` | string | `profile-network` or `bootstrap` |
 
-`user` resolves the profile `secUid`, pages `/api/post/item_list/`, and uses
-exact-author `/api/search/general/full/` only as a fallback when profile data is
-short. `source` lets callers distinguish first-party profile rows from fallback
-search rows.
+`user` reads profile bootstrap data and captures the page's own
+`/api/post/item_list/` responses. It does not issue unsigned API requests or replay
+signed URLs. Captures must match the requested profile's `secUid`, and videos
+must match the requested author. A current Browser Bridge with network capture
+support is required when bootstrap data is insufficient.
+
+Loading is bounded to ten capture reads and four scrolls. If loading stalls after
+some videos arrive, the command returns those rows with a warning. Missing,
+empty, malformed, truncated, blocked or rate-limited responses are errors rather
+than evidence that a profile has no videos. An explicitly complete empty list or
+zero-video profile is reported as `EMPTY_RESULT`.
 
 ### `friends`
 

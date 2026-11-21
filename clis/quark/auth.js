@@ -24,6 +24,10 @@ const WHOAMI_PROBE = `(async () => {
 async function verifyQuarkIdentity(page) {
   await page.goto('https://pan.quark.cn/');
   await page.wait(2);
+  return probeQuarkIdentity(page);
+}
+
+async function probeQuarkIdentity(page) {
   const probe = await page.evaluate(WHOAMI_PROBE);
   if (probe?.kind === 'auth') throw new AuthRequiredError('quark.cn', probe.detail);
   if (probe?.kind === 'http') throw new CommandExecutionError(`HTTP ${probe.httpStatus} from Quark account/info`);
@@ -39,9 +43,5 @@ registerSiteAuthCommands({
   loginUrl: 'https://pan.quark.cn/',
   columns: ['nickname'],
   verify: verifyQuarkIdentity,
-  poll: async (page) => {
-    const probe = await page.evaluate(WHOAMI_PROBE);
-    if (!probe?.ok) throw new AuthRequiredError('quark.cn', 'Waiting for Quark login');
-    return { nickname: probe.nickname };
-  },
+  poll: probeQuarkIdentity,
 });

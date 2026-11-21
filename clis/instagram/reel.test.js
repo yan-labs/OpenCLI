@@ -59,13 +59,7 @@ describe('instagram reel registration', () => {
     afterEach(() => {
         vi.restoreAllMocks();
     });
-    it('registers the reel command with a required-value video arg', () => {
-        const cmd = getRegistry().get('instagram/reel');
-        expect(cmd).toBeDefined();
-        expect(cmd?.browser).toBe(true);
-        expect(cmd?.args.some((arg) => arg.name === 'video' && !arg.required && arg.valueRequired)).toBe(true);
-        expect(cmd?.args.some((arg) => arg.name === 'content' && arg.positional && !arg.required)).toBe(true);
-    });
+
     it('rejects missing --video before browser work', async () => {
         const page = createPageMock([]);
         const cmd = getRegistry().get('instagram/reel');

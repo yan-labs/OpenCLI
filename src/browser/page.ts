@@ -15,8 +15,9 @@ import { buildEvaluateExpression } from './utils.js';
 import { saveBase64ToFile } from '../utils.js';
 import { generateStealthJs } from './stealth.js';
 import { waitForDomStableJs } from './dom-helpers.js';
-import { CDPBasePage } from './base-page.js';
+import { CDPBasePage, NativeInputVisibilityError } from './base-page.js';
 import { classifyBrowserError } from './errors.js';
+import { CommandExecutionError } from '../errors.js';
 import { log } from '../logger.js';
 
 function isUnsupportedNetworkCaptureError(err: unknown): boolean {
@@ -24,19 +25,6 @@ function isUnsupportedNetworkCaptureError(err: unknown): boolean {
   const normalized = message.toLowerCase();
   return (normalized.includes('unknown action') && normalized.includes('network-capture'))
     || (normalized.includes('network capture') && normalized.includes('not supported'));
-}
-
-// `open` arms network capture BEFORE navigating, so on a brand-new session the
-// capture command reaches the extension before any tab exists. Since the extension
-// refuses to auto-create a tab for a command that carries no URL (that guard is what
-// keeps eval/click/state from spawning orphan blank tabs), the capture call fails with
-// `session_not_found`. That is not a real failure here: the navigation that follows
-// creates the tab, and the JS interceptor fallback covers the request log. Treat it as
-// "capture unavailable for this call" WITHOUT marking capture permanently unsupported.
-function isSessionNotFoundError(err: unknown): boolean {
-  const message = err instanceof Error ? err.message : String(err);
-  const normalized = message.toLowerCase();
-  return normalized.includes('session_not_found') || normalized.includes('no active session');
 }
 
 // The extension throws "Page not found: <id> — stale page identity" when our cached
@@ -59,11 +47,12 @@ export class Page extends CDPBasePage {
     private readonly session: string,
     idleTimeout?: number,
     public readonly contextId?: string,
-    private readonly windowMode?: 'foreground' | 'active' | 'background' | 'isolated' | 'dedicated',
+    private readonly windowMode?: 'foreground' | 'background' | 'dedicated',
     private readonly surface: 'browser' | 'adapter' = 'browser',
     private readonly siteSession?: 'ephemeral' | 'persistent',
     /** Soft profile preference (config default) — daemon arbitrates; see profileRouteParams. */
     public readonly preferredContextId?: string,
+    private readonly requireExistingSession?: boolean,
   ) {
     super();
     this._idleTimeout = idleTimeout;
@@ -75,12 +64,13 @@ export class Page extends CDPBasePage {
   private _networkCaptureWarned = false;
 
   /** Helper: spread session into command params */
-  private _sessionOpts(): { session: string; surface: 'browser' | 'adapter'; idleTimeout?: number; contextId?: string; preferredContextId?: string; windowMode?: 'foreground' | 'active' | 'background' | 'isolated' | 'dedicated'; siteSession?: 'ephemeral' | 'persistent' } {
+  private _sessionOpts(): { session: string; surface: 'browser' | 'adapter'; requireExistingSession?: boolean; idleTimeout?: number; contextId?: string; preferredContextId?: string; windowMode?: 'foreground' | 'background' | 'dedicated'; siteSession?: 'ephemeral' | 'persistent' } {
     return {
       session: this.session,
       surface: this.surface,
       ...(this.contextId && { contextId: this.contextId }),
       ...(this.preferredContextId && { preferredContextId: this.preferredContextId }),
+      ...(this.requireExistingSession && { requireExistingSession: true }),
       ...(this._idleTimeout != null && { idleTimeout: this._idleTimeout }),
       ...(this.windowMode && { windowMode: this.windowMode }),
       ...(this.siteSession && { siteSession: this.siteSession }),
@@ -95,38 +85,18 @@ export class Page extends CDPBasePage {
       ...(this.contextId && { contextId: this.contextId }),
       ...(this.preferredContextId && { preferredContextId: this.preferredContextId }),
       ...(this._page !== undefined && { page: this._page }),
+      ...(this.requireExistingSession && { requireExistingSession: true }),
       ...(this._idleTimeout != null && { idleTimeout: this._idleTimeout }),
       ...(this.windowMode && { windowMode: this.windowMode }),
       ...(this.siteSession && { siteSession: this.siteSession }),
     };
   }
 
-  async consoleCapture(): Promise<{ captureSupported: boolean; startedAt: number | null; messages: unknown[] }> {
-    try {
-      return await sendCommand('console-read', this._cmdOpts()) as { captureSupported: boolean; startedAt: number | null; messages: unknown[] };
-    } catch (err) {
-      const message = err instanceof Error ? err.message.toLowerCase() : String(err).toLowerCase();
-      if (!message.includes('unknown action') || !message.includes('console-read')) throw err;
-      return { captureSupported: false, startedAt: null, messages: [] };
-    }
-  }
-
-  override async consoleMessages(level = 'all'): Promise<unknown[]> {
-    const { messages } = await this.consoleCapture();
-    return level === 'all' ? messages : messages.filter(message =>
-      (message as { type?: string }).type === level);
-  }
-
-  async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: number; timeoutMs?: number }): Promise<void> {
-    // Omitted (undefined) so an older extension build — which does not read this
-    // field yet — falls back to its own hardcoded 15s default rather than seeing
-    // an unexpected `timeoutMs: undefined` key.
-    const navOpts = options?.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {};
+  async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: number }): Promise<void> {
     let result: { data: unknown; page?: string };
     try {
       result = await sendCommandFull('navigate', {
         url,
-        ...navOpts,
         ...this._cmdOpts(),
       });
     } catch (err) {
@@ -139,7 +109,6 @@ export class Page extends CDPBasePage {
       this._page = undefined;
       result = await sendCommandFull('navigate', {
         url,
-        ...navOpts,
         ...this._cmdOpts(),
       });
     }
@@ -219,23 +188,41 @@ export class Page extends CDPBasePage {
     }
   }
 
+  /** Non-idempotent writes must not use evaluate's navigation retry. */
+  async evaluateOnce<T = unknown>(js: string): Promise<T> {
+    return await sendCommand('exec', { code: buildEvaluateExpression(js, []), ...this._cmdOpts() }) as T;
+  }
+
   async getCookies(opts: { domain?: string; url?: string } = {}): Promise<BrowserCookie[]> {
     const result = await sendCommand('cookies', { ...this._sessionOpts(), ...opts });
-    return Array.isArray(result) ? result : [];
+    if (!Array.isArray(result) || result.some(cookie => !cookie || typeof cookie.name !== 'string' || typeof cookie.value !== 'string')) {
+      throw new CommandExecutionError('Browser Bridge returned an invalid cookies response');
+    }
+    return result;
   }
 
   /** Release the current browser session lease in the extension */
   async closeWindow(): Promise<void> {
+    const closeOwnedTab = process.env.OPENCLI_CLOSE_OWNED_TAB === '1';
     try {
-      await sendCommand('close-window', { ...this._sessionOpts() });
-    } catch {
+      const result = await sendCommand(closeOwnedTab ? 'close-owned-tab' : 'close-window', {
+        ...this._sessionOpts(),
+      });
+      const cleanup = result && typeof result === 'object' && 'tabCleanup' in result ? result.tabCleanup : undefined;
+      if (closeOwnedTab && cleanup !== 'closed-owned-tab' && cleanup !== 'no-owned-tab') {
+        throw new CommandExecutionError('Browser Bridge did not acknowledge owned-tab cleanup; update the extension.');
+      }
+    } catch (err) {
+      if (closeOwnedTab) {
+        log.warn(`Owned-tab cleanup failed (session=${this.session}, surface=${this.surface}): ${err instanceof Error ? err.message : String(err)}. Retry cleanup separately or close the remaining tab manually; do not repeat the site action.`);
+        throw err;
+      }
       // Window may already be closed or daemon may be down
-    } finally {
-      this._page = undefined;
-      this._lastUrl = null;
-      this._networkCaptureUnsupported = false;
-      this._networkCaptureWarned = false;
     }
+    this._page = undefined;
+    this._lastUrl = null;
+    this._networkCaptureUnsupported = false;
+    this._networkCaptureWarned = false;
   }
 
   async tabs(): Promise<unknown[]> {
@@ -307,22 +294,21 @@ export class Page extends CDPBasePage {
       });
       return true;
     } catch (err) {
-      if (isSessionNotFoundError(err)) return false;
       if (!isUnsupportedNetworkCaptureError(err)) throw err;
       this._markUnsupportedNetworkCapture();
       return false;
     }
   }
 
-  async readNetworkCapture(): Promise<unknown[]> {
+  async readNetworkCapture(options: { retainIncomplete?: boolean } = {}): Promise<unknown[]> {
     if (this._networkCaptureUnsupported) return [];
     try {
       const result = await sendCommand('network-capture-read', {
+        ...options,
         ...this._cmdOpts(),
       });
       return Array.isArray(result) ? result : [];
     } catch (err) {
-      if (isSessionNotFoundError(err)) return [];
       if (!isUnsupportedNetworkCaptureError(err)) throw err;
       this._markUnsupportedNetworkCapture();
       return [];
@@ -364,32 +350,14 @@ export class Page extends CDPBasePage {
     }
   }
 
-  async readClipboard(): Promise<string> {
-    const result = await sendCommand('clipboard', { ...this._cmdOpts() }) as { text?: string };
-    return result?.text ?? '';
-  }
-
-  async frames(opts?: { debug?: boolean }): Promise<Array<{ index: number; frameId: string; url: string; name: string }> | { frames: Array<{ index: number; frameId: string; url: string; name: string }>; debug: Record<string, unknown> }> {
-    const result = await sendCommand('frames', { ...(opts?.debug ? { debug: true } : {}), ...this._cmdOpts() });
-    if (opts?.debug) {
-      return result as { frames: Array<{ index: number; frameId: string; url: string; name: string }>; debug: Record<string, unknown> };
-    }
-    return Array.isArray(result) ? result : [];
-  }
-
-  async contexts(): Promise<Array<{ id: number; origin: string; name: string; auxData: any }>> {
-    const result = await sendCommand('contexts', { ...this._cmdOpts() });
+  async frames(): Promise<Array<{ index: number; frameId: string; url: string; name: string }>> {
+    const result = await sendCommand('frames', { ...this._cmdOpts() });
     return Array.isArray(result) ? result : [];
   }
 
   async evaluateInFrame(js: string, frameIndex: number): Promise<unknown> {
     const code = buildEvaluateExpression(js);
     return sendCommand('exec', { code, frameIndex, ...this._cmdOpts() });
-  }
-
-  async evaluateInContext(js: string, contextId: number): Promise<unknown> {
-    const code = buildEvaluateExpression(js);
-    return sendCommand('exec', { code, execContextId: contextId, ...this._cmdOpts() });
   }
 
   async cdp(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
@@ -402,6 +370,7 @@ export class Page extends CDPBasePage {
 
   /** Precise click using DOM.getContentQuads/getBoxModel for inline elements */
   async clickWithQuads(ref: string): Promise<void> {
+    await this.assertNativeInputVisible();
     const safeRef = JSON.stringify(ref);
     const cssSelector = `[data-opencli-ref="${ref.replace(/"/g, '\\"')}"]`;
 
@@ -436,7 +405,10 @@ export class Page extends CDPBasePage {
           await this.nativeClick(Math.round(cx), Math.round(cy));
           return;
         }
-      } catch { /* fallthrough */ }
+      } catch (error) {
+        if (error instanceof NativeInputVisibilityError) throw error;
+        // Fall through for unsupported geometry lookup.
+      }
 
       // Try getBoxModel
       try {
@@ -448,8 +420,14 @@ export class Page extends CDPBasePage {
           await this.nativeClick(Math.round(cx), Math.round(cy));
           return;
         }
-      } catch { /* fallthrough */ }
-    } catch { /* fallthrough */ }
+      } catch (error) {
+        if (error instanceof NativeInputVisibilityError) throw error;
+        // Fall through for unsupported geometry lookup.
+      }
+    } catch (error) {
+      if (error instanceof NativeInputVisibilityError) throw error;
+      // Fall through for unsupported DOM lookup.
+    }
 
     // Final fallback: regular click
     await this.evaluate(`

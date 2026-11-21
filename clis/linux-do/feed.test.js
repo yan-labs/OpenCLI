@@ -1,11 +1,58 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
-import { __test__ } from './feed.js';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { AuthRequiredError, CommandExecutionError, LoginWallError } from '@jackwener/opencli/errors';
+import { fetchLinuxDoJson, __test__ } from './feed.js';
 describe('linux-do feed metadata resolution', () => {
     afterEach(() => {
         __test__.resetMetadataCaches();
+    });
+
+    it('executes the browser sniffer for an HTML 403 response', async () => {
+        const page = {
+            evaluate: vi.fn((source) => new Function('fetch', `return ${source}`)(vi.fn().mockResolvedValue({
+                status: 403,
+                ok: false,
+                url: 'https://linux.do/latest.json',
+                headers: { get: () => 'text/html; charset=utf-8' },
+                text: async () => '<html><title>Access denied</title>',
+            }))),
+        };
+        await expect(fetchLinuxDoJson(page, '/latest.json', { skipNavigate: true }))
+            .rejects.toBeInstanceOf(LoginWallError);
+    });
+
+    it('maps a valid browser JSON envelope and uses the shared response sniffer', async () => {
+        const page = {
+            evaluate: vi.fn().mockResolvedValue({ kind: 'ok', data: { topic_list: { topics: [] } } }),
+        };
+        await expect(fetchLinuxDoJson(page, '/latest.json', { skipNavigate: true }))
+            .resolves.toEqual({ topic_list: { topics: [] } });
+        expect(page.evaluate.mock.calls[0][0]).toContain('fetchJsonOrLoginWall');
+    });
+
+    it('distinguishes login walls, auth responses, rate limits, and bridge failures', async () => {
+        const loginWall = {
+            kind: 'login-wall',
+            sentinel: {
+                __loginWall: true,
+                status: 403,
+                url: 'https://linux.do/latest.json',
+                contentType: 'text/html',
+                bodyPreview: '<html><title>Access denied</title>',
+            },
+        };
+        await expect(fetchLinuxDoJson({ evaluate: vi.fn().mockResolvedValue(loginWall) }, '/latest.json', { skipNavigate: true }))
+            .rejects.toBeInstanceOf(LoginWallError);
+        await expect(fetchLinuxDoJson({ evaluate: vi.fn().mockResolvedValue({ kind: 'http', status: 403 }) }, '/latest.json', { skipNavigate: true }))
+            .rejects.toBeInstanceOf(AuthRequiredError);
+        await expect(fetchLinuxDoJson({ evaluate: vi.fn().mockResolvedValue({ kind: 'http', status: 429 }) }, '/latest.json', { skipNavigate: true }))
+            .rejects.toMatchObject({ hint: expect.stringContaining('Stop retrying') });
+        await expect(fetchLinuxDoJson({ evaluate: vi.fn().mockResolvedValue({ kind: 'http', status: 'bad' }) }, '/latest.json', { skipNavigate: true }))
+            .rejects.toThrow('non-numeric HTTP status');
+        await expect(fetchLinuxDoJson({ evaluate: vi.fn().mockResolvedValue({ kind: 'exception', detail: 'bridge failed' }) }, '/latest.json', { skipNavigate: true }))
+            .rejects.toBeInstanceOf(CommandExecutionError);
     });
     it('builds the replacement URL for legacy latest', async () => {
         const request = await __test__.resolveFeedRequest(null, {

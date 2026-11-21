@@ -5,6 +5,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 import {
   cancelMidjourneyJob,
   creditsToFastMinutes,
+  downloadOriginals,
   downloadRawVideo,
   downloadRenderedVideo,
   normalizePositiveInt,
@@ -384,7 +385,7 @@ it('submission and derived-job polling stop after three consecutive API failures
 
 function browserPageFor(bytes, mime = 'video/mp4') {
   let evaluateCalls = 0;
-  globalThis.window = {};
+  globalThis.window = { location: { origin: 'https://cdn.midjourney.com' } };
   vi.stubGlobal('fetch', vi.fn(async () => new Response(bytes, {
     status: 200,
     headers: { 'content-type': mime },
@@ -415,7 +416,7 @@ it('raw-video downloads cross the browser bridge in bounded chunks', async () =>
   expect(result.bytes).toBe(bytes.length);
   expect(page.evaluateCalls).toBeGreaterThanOrEqual(5);
   expect(await fs.readFile(result.filePath)).toEqual(Buffer.from(bytes));
-  expect(Object.keys(globalThis.window)).toEqual([]);
+  expect(Object.keys(globalThis.window)).toEqual(['location']);
 });
 
 it('a corrupt non-empty cache entry is replaced instead of reported as cached', async () => {
@@ -456,4 +457,139 @@ it('rendered downloads trust file magic over stale Browser Bridge MIME metadata'
   expect(result.bytes).toBe(gif.length);
   expect(await fs.readFile(result.filePath)).toEqual(gif);
   await expect(fs.stat(sourcePath)).rejects.toMatchObject({ code: 'ENOENT' });
+});
+
+const CDN = 'https://cdn.midjourney.com';
+const PNG_BYTES = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(300_000, 7)]);
+const JPEG_BYTES = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(1000, 9)]);
+
+// Stands in for a Browser Bridge tab. `routes` maps a CDN URL to per-request
+// replies (the last one repeats). Unlisted URLs answer 403, as Cloudflare does
+// for a challenged cross-origin fetch.
+// `landOn` is where goto() ends up; `wrap` returns evaluate() results in the
+// {session, data} envelope the Browser Bridge can use.
+function cdnPage(routes, { landOn = CDN, wrap = false } = {}) {
+  const state = { origin: 'https://www.midjourney.com', gotos: [], waits: [], requests: [], buffers: new Map() };
+  const reply = (value) => (wrap ? { session: 'site:midjourney', data: value } : value);
+  return {
+    state,
+    async goto(url) { state.gotos.push(url); state.origin = landOn; },
+    async wait(options) { state.waits.push(options); },
+    async evaluate(_fn, ...args) {
+      if (args.length === 0) return reply(state.origin);
+      if (args.length === 1) { state.buffers.delete(args[0]); return reply(true); }
+      if (args.length === 2) {
+        const [url, key] = args;
+        state.requests.push(url);
+        const seen = state.requests.filter((item) => item === url).length;
+        const list = routes[url] || [{ status: 403 }];
+        const next = list[Math.min(seen, list.length) - 1];
+        if (next.status !== 200) return reply({ ok: false, status: next.status, type: 'text/html' });
+        state.buffers.set(key, next.bytes);
+        return reply({ ok: true, status: 200, type: next.type, size: next.bytes.length });
+      }
+      const [key, start, length] = args;
+      return reply(state.buffers.get(key).subarray(start, start + length).toString('base64'));
+    },
+  };
+}
+
+async function tempOutputDir() {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'opencli-midjourney-original-'));
+  tempDirs.push(dir);
+  return dir;
+}
+
+const pngReply = { status: 200, type: 'image/png', bytes: PNG_BYTES };
+const jpegReply = { status: 200, type: 'image/jpeg', bytes: JPEG_BYTES };
+
+it('image originals enter the CDN origin once and save PNGs', async () => {
+  const page = cdnPage({ [`${CDN}/${JOB}/0_0.png`]: [pngReply], [`${CDN}/${JOB}/0_1.png`]: [pngReply] });
+  const files = await downloadOriginals(page, JOB, [0, 1], await tempOutputDir());
+  expect(files.map((item) => path.basename(item.filePath))).toEqual([`${JOB}_0.png`, `${JOB}_1.png`]);
+  expect(page.state.gotos).toHaveLength(1);
+  expect((await fs.stat(files[1].filePath)).size).toBe(PNG_BYTES.length);
+});
+
+it('a challenged CDN request is retried instead of falling back to JPEG', async () => {
+  const page = cdnPage({
+    [`${CDN}/${JOB}/0_0.png`]: [{ status: 403 }, { status: 403 }, pngReply],
+    [`${CDN}/${JOB}/0_0.jpeg`]: [jpegReply],
+  });
+  const [file] = await downloadOriginals(page, JOB, [0], await tempOutputDir());
+  expect(path.extname(file.filePath)).toBe('.png');
+  expect(page.state.waits).toEqual([{ time: 2 }, { time: 5 }]);
+  expect(page.state.gotos).toHaveLength(1);
+  expect(page.state.requests.some((url) => url.endsWith('.jpeg'))).toBe(false);
+  expect(page.state.buffers.size).toBe(0);
+});
+
+it('a CDN that keeps challenging fails as a block, never as a lower-quality save', async () => {
+  // The JPEG is available, so an implementation that falls through on any error would save it.
+  const page = cdnPage({ [`${CDN}/${JOB}/0_0.jpeg`]: [jpegReply] });
+  const outputDir = await tempOutputDir();
+  await expect(downloadOriginals(page, JOB, [0], outputDir)).rejects.toMatchObject({
+    message: expect.stringContaining('HTTP 403'),
+    hint: expect.stringContaining(`opencli midjourney download ${JOB}`),
+  });
+  expect(page.state.waits).toEqual([{ time: 2 }, { time: 5 }, { time: 10 }]);
+  expect(page.state.requests.every((url) => url.endsWith('.png'))).toBe(true);
+  expect(await fs.readdir(outputDir)).toEqual([]);
+});
+
+it('image originals fall back to a derivative only after the PNG is confirmed missing', async () => {
+  const page = cdnPage({
+    [`${CDN}/${JOB}/0_0.png`]: [{ status: 422 }],
+    [`${CDN}/${JOB}/0_0.jpeg`]: [jpegReply],
+  });
+  const [file] = await downloadOriginals(page, JOB, [0], await tempOutputDir());
+  expect(path.extname(file.filePath)).toBe('.jpg');
+  expect(page.state.requests).toEqual([`${CDN}/${JOB}/0_0.png`, `${CDN}/${JOB}/0_0.jpeg`]);
+
+  const missing = Object.fromEntries(['png', 'jpeg', 'jpg', 'webp'].map((ext) => [`${CDN}/${JOB}/0_0.${ext}`, [{ status: 404 }]]));
+  await expect(downloadOriginals(cdnPage(missing), JOB, [0], await tempOutputDir()))
+    .rejects.toThrow(/No Midjourney original image/);
+});
+
+it('only a PNG counts as a cached original', async () => {
+  const outputDir = await tempOutputDir();
+  await fs.writeFile(path.join(outputDir, `${JOB}_0.jpg`), JPEG_BYTES);
+  const page = cdnPage({ [`${CDN}/${JOB}/0_0.png`]: [pngReply] });
+  const [fresh] = await downloadOriginals(page, JOB, [0], outputDir);
+  expect(fresh.cached).toBe(false);
+  expect(path.extname(fresh.filePath)).toBe('.png');
+
+  const again = cdnPage({});
+  const [cached] = await downloadOriginals(again, JOB, [0], outputDir);
+  expect(cached.cached).toBe(true);
+  expect(again.state.requests).toHaveLength(0);
+});
+
+it('a block after the PNG miss does not save a lower-quality file', async () => {
+  const page = cdnPage({ [`${CDN}/${JOB}/0_0.png`]: [{ status: 422 }] });
+  const outputDir = await tempOutputDir();
+  await expect(downloadOriginals(page, JOB, [0], outputDir)).rejects.toThrow(/HTTP 403/);
+  expect(await fs.readdir(outputDir)).toEqual([]);
+});
+
+it('a non-block CDN status fails immediately without retrying', async () => {
+  const page = cdnPage({ [`${CDN}/${JOB}/0_0.png`]: [{ status: 401 }] });
+  await expect(downloadOriginals(page, JOB, [0], await tempOutputDir())).rejects.toThrow(/HTTP 401/);
+  expect(page.state.requests).toHaveLength(1);
+  expect(page.state.waits).toEqual([]);
+});
+
+it('image originals fail as typed errors when the tab cannot reach the CDN origin', async () => {
+  const page = cdnPage({}, { landOn: 'https://www.midjourney.com' });
+  await expect(downloadOriginals(page, JOB, [0], await tempOutputDir()))
+    .rejects.toThrow(/Could not open the Midjourney CDN origin: the tab is on https:\/\/www\.midjourney\.com/);
+  expect(page.state.requests).toHaveLength(0);
+});
+
+it('image originals unwrap Browser Bridge result envelopes', async () => {
+  const page = cdnPage({ [`${CDN}/${JOB}/0_0.png`]: [pngReply] }, { wrap: true });
+  const [file] = await downloadOriginals(page, JOB, [0], await tempOutputDir());
+  expect((await fs.stat(file.filePath)).size).toBe(PNG_BYTES.length);
+  expect(page.state.gotos).toHaveLength(1);
+  expect(page.state.buffers.size).toBe(0);
 });

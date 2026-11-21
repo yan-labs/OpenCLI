@@ -24,33 +24,6 @@ function makeTempVideo(ext = '.mp4') {
   return file;
 }
 
-describe('wechat-channels publish — registration', () => {
-  it('is registered with the expected metadata', () => {
-    const cmd = getRegistry().get('wechat-channels/publish');
-    expect(cmd).toBeDefined();
-    expect(cmd?.func).toBeTypeOf('function');
-    expect(cmd?.access).toBe('write');
-    expect(cmd?.domain).toBe('channels.weixin.qq.com');
-    expect(cmd?.strategy).toBe('cookie');
-  });
-
-  it('declares video as the required positional argument', () => {
-    const cmd = getRegistry().get('wechat-channels/publish');
-    const video = cmd?.args.find((a) => a.name === 'video');
-    expect(video?.positional).toBe(true);
-    expect(video?.required).toBe(true);
-  });
-
-  it('exposes the documented optional flags', () => {
-    const cmd = getRegistry().get('wechat-channels/publish');
-    const names = new Set(cmd?.args.map((a) => a.name));
-    for (const flag of ['title', 'caption', 'schedule', 'draft', 'manual', 'timeout']) {
-      expect(names.has(flag)).toBe(true);
-    }
-    expect(names.has('cover')).toBe(false);
-  });
-});
-
 describe('wechat-channels publish — helper contracts', () => {
   it('requires timeout to be a meaningful positive integer', () => {
     expect(__test__.parseTimeoutSeconds(undefined)).toBe(600);

@@ -96,3 +96,26 @@ describe('site auth command helper', () => {
     expect(page.goto).toHaveBeenCalledWith('https://example.com/login');
   });
 });
+
+describe('auth result contracts', () => {
+  function register(verify, quickCheck) {
+    registerSiteAuthCommands({ site: 'contract', domain: 'example.com', loginUrl: 'https://example.com/login', verify, quickCheck });
+    return getRegistry().get('contract/whoami');
+  }
+  it.each([undefined, null, [], {}, 'alice', { logged_in: null }, { logged_in: 'false' }])('rejects invalid identity %j', async identity => {
+    const cmd = register(async () => identity);
+    await expect(cmd.func(pageMock(), {})).rejects.toMatchObject({ code: 'COMMAND_EXEC' });
+  });
+  it('does not treat explicit logout as identity success', async () => {
+    const cmd = register(async () => ({ logged_in: false }));
+    await expect(cmd.func(pageMock(), {})).rejects.toBeInstanceOf(AuthRequiredError);
+  });
+  it('keeps the configured site authoritative', async () => {
+    const cmd = register(async () => ({ site: 'wrong', username: 'alice' }));
+    await expect(cmd.func(pageMock(), {})).resolves.toMatchObject({ site: 'contract' });
+  });
+  it.each([null, undefined, {}, { logged_in: null }, { logged_in: 'false' }])('preserves unknown quick checks %j', async result => {
+    const cmd = register(async () => ({ username: 'alice' }), async () => result);
+    await expect(cmd.authStatus.quickCheck(pageMock())).resolves.toMatchObject({ logged_in: null });
+  });
+});

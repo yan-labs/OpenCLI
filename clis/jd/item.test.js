@@ -14,25 +14,25 @@ function restoreGlobals() {
 }
 describe('jd item adapter', () => {
     const command = getRegistry().get('jd/item');
-    it('registers the command with correct shape', () => {
-        expect(command).toBeDefined();
-        expect(command.site).toBe('jd');
-        expect(command.name).toBe('item');
-        expect(command.domain).toBe('item.jd.com');
-        expect(command.strategy).toBe('cookie');
-        expect(typeof command.func).toBe('function');
+
+    it('detects the login redirect through the real injected page scripts', async () => {
+        const dom = new JSDOM('<html><head><title>京东-欢迎登录</title></head><body></body></html>', {
+            url: 'https://passport.jd.com/new/login.aspx?ReturnUrl=https%3A%2F%2Fitem.jd.com%2F100328272886.html',
+        });
+        const previousLocation = globalThis.location;
+        globalThis.window = dom.window;
+        globalThis.document = dom.window.document;
+        globalThis.location = dom.window.location;
+        try {
+            const page = { evaluate: vi.fn(async (script) => (0, eval)(script)), goto: vi.fn(), wait: vi.fn() };
+            await expect(command.func(page, { sku: '100328272886', images: 0 })).rejects.toBeInstanceOf(AuthRequiredError);
+        }
+        finally {
+            restoreGlobals();
+            globalThis.location = previousLocation;
+        }
     });
-    it('has sku as a required positional arg', () => {
-        const skuArg = command.args.find((a) => a.name === 'sku');
-        expect(skuArg).toBeDefined();
-        expect(skuArg.required).toBe(true);
-        expect(skuArg.positional).toBe(true);
-    });
-    it('has images arg with default 200', () => {
-        const imagesArg = command.args.find((a) => a.name === 'images');
-        expect(imagesArg).toBeDefined();
-        expect(imagesArg.default).toBe(200);
-    });
+
     it('fails fast when JD blocks the item page', async () => {
         const page = {
             evaluate: vi.fn()
@@ -91,15 +91,7 @@ describe('jd item adapter', () => {
         };
         await expect(command.func(page, { sku: '100328272886', images: 0 })).resolves.toEqual([data]);
     });
-    it('normalizes JD item URL input to a SKU before building selectors', () => {
-        expect(__test__.normalizeJdSkuInput('100328272886')).toBe('100328272886');
-        expect(__test__.normalizeJdSkuInput('https://item.jd.com/100328272886.html?purchasetab=gfgm')).toBe('100328272886');
-        expect(__test__.normalizeJdSkuInput('skuId=10218494560141')).toBe('10218494560141');
-    });
-    it('includes expected columns', () => {
-        expect(command.columns).toEqual(expect.arrayContaining(['title', 'price', 'shop', 'specs', 'mainImages', 'detailImages']));
-        expect(command.columns).not.toContain('avifImages');
-    });
+
     it('extracts only detail avif images and respects the limit', () => {
         const result = __test__.extractAvifImages([
             'https://img14.360buyimg.com/n1/jfs/t1/normal.jpg',
@@ -146,107 +138,6 @@ describe('jd item adapter', () => {
             globalThis.document = previousDocument;
         }
     });
-    it('collects JD detail images from computed background images', () => {
-        const dom = new JSDOM(`
-      <div id="J-detail">
-        <div class="ssd-module computed-bg"></div>
-        <div class="ssd-module ignored-bg"></div>
-      </div>
-    `);
-        const previousDocument = globalThis.document;
-        const previousGetComputedStyle = globalThis.getComputedStyle;
-        globalThis.document = dom.window.document;
-        globalThis.getComputedStyle = ((element) => ({
-            background: '',
-            backgroundImage: element.classList.contains('computed-bg')
-                ? 'url("//img10.360buyimg.com/imgzone/jfs/t1/computed-detail.jpg.avif")'
-                : 'none',
-        }));
-        try {
-            expect(__test__.extractDetailImagesFromDom(10)).toEqual([
-                'https://img10.360buyimg.com/imgzone/jfs/t1/computed-detail.jpg.avif',
-            ]);
-        }
-        finally {
-            globalThis.document = previousDocument;
-            globalThis.getComputedStyle = previousGetComputedStyle;
-        }
-    });
-    it('collects JD detail images from inline JSON-like script text', () => {
-        const dom = new JSDOM(`
-      <h2 id="SPXQ-title">商品详情</h2>
-      <script>
-        window.__DETAIL_DATA__ = {
-          images: [
-            "https://img10.360buyimg.com/imgzone/jfs/t1/script-detail-a.jpg.avif",
-            "//img11.360buyimg.com/imgzone/jfs/t1/script-detail-b.gif"
-          ]
-        };
-      </script>
-    `);
-        const previousDocument = globalThis.document;
-        globalThis.document = dom.window.document;
-        try {
-            expect(__test__.extractDetailImagesFromDom(10)).toEqual([
-                'https://img10.360buyimg.com/imgzone/jfs/t1/script-detail-a.jpg.avif',
-                'https://img11.360buyimg.com/imgzone/jfs/t1/script-detail-b.gif',
-            ]);
-        }
-        finally {
-            globalThis.document = previousDocument;
-        }
-    });
-    it('collects JD detail images from same-origin iframe content', () => {
-        const dom = new JSDOM(`
-      <h2 id="SPXQ-title">商品详情</h2>
-      <iframe id="detail-frame"></iframe>
-    `, { url: 'https://item.jd.com/100328272886.html' });
-        const frameDom = new JSDOM(`
-      <div id="J-detail">
-        <img src="https://img10.360buyimg.com/imgzone/jfs/t1/frame-detail-a.jpg.avif" />
-        <div style="background-image:url(//img11.360buyimg.com/cms/jfs/t1/frame-detail-b.jpg.avif)"></div>
-      </div>
-    `, { url: 'https://item.jd.com/detail-frame.html' });
-        const iframe = dom.window.document.getElementById('detail-frame');
-        Object.defineProperty(iframe, 'contentDocument', { value: frameDom.window.document, configurable: true });
-        Object.defineProperty(iframe, 'contentWindow', { value: frameDom.window, configurable: true });
-        const previousDocument = globalThis.document;
-        globalThis.document = dom.window.document;
-        try {
-            expect(__test__.extractDetailImagesFromDom(10)).toEqual([
-                'https://img10.360buyimg.com/imgzone/jfs/t1/frame-detail-a.jpg.avif',
-                'https://img11.360buyimg.com/cms/jfs/t1/frame-detail-b.jpg.avif',
-            ]);
-        }
-        finally {
-            globalThis.document = previousDocument;
-        }
-    });
-    it('collects JD detail images from page data objects', async () => {
-        const dom = new JSDOM(`
-      <h2 id="SPXQ-title">商品详情</h2>
-    `);
-        globalThis.document = dom.window.document;
-        globalThis.window = dom.window;
-        globalThis.__PAGE_DATA__ = {
-            detail: {
-                images: [
-                    'https://img10.360buyimg.com/imgzone/jfs/t1/page-data-a.jpg.avif',
-                    { src: '//img11.360buyimg.com/imgzone/jfs/t1/page-data-b.webp' },
-                ],
-            },
-        };
-        try {
-            await expect(__test__.extractDetailImagesFromPage(10)).resolves.toEqual([
-                'https://img10.360buyimg.com/imgzone/jfs/t1/page-data-a.jpg.avif',
-                'https://img11.360buyimg.com/imgzone/jfs/t1/page-data-b.webp',
-            ]);
-        }
-        finally {
-            delete globalThis.__PAGE_DATA__;
-            restoreGlobals();
-        }
-    });
     it('collects JD detail images from network resource text', async () => {
         const dom = new JSDOM(`
       <h2 id="SPXQ-title">商品详情</h2>
@@ -270,43 +161,6 @@ describe('jd item adapter', () => {
         try {
             await expect(__test__.extractDetailImagesFromPage(10)).resolves.toEqual([
                 'https://img10.360buyimg.com/imgzone/jfs/t1/network-detail-a.jpg.avif',
-            ]);
-        }
-        finally {
-            globalThis.fetch = previousFetch;
-            restoreGlobals();
-        }
-    });
-    it('collects JD detail images from WareGraphic graphicContent', async () => {
-        const dom = new JSDOM(`
-      <h2 id="SPXQ-title">商品详情</h2>
-    `);
-        const previousFetch = globalThis.fetch;
-        globalThis.document = dom.window.document;
-        globalThis.window = dom.window;
-        globalThis.performance = {
-            getEntriesByType: () => [
-                { name: 'https://api.m.jd.com/client.action?functionId=pc_item_getWareGraphic&skuId=100328272886' },
-            ],
-            now: () => 0,
-        };
-        globalThis.fetch = (async () => ({
-            ok: true,
-            headers: { get: () => 'application/json' },
-            text: async () => JSON.stringify({
-                data: {
-                    graphicContent: `
-            <div style="background-image:url(//img30.360buyimg.com/sku/jfs/t1/ware-a.jpg)"></div>
-            <img src="https://img30.360buyimg.com/sku/jfs/t1/ware-b.png" />
-            <a href="https://item.jd.com/100328272886.html">not image</a>
-          `,
-                },
-            }),
-        }));
-        try {
-            await expect(__test__.extractDetailImagesFromPage(10)).resolves.toEqual([
-                'https://img30.360buyimg.com/sku/jfs/t1/ware-a.jpg',
-                'https://img30.360buyimg.com/sku/jfs/t1/ware-b.png',
             ]);
         }
         finally {

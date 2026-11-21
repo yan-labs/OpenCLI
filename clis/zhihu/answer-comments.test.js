@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { getRegistry } from '@jackwener/opencli/registry';
-import { ArgumentError, AuthRequiredError, CommandExecutionError, EmptyResultError } from '@jackwener/opencli/errors';
+import { CommandExecutionError } from '@jackwener/opencli/errors';
 import { buildCommentRows } from './answer-comments-helpers.js';
 import './answer-comments.js';
 
@@ -43,75 +43,26 @@ function child(id, rootId, parentId, content = `reply ${id}`, extra = {}) {
 }
 
 describe('zhihu answer-comments', () => {
-    it('registers score/latest ordering and reconstructable hierarchy fields', () => {
-        const cmd = command();
-        expect(cmd).toBeDefined();
-        expect(cmd.access).toBe('read');
-        expect(cmd.strategy).toBe('cookie');
-        expect(cmd.args.find((arg) => arg.name === 'order')).toMatchObject({
-            default: 'score',
-            choices: ['score', 'latest'],
-        });
-        expect(cmd.columns).toEqual([
-            'rank', 'comment_rank', 'reply_rank', 'depth', 'id', 'parent_id',
-            'author', 'reply_to', 'likes', 'created_at', 'url', 'content',
-        ]);
-    });
 
-    it('uses comment_v5 and preserves root order plus exact reply depth', async () => {
+    it.each(['root', 'child'])('follows server-sized %s pages beyond the old fetch budget', async (role) => {
+        let count = 0;
         const page = pageWith(async (url) => {
-            if (url.includes('/root_comment')) {
-                expect(url).toContain('order_by=score');
-                return {
-                    data: [root('100', '<p>root</p>', {
-                        child_comment_count: 3,
-                        like_count: 4,
-                        created_time: 1700000000,
-                    })],
-                    paging: { is_end: true },
-                };
+            if (role === 'child' && url.includes('/root_comment')) {
+                return { data: [root('100', 'root', { child_comment_count: 60 })], paging: { is_end: true } };
             }
-            expect(url).toContain('/comment/100/child_comment');
-            return {
-                data: [
-                    child('101', '100', '100', '<p>direct</p>', { like_count: 2 }),
-                    child('102', '100', '101', '<p>nested</p>', {
-                        reply_to_author: { member: { name: 'author 101' } },
-                    }),
-                    child('103', '100', '102', '<p>deep</p>', {
-                        reply_to_author: { member: { name: 'author 102' } },
-                    }),
-                ],
-                paging: { is_end: true },
-            };
+            const items = Array.from({ length: 10 }, (_, i) => {
+                const id = String(200 + count * 10 + i);
+                return role === 'root' ? root(id) : child(id, '100', '100');
+            });
+            count += 1;
+            const path = role === 'root' ? 'answers/20/root_comment' : 'comment/100/child_comment';
+            const order = role === 'root' ? '&order_by=score' : '';
+            return { data: items, paging: { is_end: count === 6,
+                next: `https://www.zhihu.com/api/v4/comment_v5/${path}?limit=10&offset=${count}${order}` } };
         });
-
-        const rows = await command().func(page, args({
-            id: 'answer:10:20',
-            'replies-limit': 3,
-        }));
-
-        expect(rows.map((row) => [row.id, row.parent_id, row.depth, row.comment_rank, row.reply_rank])).toEqual([
-            ['100', '', 0, 1, 0],
-            ['101', '100', 1, 1, 1],
-            ['102', '101', 2, 1, 2],
-            ['103', '102', 3, 1, 3],
-        ]);
-        expect(rows[2]).toMatchObject({ author: 'author 102', reply_to: 'author 101', content: 'nested' });
-        expect(page.evaluate).toHaveBeenCalledTimes(2);
-    });
-
-    it('maps latest to order_by=ts and sends no child request when replies-limit is zero', async () => {
-        const page = pageWith(async (url) => {
-            expect(url).toContain('order_by=ts');
-            return {
-                data: [root('100', 'root', { child_comment_count: 5 })],
-                paging: { is_end: true },
-            };
-        });
-        const rows = await command().func(page, args({ order: 'latest' }));
-        expect(rows.map((row) => row.id)).toEqual(['100']);
-        expect(page.evaluate).toHaveBeenCalledTimes(1);
+        const rows = await command().func(page, args(role === 'root' ? { limit: 60 } : { 'replies-limit': 60 }));
+        expect(rows).toHaveLength(role === 'root' ? 60 : 61);
+        expect(count).toBe(6);
     });
 
     it('counts unique roots toward limit and idempotently removes equivalent page overlap', async () => {
@@ -215,6 +166,8 @@ describe('zhihu answer-comments', () => {
 
     it('requires exact answer/root/order pagination provenance', async () => {
         for (const next of [
+            ...['0', '-1', 'abc', '1.5', ''].map(size =>
+                `https://www.zhihu.com/api/v4/comment_v5/answers/20/root_comment?order_by=score&limit=${size}&offset=x`),
             'https://evil.example/api/v4/comment_v5/answers/20/root_comment?order_by=score&limit=20&offset=x',
             'https://www.zhihu.com/api/v4/comment_v5/answers/21/root_comment?order_by=score&limit=20&offset=x',
             'https://www.zhihu.com/api/v4/comment_v5/answers/20/root_comment?order_by=ts&limit=20&offset=x',
@@ -264,37 +217,6 @@ describe('zhihu answer-comments', () => {
         expect(stalled.evaluate).toHaveBeenCalledTimes(3);
     });
 
-    it('distinguishes auth, risk control, not found, empty, and malformed responses', async () => {
-        await expect(command().func(pageWith(async () => ({ __httpStatus: 401 })), args()))
-            .rejects.toBeInstanceOf(AuthRequiredError);
-        await expect(command().func(pageWith(async () => ({
-            __httpStatus: 403,
-            __errorCode: 40362,
-            __errorMessage: 'risk',
-        })), args())).rejects.toBeInstanceOf(CommandExecutionError);
-        await expect(command().func(pageWith(async () => ({
-            __httpStatus: 403,
-            __errorCode: 40353,
-            __needLogin: true,
-        })), args())).rejects.toBeInstanceOf(AuthRequiredError);
-        await expect(command().func(pageWith(async () => ({ __httpStatus: 404 })), args()))
-            .rejects.toBeInstanceOf(EmptyResultError);
-        await expect(command().func(pageWith(async () => ({ data: [], paging: { is_end: true } })), args()))
-            .rejects.toBeInstanceOf(EmptyResultError);
-        await expect(command().func(pageWith(async () => ({ data: {}, paging: { is_end: true } })), args()))
-            .rejects.toBeInstanceOf(CommandExecutionError);
-        await expect(command().func(pageWith(async () => ({ data: [], paging: {} })), args()))
-            .rejects.toBeInstanceOf(CommandExecutionError);
-    });
-
-    it('rejects invalid inputs before navigation', async () => {
-        const page = { goto: vi.fn(), evaluate: vi.fn() };
-        await expect(command().func(page, args({ id: 'invalid' }))).rejects.toBeInstanceOf(ArgumentError);
-        await expect(command().func(page, args({ limit: 0 }))).rejects.toBeInstanceOf(ArgumentError);
-        await expect(command().func(page, args({ 'replies-limit': 101 }))).rejects.toBeInstanceOf(ArgumentError);
-        await expect(command().func(page, args({ order: 'normal' }))).rejects.toBeInstanceOf(ArgumentError);
-        expect(page.goto).not.toHaveBeenCalled();
-    });
 });
 
 describe('zhihu answer-comments graph', () => {

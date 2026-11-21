@@ -1,14 +1,16 @@
-import { AuthRequiredError, TimeoutError, getErrorMessage } from '@jackwener/opencli/errors';
+import { AuthRequiredError, CommandExecutionError, TimeoutError, getErrorMessage } from '@jackwener/opencli/errors';
 import { cli, Strategy } from '@jackwener/opencli/registry';
 
 const DEFAULT_TIMEOUT_SECONDS = 300;
 const POLL_INTERVAL_MS = 2000;
 
 function normalizeIdentity(site, identity) {
-  const row = identity && typeof identity === 'object' && !Array.isArray(identity)
-    ? identity
-    : {};
-  return { logged_in: true, site, ...row };
+  if (!identity || typeof identity !== 'object' || Array.isArray(identity) || Object.keys(identity).length === 0 ||
+      ('logged_in' in identity && typeof identity.logged_in !== 'boolean')) {
+    throw new CommandExecutionError(`${site} identity probe returned an invalid account result`);
+  }
+  if (identity.logged_in === false) throw new AuthRequiredError(site, 'Identity probe reports a logged-out session');
+  return { ...identity, logged_in: true, site };
 }
 
 function isAuthRequired(error) {
@@ -32,9 +34,9 @@ function commandColumns(config) {
 function normalizeQuickCheck(result) {
   if (typeof result === 'boolean') return { logged_in: result };
   if (result && typeof result === 'object' && !Array.isArray(result)) {
-    return { logged_in: !!result.logged_in, ...result };
+    return { ...result, logged_in: typeof result.logged_in === 'boolean' ? result.logged_in : null };
   }
-  return { logged_in: false };
+  return { logged_in: null };
 }
 
 function normalizeRefreshResult(result) {
@@ -47,7 +49,7 @@ export function registerSiteAuthCommands(config) {
     throw new Error('registerSiteAuthCommands requires site, domain, loginUrl, and verify(page)');
   }
 
-  cli({
+  if (config.registerWhoami !== false) cli({
     site: config.site,
     name: 'whoami',
     access: 'read',

@@ -21,8 +21,6 @@ import {
   autoScrollJs,
   networkRequestsJs,
   waitForDomStableJs,
-  inputProbeInstallJs,
-  inputProbeCheckJs,
 } from './dom-helpers.js';
 import {
   resolveTargetJs,
@@ -32,15 +30,24 @@ import {
   prepareNativeTypeResolvedJs,
   verifyFilledResolvedJs,
   scrollResolvedJs,
-  dragResolvedJs,
   type FillResolvedResult,
   type ResolveOptions,
   type TargetMatchLevel,
 } from './target-resolver.js';
 import { TargetError, type TargetErrorCode } from './target-errors.js';
-import { CliError } from '../errors.js';
+import { CliError, CommandExecutionError } from '../errors.js';
 import { formatSnapshot } from '../snapshotFormatter.js';
 import { installVisualRefOverlayJs, removeVisualRefOverlayJs } from './visual-refs.js';
+import { cdpKeyPressEvents, keyModifierFlags } from './key-definitions.js';
+
+export const NATIVE_INPUT_VISIBILITY_JS = 'document.visibilityState';
+
+export class NativeInputVisibilityError extends CommandExecutionError {
+  constructor() {
+    super('Native input requires a visible browser page; input was not dispatched.',
+      'Select the target tab and restore/uncover its browser window, then retry.');
+  }
+}
 
 export interface ResolveSuccess {
   matches_n: number;
@@ -56,39 +63,6 @@ export interface ResolveSuccess {
    * agents can tell a trusted synthetic click from the untrusted JS fallback.
    */
   click_method?: 'cdp' | 'js' | 'ax';
-  /**
-   * Set only when the trusted CDP click was verified as dropped: the click
-   * command resolved but the page never received a trusted mousedown/click
-   * (observed on real Chrome for windows placed off the visible display — the
-   * `dedicated` window mode's placement — where `Input.dispatchMouseEvent`
-   * succeeds while the input never reaches the renderer). The reported
-   * `click_method` is then `js`: the JS el.click() fallback is what actually
-   * performed the action. Absent in every other case.
-   */
-  native_click_dropped?: boolean;
-  /**
-   * Set only when the trusted CDP hover (`Input.dispatchMouseEvent`
-   * mouseMoved) was verified as dropped by the in-page probe: the dispatch
-   * resolved but the page never received a trusted mousemove/mouseover, and
-   * the synthetic-event fallback (pointerover/mouseover/mouseenter/…) is what
-   * actually performed the hover. Absent in every other case.
-   */
-  native_hover_dropped?: boolean;
-  /**
-   * Set only when the trusted CDP double-click (`Input.dispatchMouseEvent`
-   * pressed/released pairs) was verified as dropped by the in-page probe: the
-   * dispatches resolved but the page never saw a trusted dblclick/mousedown,
-   * and the full synthetic double-click sequence is what actually performed
-   * the action. Absent in every other case.
-   */
-  native_dblclick_dropped?: boolean;
-  /**
-   * Set only when the trusted CDP text insertion (`Input.insertText`) was
-   * verified as dropped by the in-page probe: the insertion resolved but the
-   * page never saw a trusted beforeinput/input, and the DOM setter fallback
-   * is what actually entered the text. Absent in every other case.
-   */
-  native_type_dropped?: boolean;
   /**
    * Result of hit-testing the click point against the resolved element:
    * `target` (the point lands on the element or a descendant — trustworthy),
@@ -136,13 +110,6 @@ export interface DragResult {
   target_matches_n: number;
   source_match_level: TargetMatchLevel;
   target_match_level: TargetMatchLevel;
-  /**
-   * Set only when the action was actually performed by the in-page synthetic
-   * drag sequence (dragResolvedJs): either the trusted CDP drag was verified
-   * as dropped by the probe, or CDP Input.dispatchMouseEvent was unavailable
-   * outright. Absent when the trusted CDP drag is trusted.
-   */
-  native_drag_dropped?: boolean;
 }
 
 interface CdpFrameTreeNode {
@@ -207,7 +174,7 @@ export abstract class BasePage implements IPage {
 
   // ── Transport-specific methods (must be implemented by subclasses) ──
 
-  abstract goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: number; allowBoundNavigation?: boolean; timeoutMs?: number }): Promise<void>;
+  abstract goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: number; allowBoundNavigation?: boolean }): Promise<void>;
   abstract evaluate<T = unknown>(js: string): Promise<T>;
   abstract evaluate<Args extends unknown[], T>(fn: BrowserEvaluateFunction<Args, T>, ...args: Args): Promise<Awaited<T>>;
 
@@ -367,45 +334,21 @@ export abstract class BasePage implements IPage {
     // or an ancestor (open shadow-DOM host / own wrapper — CDP still reaches the
     // target there). Only an unrelated overlay ('other') forces the el.click()
     // fallback, which dispatches straight on the node. See issues #2076/#2071.
-    //
-    // "The CDP command resolved" is not the same as "the click happened": some
-    // real-Chrome states (windows placed off the visible display — the
-    // `dedicated` window mode's placement) make `Input.dispatchMouseEvent`
-    // succeed while the input is dropped before the page ever sees it, which
-    // used to burn every `auto` step on a click that did nothing. So a native
-    // click here is verified against an in-page probe: if NO trusted
-    // mousedown/click reached the document, fall through to the JS el.click()
-    // path below, which cannot be dropped. The probe only exists around the
-    // native dispatch and is removed by its own check, so no listener leaks;
-    // `isTrusted` filtering keeps pages that re-dispatch synthetic clicks from
-    // masking a real drop. When the probe is unavailable (older backends,
-    // install failure) or reports 'missing' (page navigated away — itself
-    // evidence something happened), behaviour is exactly the legacy one.
-    let nativeDropped = false;
     if (rect?.visible === true && (rect.hit === 'target' || rect.hit === 'ancestor')) {
-      const probeToken = await this.armClickProbe();
       const success = await this.tryNativeClick(rect.x, rect.y);
-      if (success) {
-        nativeDropped = probeToken !== null && (await this.settleClickProbe(probeToken)) === 'dropped';
-        if (!nativeDropped) return { ...resolved, click_method: 'cdp', ...meta };
-      }
+      if (success) return { ...resolved, click_method: 'cdp', ...meta };
     }
 
     // JS fallback: el.click() dispatches straight on __resolved, bypassing the
-    // occluding overlay (also covers older backends / zero-rect targets, and
-    // the trusted-input-dropped case detected above).
+    // occluding overlay (also covers older backends / zero-rect targets).
     const result = await this.evaluate(clickResolvedJs({ skipScroll: nativeScrolled })) as
       | string
       | { status: string; x?: number; y?: number; w?: number; h?: number; error?: string }
       | null;
 
-    if (typeof result === 'string' || result == null) {
-      return { ...resolved, click_method: 'js', ...(nativeDropped && { native_click_dropped: true }), ...meta };
-    }
+    if (typeof result === 'string' || result == null) return { ...resolved, click_method: 'js', ...meta };
 
-    if (result.status === 'clicked') {
-      return { ...resolved, click_method: 'js', ...(nativeDropped && { native_click_dropped: true }), ...meta };
-    }
+    if (result.status === 'clicked') return { ...resolved, click_method: 'js', ...meta };
 
     // JS click failed — try CDP native click if coordinates available
     if (result.x != null && result.y != null) {
@@ -416,70 +359,11 @@ export abstract class BasePage implements IPage {
     throw new Error(`Click failed: ${result.error ?? 'JS click and CDP fallback both failed'}`);
   }
 
-  /**
-   * How long the click probe keeps watching for a trusted event after a CDP
-   * click resolved, in ms. Polls every 25ms in-page and exits early on the
-   * first observed event, so the happy path pays ~25ms and only a genuinely
-   * dropped click pays the full window. Long enough to cover scheduler
-   * jitter between the Input dispatch response and the renderer processing
-   * the event; short enough not to slow an `auto` loop's failed steps down.
-   */
-  static readonly CLICK_PROBE_SETTLE_MS = 180;
-
-  /**
-   * Arm the trusted-input liveness probe (see inputProbeInstallJs) ahead of
-   * any CDP `Input.*` dispatch. Returns the probe token, or null when probing
-   * is unavailable — null keeps the legacy behaviour of trusting whatever the
-   * CDP dispatch reported.
-   */
-  protected async armInputProbe(eventTypes: string[]): Promise<string | null> {
-    try {
-      const token = await this.evaluate(inputProbeInstallJs(eventTypes));
-      return typeof token === 'string' && token.length > 0 ? token : null;
-    } catch {
-      return null;
-    }
-  }
-
-  /**
-   * Settle the probe armed by armInputProbe. 'dropped' is the only verdict
-   * that changes behaviour (fall back to the JS path); 'observed' and
-   * 'missing' both keep the native dispatch's result, and any check failure
-   * degrades to 'observed' for the same reason. Every caller shares
-   * CLICK_PROBE_SETTLE_MS as the settle window.
-   */
-  protected async settleInputProbe(
-    token: string,
-    settleMs: number = BasePage.CLICK_PROBE_SETTLE_MS,
-  ): Promise<'observed' | 'dropped' | 'missing'> {
-    try {
-      const result = await this.evaluate(inputProbeCheckJs(token, settleMs)) as
-        | { status?: string }
-        | null;
-      if (result?.status === 'dropped') return 'dropped';
-      return 'observed';
-    } catch {
-      // The check evaluate itself failing (navigation tearing down the
-      // context, dialog, transport hiccup) means the page moved on — never
-      // fall back to JS on top of an input that may have worked.
-      return 'observed';
-    }
-  }
-
-  /**
-   * Arm the trusted-click liveness probe. Thin wrapper over the generic
-   * input probe kept so click()'s call sites (and their tests) stay stable.
-   */
-  protected async armClickProbe(): Promise<string | null> {
-    return this.armInputProbe(['mousedown', 'click']);
-  }
-
-  /**
-   * Settle the probe armed by armClickProbe. Thin wrapper over the generic
-   * input probe with the shared click settle window.
-   */
-  protected async settleClickProbe(token: string): Promise<'observed' | 'dropped' | 'missing'> {
-    return this.settleInputProbe(token, BasePage.CLICK_PROBE_SETTLE_MS);
+  protected async assertNativeInputVisible(): Promise<void> {
+    let visibility: unknown;
+    try { visibility = await this.evaluate(NATIVE_INPUT_VISIBILITY_JS); }
+    catch { throw new NativeInputVisibilityError(); }
+    if (visibility !== 'visible') throw new NativeInputVisibilityError();
   }
 
   /** Uses native CDP click support when the concrete page exposes it. */
@@ -489,7 +373,8 @@ export abstract class BasePage implements IPage {
     try {
       await nativeClick.call(this, x, y);
       return true;
-    } catch {
+    } catch (error) {
+      if (error instanceof NativeInputVisibilityError) throw error;
       return false;
     }
   }
@@ -497,6 +382,7 @@ export abstract class BasePage implements IPage {
   protected async tryNativeMouseMove(x: number, y: number): Promise<boolean> {
     const cdp = (this as IPage).cdp;
     if (typeof cdp !== 'function') return false;
+    await this.assertNativeInputVisible();
     try {
       await cdp.call(this, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
       return true;
@@ -508,6 +394,7 @@ export abstract class BasePage implements IPage {
   protected async tryNativeDoubleClick(x: number, y: number): Promise<boolean> {
     const cdp = (this as IPage).cdp;
     if (typeof cdp !== 'function') return false;
+    await this.assertNativeInputVisible();
     try {
       await cdp.call(this, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
       await cdp.call(this, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 });
@@ -523,6 +410,7 @@ export abstract class BasePage implements IPage {
   protected async tryNativeDrag(from: { x: number; y: number }, to: { x: number; y: number }): Promise<boolean> {
     const cdp = (this as IPage).cdp;
     if (typeof cdp !== 'function') return false;
+    await this.assertNativeInputVisible();
     const midX = Math.round((from.x + to.x) / 2);
     const midY = Math.round((from.y + to.y) / 2);
     try {
@@ -546,29 +434,13 @@ export abstract class BasePage implements IPage {
 
     const resolved = await this.resolveAxRefPoint(entry);
     if (!resolved) return null;
-
-    // The AX path used to trust the CDP click unconditionally — the exact
-    // hole the click() body had before 899f89a5: on the dedicated-window
-    // placement the dispatch "succeeds" while the page never sees it, and an
-    // AX-ref click would report success forever. Wrap the native dispatch in
-    // the same trusted-event probe; a verified drop returns null so the
-    // click() body (standard resolve + rect hit-testing + JS el.click()
-    // fallback) takes over instead of reporting a fake success. Note the AX
-    // ref space (_axRefs) is separate from __opencli_ref_identity, so the
-    // standard resolve may not know this ref — raising there is strictly
-    // better than a silent no-op click.
-    const probeToken = await this.armInputProbe(['mousedown', 'click']);
     try {
       await nativeClick.call(this, resolved.x, resolved.y);
-    } catch {
+      return { matches_n: 1, match_level: resolved.matchLevel, click_method: 'ax' };
+    } catch (error) {
+      if (error instanceof NativeInputVisibilityError) throw error;
       return null;
     }
-    if (probeToken !== null && (await this.settleInputProbe(probeToken)) === 'dropped') {
-      // 原生点击被验证为丢弃：不要报成功，让调用方 click() 的主体逻辑
-      // （runResolve + rect 命中检测 + JS el.click() 回退）接手。
-      return null;
-    }
-    return { matches_n: 1, match_level: resolved.matchLevel, click_method: 'ax' };
   }
 
   private async resolveAxRefPoint(entry: BrowserRef): Promise<{ x: number; y: number; matchLevel: TargetMatchLevel } | null> {
@@ -643,7 +515,8 @@ export abstract class BasePage implements IPage {
     try {
       await nativeKeyPress.call(this, key, modifiers);
       return true;
-    } catch {
+    } catch (error) {
+      if (error instanceof NativeInputVisibilityError) throw error;
       return false;
     }
   }
@@ -723,7 +596,6 @@ export abstract class BasePage implements IPage {
   async typeText(ref: string, text: string, opts: ResolveOptions = {}): Promise<ResolveSuccess> {
     const resolved = await runResolve(this, ref, opts);
     let typed = false;
-    let typeDropped = false;
     let nativeScrolled = false;
     let nativeFocused = false;
 
@@ -737,19 +609,7 @@ export abstract class BasePage implements IPage {
         })) as
           | { ok?: boolean; mode?: string; reason?: string }
           | null;
-        if (preparation?.ok === true) {
-          // `Input.insertText` resolves without effect in the same dropped
-          // trusted-input states that eat clicks (see the click() comment).
-          // Verify against the in-page probe: keydown is included for future
-          // keyboard-path reuse, while beforeinput/input are what a real
-          // insertText fires; any trusted one of them proves delivery.
-          const probeToken = await this.armInputProbe(['keydown', 'beforeinput', 'input']);
-          const nativeOk = await this.tryNativeType(text);
-          if (nativeOk) {
-            typeDropped = probeToken !== null && (await this.settleInputProbe(probeToken)) === 'dropped';
-            typed = !typeDropped;
-          }
-        }
+        typed = preparation?.ok === true && await this.tryNativeType(text);
       } catch {
         // Native input is a reliability upgrade, not the only path. Preserve
         // the existing DOM setter fallback if preparation fails.
@@ -759,7 +619,7 @@ export abstract class BasePage implements IPage {
     if (!typed) {
       await this.evaluate(typeResolvedJs(text));
     }
-    return { ...resolved, ...(typeDropped && { native_type_dropped: true }) };
+    return resolved;
   }
 
   async hover(ref: string, opts: ResolveOptions = {}): Promise<ResolveSuccess> {
@@ -768,22 +628,7 @@ export abstract class BasePage implements IPage {
     const rect = await this.evaluate(boundingRectResolvedJs({ skipScroll: nativeScrolled })) as
       | { x: number; y: number; w: number; h: number; visible: boolean }
       | null;
-
-    // A CDP mouseMoved can resolve without effect in the same dropped
-    // trusted-input states that eat clicks (windows off the visible display —
-    // the `dedicated` mode). Verify with the in-page probe; on a verified
-    // drop fall through to the synthetic-event fallback, which cannot be
-    // dropped. 'missing' (page navigated) and an unarmable probe keep the
-    // legacy trust-the-CDP-result behaviour.
-    let hoverDropped = false;
-    if (rect?.visible === true) {
-      const probeToken = await this.armInputProbe(['mousemove', 'mouseover']);
-      const moved = await this.tryNativeMouseMove(rect.x, rect.y);
-      if (moved) {
-        hoverDropped = probeToken !== null && (await this.settleInputProbe(probeToken)) === 'dropped';
-        if (!hoverDropped) return resolved;
-      }
-    }
+    if (rect?.visible === true && await this.tryNativeMouseMove(rect.x, rect.y)) return resolved;
 
     await this.evaluate(`
       (() => {
@@ -801,14 +646,10 @@ export abstract class BasePage implements IPage {
         try { el.dispatchEvent(new PointerEvent('pointerover', init)); } catch (_) {}
         try { el.dispatchEvent(new PointerEvent('pointermove', init)); } catch (_) {}
         el.dispatchEvent(new MouseEvent('mouseover', init));
-        // mouseenter does not bubble, but dispatching it straight on the
-        // target still reaches listeners registered on the element itself —
-        // no bubbles:true needed, and some menus/tooltips only listen here.
-        try { el.dispatchEvent(new MouseEvent('mouseenter', { ...init, bubbles: false })); } catch (_) {}
         el.dispatchEvent(new MouseEvent('mousemove', init));
       })()
     `);
-    return { ...resolved, ...(hoverDropped && { native_hover_dropped: true }) };
+    return resolved;
   }
 
   async focus(ref: string, opts: ResolveOptions = {}): Promise<ResolveSuccess & { focused: boolean }> {
@@ -833,21 +674,7 @@ export abstract class BasePage implements IPage {
     const rect = await this.evaluate(boundingRectResolvedJs({ skipScroll: nativeScrolled })) as
       | { x: number; y: number; w: number; h: number; visible: boolean }
       | null;
-
-    // Same dropped-trusted-input defence as hover(): verify the CDP press/
-    // release pairs actually reached the page before trusting them. On a
-    // verified drop, fall through to the full synthetic double-click sequence
-    // below (the old single `dblclick` dispatch fooled nothing — many pages
-    // act on mousedown/click, not dblclick).
-    let dblDropped = false;
-    if (rect?.visible === true) {
-      const probeToken = await this.armInputProbe(['dblclick', 'mousedown']);
-      const clicked = await this.tryNativeDoubleClick(rect.x, rect.y);
-      if (clicked) {
-        dblDropped = probeToken !== null && (await this.settleInputProbe(probeToken)) === 'dropped';
-        if (!dblDropped) return resolved;
-      }
-    }
+    if (rect?.visible === true && await this.tryNativeDoubleClick(rect.x, rect.y)) return resolved;
 
     await this.evaluate(`
       (() => {
@@ -855,27 +682,19 @@ export abstract class BasePage implements IPage {
         if (!el) throw new Error('No resolved element');
         if (${nativeScrolled ? 'false' : 'true'}) el.scrollIntoView({ behavior: 'instant', block: 'center' });
         const rect = el.getBoundingClientRect();
-        const base = {
+        const init = {
           bubbles: true,
           cancelable: true,
           view: window,
           clientX: Math.round(rect.left + rect.width / 2),
           clientY: Math.round(rect.top + rect.height / 2),
           button: 0,
+          detail: 2,
         };
-        const fire = (type, detail) => {
-          el.dispatchEvent(new MouseEvent(type, { ...base, detail }));
-        };
-        fire('mousedown', 1);
-        fire('mouseup', 1);
-        fire('click', 1);
-        fire('mousedown', 2);
-        fire('mouseup', 2);
-        fire('click', 2);
-        fire('dblclick', 2);
+        el.dispatchEvent(new MouseEvent('dblclick', init));
       })()
     `);
-    return { ...resolved, ...(dblDropped && { native_dblclick_dropped: true }) };
+    return resolved;
   }
 
   private async readCheckableState(): Promise<{
@@ -1145,28 +964,11 @@ export abstract class BasePage implements IPage {
         throw new Error(`Drag target "${target}" has no visible bounding box.`);
       }
 
-      // Same dropped-trusted-input defence as the other Input.* users. drag()
-      // additionally has no JS fallback today — CDP being unavailable used to
-      // throw. Now the in-page synthetic sequence (see dragResolvedJs) covers
-      // both the "CDP unavailable" case and the "CDP resolved but dropped"
-      // case verified by the probe.
-      const probeToken = await this.armInputProbe(['mousedown', 'mousemove', 'pointerdown']);
       const dragged = await this.tryNativeDrag(
         { x: endpoints.source.x, y: endpoints.source.y },
         { x: endpoints.target.x, y: endpoints.target.y },
       );
-      let dragDropped = false;
-      if (!dragged) {
-        // CDP Input.dispatchMouseEvent is unavailable or failed outright —
-        // perform the drag with in-page synthetic events instead of throwing.
-        await this.evaluate(dragResolvedJs());
-        dragDropped = true;
-      } else if (probeToken !== null && (await this.settleInputProbe(probeToken)) === 'dropped') {
-        // The trusted CDP drag resolved but no trusted mousedown/mousemove/
-        // pointerdown ever reached the page — redo it synthetically.
-        await this.evaluate(dragResolvedJs());
-        dragDropped = true;
-      }
+      if (!dragged) throw new Error('Native drag requires CDP Input.dispatchMouseEvent support.');
 
       return {
         dragged: true,
@@ -1176,7 +978,6 @@ export abstract class BasePage implements IPage {
         target_matches_n: targetResolved.matches_n,
         source_match_level: sourceResolved.match_level,
         target_match_level: targetResolved.match_level,
-        ...(dragDropped && { native_drag_dropped: true }),
       };
     } finally {
       await this.evaluate('delete window.__opencli_drag_source').catch(() => {});
@@ -1216,12 +1017,7 @@ export abstract class BasePage implements IPage {
     }
 
     let verification = await this.evaluate(verifyFilledResolvedJs(text)) as FillResolvedResult | null;
-    let nativeTypeDropped = false;
     if (usedNativeInput && verification?.ok !== true) {
-      // The value comparison is this method's dropped-input detector: a
-      // silently dropped Input.insertText leaves the actual value untouched,
-      // so the verification fails and the DOM setter redo below runs.
-      nativeTypeDropped = true;
       await this.evaluate(typeResolvedJs(text));
       verification = await this.evaluate(verifyFilledResolvedJs(text)) as FillResolvedResult | null;
     }
@@ -1236,7 +1032,6 @@ export abstract class BasePage implements IPage {
       actual,
       length: actual.length,
       ...(mode ? { mode } : {}),
-      ...(nativeTypeDropped && { native_type_dropped: true }),
     };
   }
 
@@ -1473,6 +1268,7 @@ export abstract class CDPBasePage extends BasePage {
   }
 
   async nativeClick(x: number, y: number): Promise<void> {
+    await this.assertNativeInputVisible();
     await this.cdp('Input.dispatchMouseEvent', {
       type: 'mouseMoved',
       x,
@@ -1500,55 +1296,13 @@ export abstract class CDPBasePage extends BasePage {
   }
 
   async nativeKeyPress(key: string, modifiers: string[] = []): Promise<void> {
-    let modifierFlags = 0;
-    const modKeyInfo: Array<{ key: string; code: string; vk: number; flag: number }> = [];
-    for (const mod of modifiers) {
-      if (mod === 'Alt') { modifierFlags |= 1; modKeyInfo.push({ key: 'Alt', code: 'AltLeft', vk: 18, flag: 1 }); }
-      if (mod === 'Ctrl' || mod === 'Control') { modifierFlags |= 2; modKeyInfo.push({ key: 'Control', code: 'ControlLeft', vk: 17, flag: 2 }); }
-      if (mod === 'Meta') { modifierFlags |= 4; modKeyInfo.push({ key: 'Meta', code: 'MetaLeft', vk: 91, flag: 4 }); }
-      if (mod === 'Shift') { modifierFlags |= 8; modKeyInfo.push({ key: 'Shift', code: 'ShiftLeft', vk: 16, flag: 8 }); }
-    }
-    const vkCode = key.length === 1 ? key.toUpperCase().charCodeAt(0) : 0;
-    const code = key.length === 1 ? `Key${key.toUpperCase()}` : key;
-    let activeFlags = 0;
-    for (const mk of modKeyInfo) {
-      await this.cdp('Input.dispatchKeyEvent', {
-        type: 'keyDown',
-        key: mk.key,
-        code: mk.code,
-        modifiers: activeFlags,
-        windowsVirtualKeyCode: mk.vk,
-        nativeVirtualKeyCode: mk.vk,
-      });
-      activeFlags |= mk.flag;
-    }
-    await this.cdp('Input.dispatchKeyEvent', {
-      type: 'keyDown',
-      key,
-      code,
-      modifiers: modifierFlags,
-      windowsVirtualKeyCode: vkCode,
-      nativeVirtualKeyCode: vkCode,
-    });
-    await this.cdp('Input.dispatchKeyEvent', {
-      type: 'keyUp',
-      key,
-      code,
-      modifiers: modifierFlags,
-      windowsVirtualKeyCode: vkCode,
-      nativeVirtualKeyCode: vkCode,
-    });
-    for (const mk of modKeyInfo.reverse()) {
-      activeFlags &= ~mk.flag;
-      await this.cdp('Input.dispatchKeyEvent', {
-        type: 'keyUp',
-        key: mk.key,
-        code: mk.code,
-        modifiers: activeFlags,
-        windowsVirtualKeyCode: mk.vk,
-        nativeVirtualKeyCode: mk.vk,
-      });
-    }
+    await this.assertNativeInputVisible();
+    const modifierFlags = keyModifierFlags(modifiers);
+    // Include code / keyCode / text so pages see the same key fields and
+    // keypress phase as a real key press (#2751).
+    const { keyDown, keyUp } = cdpKeyPressEvents(key, modifierFlags);
+    await this.cdp('Input.dispatchKeyEvent', keyDown);
+    await this.cdp('Input.dispatchKeyEvent', keyUp);
   }
 }
 

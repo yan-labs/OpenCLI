@@ -5,15 +5,18 @@
  * dispatches them to Chrome APIs (debugger/tabs/cookies), returns results.
  */
 
+import { dedicatedBounds } from './dedicated-layout.js';
+
 declare const __OPENCLI_COMPAT_RANGE__: string;
 
+import { callChrome, describeChrome, ChromeApiError } from './chrome-api';
 import type { Command, Result } from './protocol';
 import { DAEMON_HOST, DAEMON_PORT, DAEMON_WS_URL, DAEMON_PING_URL } from './protocol';
+import { findIdleInteractiveGroup, idlePlaceholderUrl, parkIdleInteractiveTab, consumeIdlePlaceholder } from './idle-container';
 import * as executor from './cdp';
 import * as identity from './identity';
 import { executeWithJournal } from './journal';
 
-const sessionViewports = new Map<string, { width: number; height: number; tabs: Set<number> }>();
 let ws: WebSocket | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let reconnectAttempts = 0;
@@ -21,7 +24,6 @@ const CONTEXT_ID_KEY = 'opencli_context_id_v1';
 let currentContextId = 'default';
 let contextIdPromise: Promise<string> | null = null;
 let connectInFlight: Promise<void> | null = null;
-let handshakeTimer: ReturnType<typeof setTimeout> | null = null;
 // Startup readiness gate. A MV3 service worker can be woken by an event
 // (alarm, window/tab removal) before initialize()'s recovery chain has
 // rehydrated in-memory lease/container state from storage. Event handlers that
@@ -175,20 +177,8 @@ async function connectAttempt(): Promise<void> {
     return;
   }
 
-  if (handshakeTimer) clearTimeout(handshakeTimer);
-  handshakeTimer = setTimeout(() => {
-    if (ws !== thisWs || thisWs.readyState !== WebSocket.CONNECTING) return;
-    console.warn('[opencli] Daemon WebSocket handshake timed out; reconnecting');
-    // Release the guard before close: Chrome may delay the close event too.
-    ws = null;
-    thisWs.close();
-    scheduleReconnect();
-  }, 10_000);
-
   thisWs.onopen = () => {
     if (ws !== thisWs) return;
-    if (handshakeTimer) clearTimeout(handshakeTimer);
-    handshakeTimer = null;
     console.log('[opencli] Connected to daemon');
     reconnectAttempts = 0; // Reset on successful connection
     if (reconnectTimer) {
@@ -211,17 +201,9 @@ async function connectAttempt(): Promise<void> {
 
   thisWs.onmessage = async (event) => {
     if (ws !== thisWs) return;
-    let stallTimer: ReturnType<typeof setTimeout> | undefined;
     try {
       const command = JSON.parse(event.data as string) as Command;
-      let stage = 'journal storage';
-      stallTimer = setTimeout(() => {
-        console.warn(`[opencli] Command ${command.id} action=${command.action} still waiting at ${stage} after 5s`);
-      }, 5_000);
-      const result = await executeWithJournal(command, (cmd) => {
-        stage = 'Chrome API handler';
-        return handleCommand(cmd);
-      });
+      const result = await executeWithJournal(command, handleCommand);
       // The socket may have been replaced while a long command ran. Deliver
       // the result on the freshest open socket — the daemon correlates by id,
       // and the journal replays it if this delivery is lost too.
@@ -229,16 +211,12 @@ async function connectAttempt(): Promise<void> {
       safeSend(target, result);
     } catch (err) {
       console.error('[opencli] Message handling error:', err);
-    } finally {
-      if (stallTimer) clearTimeout(stallTimer);
     }
   };
 
   thisWs.onclose = () => {
     stopWsKeepalive(thisWs);
     if (ws !== thisWs) return;
-    if (handshakeTimer) clearTimeout(handshakeTimer);
-    handshakeTimer = null;
     console.log('[opencli] Disconnected from daemon');
     ws = null;
     scheduleReconnect();
@@ -311,32 +289,7 @@ type LeaseOwnership = 'owned' | 'borrowed';
 type LeaseLifecycle = 'ephemeral' | 'persistent' | 'pinned';
 type WindowRole = 'interactive' | 'automation' | 'borrowed-user';
 type OwnedWindowRole = Exclude<WindowRole, 'borrowed-user'>;
-// foreground — raise the window AND select the tab (opt-in, interrupts the person by
-//              stealing macOS-level focus; use only when a human needs to see it, e.g.
-//              a CAPTCHA or an OS-level dialog)
-// active     — select the tab within its window ONLY; never touches OS-level window
-//              focus. Chromium's rAF/timer throttling keys off whether a tab is the
-//              active tab of a visible (non-minimized) window, not off which app has
-//              macOS focus — so this is enough to keep a tab's own render loop
-//              (e.g. a page polling `requestAnimationFrame`) from being throttled,
-//              without ever yanking the person's attention to another app.
-// background — do not raise, do not select; reuse the window they are already in
-// isolated   — background, but keep automation in its own separate window
-// dedicated  — OpenCLI's own named window (slot), created unfocused, optionally placed
-//              on a display; session tabs never enter the person's windows, foreign
-//              tabs are sent back, and the session tab is made the window's active tab
-//              before each command so it renders (see "Dedicated automation windows")
-//
-// The list and the type are one declaration on purpose. They used to be two, and the
-// runtime check fell behind the union: `isolated` type-checked everywhere, parsed on
-// the CLI, reached the extension, and was then dropped by a hardcoded two-value guard.
-// Nothing errored — the flag just did nothing, which is the hardest kind of broken.
-const WINDOW_MODES = ['foreground', 'active', 'background', 'isolated', 'dedicated'] as const;
-type WindowMode = typeof WINDOW_MODES[number];
-
-function isWindowMode(value: unknown): value is WindowMode {
-  return typeof value === 'string' && (WINDOW_MODES as readonly string[]).includes(value);
-}
+type WindowMode = 'foreground' | 'background' | 'dedicated';
 type BrowserSurface = 'browser' | 'adapter';
 type LeaseKind = 'owned' | 'bound';
 
@@ -353,6 +306,7 @@ type TargetLease = {
   ownership: LeaseOwnership;
   lifecycle: LeaseLifecycle;
   windowRole: WindowRole;
+  dedicated?: boolean;
 };
 
 const automationSessions = new Map<string, TargetLease>();
@@ -361,75 +315,37 @@ const IDLE_TIMEOUT_INTERACTIVE = 600_000; // 10min — human-paced browser:* / o
 const IDLE_TIMEOUT_NONE = -1;             // borrowed bound tabs stay bound until unbound/closed
 const REGISTRY_KEY = 'opencli_target_lease_registry_v2';
 const LEASE_IDLE_ALARM_PREFIX = 'opencli:lease-idle:';
-// Every session gets its own tab group, titled after the session — one group per
-// lease key, on both surfaces. `opencli browser recon …` lands in "OpenCLI: recon",
-// `opencli reddit …` in "OpenCLI: reddit". The earlier design pooled every browser
-// session into one "OpenCLI Browser" group (with a comma-joined title) and left
-// adapter tabs ungrouped in a window of their own; both were the same complaint
-// from the person at the keyboard — "where did that tab come from, and whose is
-// it" — and per-session groups answer it directly.
-const OWNED_TAB_GROUP_TITLE_PREFIX = 'OpenCLI: ';
+const CONTAINER_TAB_GROUP_TITLE: Record<OwnedWindowRole, string> = {
+  interactive: 'OpenCLI Browser',
+  // Retained for registry/type compatibility. Adapter automation no longer
+  // creates or discovers a visible tab group.
+  automation: 'OpenCLI Adapter',
+};
 const OWNED_TAB_GROUP_COLOR: chrome.tabGroups.ColorEnum = 'orange';
-// Why the container could not borrow one of the person's own windows and had to
-// create one instead. Surfaced through `browser <s> sessions` so "why did a new
-// window open" is answerable without guessing.
-type WindowFallbackReason = 'no-normal-window' | 'all-incognito' | 'all-owned' | 'query-failed';
 let leaseMutationQueue: Promise<void> = Promise.resolve();
 const ownedContainers: Record<OwnedWindowRole, {
   windowId: number | null;
-  // leaseKey → group id. A cache over the ledger below; repopulated on demand.
-  groups: Map<string, number>;
-  // True when `windowId` is a window the person opened and we are borrowing a tab
-  // in, rather than a window we created. Borrowed windows must never be treated as
-  // ours: we do not leave placeholder tabs in them, and `--window isolated` refuses
-  // to reuse them.
-  borrowed: boolean;
-  // Set when `windowId` is a window we created because no window of the person's
-  // could be borrowed; null when the container is borrowed or was asked for
-  // explicitly via `--window isolated`.
-  windowFallbackReason: WindowFallbackReason | null;
+  groupId: number | null;
   promise: Promise<{ windowId: number; initialTabId?: number }> | null;
   groupPromise: Promise<OwnedContainerGroup | null> | null;
 }> = {
-  interactive: { windowId: null, groups: new Map(), borrowed: false, windowFallbackReason: null, promise: null, groupPromise: null },
-  automation: { windowId: null, groups: new Map(), borrowed: false, windowFallbackReason: null, promise: null, groupPromise: null },
+  interactive: { windowId: null, groupId: null, promise: null, groupPromise: null },
+  automation: { windowId: null, groupId: null, promise: null, groupPromise: null },
 };
 
-// Dedicated automation windows, one per slot (see "Dedicated automation windows").
-// Kept apart from `ownedContainers` on purpose: a role container flips between a
-// borrowed window and an isolated one, while a dedicated window is only ever ours.
-const DEFAULT_DEDICATED_SLOT = 'default';
-const DEDICATED_REGISTRY_KEY = 'opencli_dedicated_windows_v1';
-const dedicatedSlots = new Map<string, DedicatedSlotState>();
-// Tabs we moved ourselves (so onAttached does not read them as the person dragging).
-const selfMovingTabIds = new Map<number, number>();
-// One queue for every slot: cell allocation must see the other slots' in-flight windows.
-let dedicatedEnsureQueue: Promise<unknown> = Promise.resolve();
-// Releases inside dedicated windows run one at a time, so "is this the last tab" is answered truthfully.
-let dedicatedReleaseQueue: Promise<unknown> = Promise.resolve();
-// Tabs we created in a dedicated window (so onCreated does not read them as foreign).
-const selfCreatedTabIds = new Set<number>();
-// Lease creations/relocations in progress; foreign-tab checks wait for them.
-let dedicatedTabCreatesInFlight = 0;
-// Grace period before judging a new/attached tab in a dedicated window.
-let foreignTabSettleMs = 1500;
-
-// Ledger of every group id we have created or adopted in the CURRENT browser
-// session, mapped to the lease key it belongs to, kept so an orphan group
-// (created by `chrome.tabs.group` but never titled because the worker died
-// before the `tabGroups.update`) stays discoverable even when the cached
-// `groups` and lease/title layers can't see it. A `null` lease key is a group
-// id restored from a registry written by an older build that did not record
-// ownership; it is never adopted for a session and only kept so it gets pruned.
-// Persisted as part of the session registry (see StoredRegistry) and restored
-// by reconcileTargetLeaseRegistry().
-const ownedGroupLedger = new Map<number, string | null>();
+// Ledger of every interactive group id we have created or adopted in the
+// CURRENT browser session, kept so an orphan group (created by
+// `chrome.tabs.group` but never titled because the worker died before the
+// `tabGroups.update`) stays discoverable even when the cached `groupId` and
+// lease layers can't see it. Interactive-only: adapter automation never
+// creates a visible group. Persisted as part of the session registry (see
+// StoredRegistry) and restored by reconcileTargetLeaseRegistry().
+const interactiveGroupLedger = new Set<number>();
 
 type StoredLease = Omit<TargetLease, 'idleTimer' | 'idleDeadlineAt'> & {
   idleDeadlineAt: number;
   updatedAt: number;
   idleTimeoutMs?: number;
-  inflightCommands?: InflightCommand[];
 };
 
 // The registry lives in chrome.storage.session, never chrome.storage.local:
@@ -444,21 +360,12 @@ type StoredLease = Omit<TargetLease, 'idleTimer' | 'idleDeadlineAt'> & {
 // and on browser restart — recovery is only promised across service-worker
 // restarts within one browser session. Old leases are NOT recovered after an
 // extension reload/update, and no durable-id logic should be added for that.
-type StoredContainer = {
-  windowId: number | null;
-  borrowed?: boolean;
-  windowFallbackReason?: WindowFallbackReason | null;
-  // group id (as a string key) → lease key. Both roles carry one now.
-  groups?: Record<string, string>;
-  // Legacy (pre per-session groups): bare interactive group ids with no owner.
-  groupIds?: number[];
-};
 type StoredRegistry = {
   version: 2;
   contextId: BrowserContextId;
   ownedContainers: {
-    interactive: StoredContainer;
-    automation: StoredContainer;
+    interactive: { windowId: number | null; groupIds: number[] };
+    automation: { windowId: number | null };
   };
   leases: Record<string, StoredLease>;
 };
@@ -479,13 +386,6 @@ type SessionOverrides = {
   idleTimeoutMs?: number;
   windowMode?: WindowMode;
   lifecycle?: LeaseLifecycle;
-  // `dedicated` only (set from the command by applyDedicatedCommandFields).
-  windowSlot?: string;
-  windowBounds?: { left: number; top: number; width: number; height: number };
-  windowDisplay?: string;
-  half?: boolean;
-  avoidDisplayBounds?: Rect;
-  autoSelect?: boolean;
 };
 const sessionOverrides = new Map<string, SessionOverrides>();
 
@@ -493,45 +393,10 @@ function setSessionOverride(key: string, patch: SessionOverrides): void {
   sessionOverrides.set(key, { ...sessionOverrides.get(key), ...patch });
 }
 
-/** Each command retains its own start and budget, including across worker restarts. */
-const INFLIGHT_MAX_MS = 600_000;
-type InflightCommand = { startedAt: number; maxMs: number; invalidated?: boolean };
-const activeCommands = new Map<string, Set<InflightCommand>>();
-
-type CommandGuard = () => void;
-
-/** A reclaimed command may only dispose of the tab it just created. */
-function guardCreatedTab(guard: CommandGuard | undefined, tabId: number): void {
-  try {
-    guard?.();
-  } catch (err) {
-    selfCreatedTabIds.delete(tabId);
-    void chrome.tabs.remove(tabId).catch(() => {});
-    throw err;
-  }
-}
-
-function oldestInflightRemaining(leaseKey: string): number | undefined {
-  const commands = activeCommands.get(leaseKey);
-  if (!commands?.size) return undefined;
-  const oldest = [...commands].reduce((a, b) => a.startedAt <= b.startedAt ? a : b);
-  return oldest.startedAt + oldest.maxMs - Date.now();
-}
-
-async function handleIdleExpiry(leaseKey: string, reason: string): Promise<void> {
-  if (getIdleTimeout(leaseKey) <= 0) return;
-  const remaining = oldestInflightRemaining(leaseKey);
-  if (remaining !== undefined && remaining > 0) {
-    resetWindowIdleTimer(leaseKey, remaining);
-    return;
-  }
-  if (remaining !== undefined) {
-    for (const command of activeCommands.get(leaseKey) ?? []) command.invalidated = true;
-    activeCommands.delete(leaseKey);
-    reason = `stuck command (${reason})`;
-  }
-  await releaseLease(leaseKey, reason);
-}
+/** Commands currently executing per lease — idle release is deferred while > 0. */
+const activeCommandCounts = new Map<string, number>();
+const closingLeases = new Set<string>();
+const closingTabs = new Set<number>();
 const LEASE_KEY_SEPARATOR = '\u0000';
 
 function getLeaseKey(session: string, surface: BrowserSurface): string {
@@ -592,28 +457,9 @@ function getWindowRole(key: string, ownership: LeaseOwnership): WindowRole {
   return ownership === 'borrowed' ? 'borrowed-user' : getOwnedWindowRole(key);
 }
 
-// Both surfaces default to `dedicated`: an automation window of our own, created
-// unfocused, placed on a secondary display when the machine has one, with the
-// session's tab selected inside it so the page actually renders.
-//
-// What the default used to be, and why it changed: `background` does NOT open a
-// window of our own — it *borrows the window the person is currently using* and
-// opens the session's tab there, in a labelled tab group, following them to
-// whatever window they move to (see ensureOwnedContainerWindowUnlocked). It never
-// raises anything, but a script doing that on the window someone is typing in is
-// exactly the interruption this mode was supposed to avoid, and a non-active tab
-// in their window reads `visibilityState: hidden`, so lazily rendered pages never
-// finish loading. `dedicated` keeps automation out of their windows entirely while
-// still rendering `visible`.
-//
-// `background` (hidden tab in the person's window), `active`, `foreground` (real OS
-// focus — some sites, e.g. PageSpeed Insights, only render for a truly frontmost
-// window) and `isolated` all remain available via `--window` / `OPENCLI_WINDOW`.
-const DEFAULT_WINDOW_MODE: WindowMode = 'dedicated';
-let defaultWindowMode: WindowMode = DEFAULT_WINDOW_MODE;
-
 function getWindowMode(key: string): WindowMode {
-  return sessionOverrides.get(key)?.windowMode ?? defaultWindowMode;
+  return sessionOverrides.get(key)?.windowMode
+    ?? (getOwnedWindowRole(key) === 'interactive' ? 'foreground' : 'background');
 }
 
 function makeAlarmName(leaseKey: string): string {
@@ -649,50 +495,18 @@ function makeSession(
   };
 }
 
-const WINDOW_FALLBACK_REASONS: readonly WindowFallbackReason[] = ['no-normal-window', 'all-incognito', 'all-owned', 'query-failed'];
-
-function snapshotContainer(role: OwnedWindowRole): StoredContainer {
-  const groups: Record<string, string> = {};
-  for (const [groupId, leaseKey] of ownedGroupLedger.entries()) {
-    if (leaseKey !== null && getOwnedWindowRole(leaseKey) === role) groups[String(groupId)] = leaseKey;
-  }
-  return {
-    windowId: ownedContainers[role].windowId,
-    borrowed: ownedContainers[role].borrowed,
-    windowFallbackReason: ownedContainers[role].windowFallbackReason,
-    groups,
-  };
-}
-
 function emptyRegistry(): StoredRegistry {
   return {
     version: 2,
     contextId: currentContextId,
     ownedContainers: {
-      interactive: snapshotContainer('interactive'),
-      automation: snapshotContainer('automation'),
+      interactive: {
+        windowId: ownedContainers.interactive.windowId,
+        groupIds: [...interactiveGroupLedger],
+      },
+      automation: { windowId: ownedContainers.automation.windowId },
     },
     leases: {},
-  };
-}
-
-function coerceStoredContainer(raw: Partial<StoredContainer> | undefined): StoredContainer {
-  const groups: Record<string, string> = {};
-  if (raw?.groups && typeof raw.groups === 'object') {
-    for (const [groupId, leaseKey] of Object.entries(raw.groups)) {
-      if (/^\d+$/.test(groupId) && typeof leaseKey === 'string') groups[groupId] = leaseKey;
-    }
-  }
-  return {
-    windowId: typeof raw?.windowId === 'number' ? raw.windowId : null,
-    borrowed: raw?.borrowed === true,
-    windowFallbackReason: (WINDOW_FALLBACK_REASONS as readonly unknown[]).includes(raw?.windowFallbackReason)
-      ? raw!.windowFallbackReason as WindowFallbackReason
-      : null,
-    groups,
-    groupIds: Array.isArray(raw?.groupIds)
-      ? raw!.groupIds.filter((id): id is number => typeof id === 'number')
-      : [],
   };
 }
 
@@ -710,8 +524,15 @@ async function readRegistry(): Promise<StoredRegistry> {
       version: 2,
       contextId: currentContextId,
       ownedContainers: {
-        interactive: coerceStoredContainer(storedContainers.interactive),
-        automation: coerceStoredContainer(storedContainers.automation),
+        interactive: {
+          windowId: typeof storedContainers.interactive?.windowId === 'number' ? storedContainers.interactive.windowId : null,
+          groupIds: Array.isArray(storedContainers.interactive?.groupIds)
+            ? storedContainers.interactive.groupIds.filter((id): id is number => typeof id === 'number')
+            : [],
+        },
+        automation: {
+          windowId: typeof storedContainers.automation?.windowId === 'number' ? storedContainers.automation.windowId : null,
+        },
       },
       leases: stored.leases as Record<string, StoredLease>,
     };
@@ -742,18 +563,21 @@ async function persistRuntimeState(): Promise<void> {
       ownership: session.ownership,
       lifecycle: session.lifecycle,
       windowRole: session.windowRole,
+      dedicated: session.dedicated,
+      idleTimeoutMs: sessionOverrides.get(leaseKey)?.idleTimeoutMs,
       idleDeadlineAt: session.idleDeadlineAt,
       updatedAt: Date.now(),
-      idleTimeoutMs: sessionOverrides.get(leaseKey)?.idleTimeoutMs,
-      inflightCommands: [...(activeCommands.get(leaseKey) ?? [])],
     };
   }
   await writeRegistry({
     version: 2,
     contextId: currentContextId,
     ownedContainers: {
-      interactive: snapshotContainer('interactive'),
-      automation: snapshotContainer('automation'),
+      interactive: {
+        windowId: ownedContainers.interactive.windowId,
+        groupIds: [...interactiveGroupLedger],
+      },
+      automation: { windowId: ownedContainers.automation.windowId },
     },
     leases,
   });
@@ -806,41 +630,20 @@ function resetWindowIdleTimer(leaseKey: string, remainingMs?: number): void {
     void persistRuntimeState();
     return;
   }
-  const inflightRemaining = oldestInflightRemaining(leaseKey);
-  const interval = Math.max(0, Math.min(timeout, remainingMs ?? timeout, inflightRemaining ?? timeout));
+  const interval = remainingMs === undefined
+    ? timeout
+    : Math.max(0, Math.min(remainingMs, timeout));
   scheduleIdleAlarm(leaseKey, interval);
   session.idleDeadlineAt = Date.now() + interval;
   void persistRuntimeState();
-  session.idleTimer = setTimeout(() => {
-    void handleIdleExpiry(leaseKey, 'idle timeout');
+  session.idleTimer = setTimeout(async () => {
+    if ((activeCommandCounts.get(leaseKey) ?? 0) > 0) {
+      // A command is still executing on this lease — never tear the tab down
+      // from under it. Its completion re-arms the timer.
+      return;
+    }
+    await releaseLease(leaseKey, 'idle timeout');
   }, interval);
-}
-
-/**
- * The title of the group a lease's tabs live in: `OpenCLI: <session>`. The
- * session part is whatever the person named the session — `recon` for
- * `opencli browser recon …`. Adapter sessions are named by the CLI runtime as
- * `site:<site>` (persistent) or `site:<site>:<uuid>` (one-shot); the person
- * typed `opencli reddit …`, so the group says `OpenCLI: reddit`, not the
- * machine name.
- */
-function getOwnedGroupTitle(leaseKey: string): string {
-  const session = getSessionFromKey(leaseKey);
-  if (getSurfaceFromKey(leaseKey) === 'adapter') {
-    const site = /^site:([^:]+)(?::[0-9a-f-]{36})?$/i.exec(session)?.[1];
-    if (site) return `${OWNED_TAB_GROUP_TITLE_PREFIX}${site}`;
-  }
-  return `${OWNED_TAB_GROUP_TITLE_PREFIX}${session}`;
-}
-
-/** Tab ids that belong to an owned lease OTHER than `leaseKey`. */
-function otherOwnedPreferredTabIds(leaseKey: string): Set<number> {
-  const ids = new Set<number>();
-  for (const [key, session] of automationSessions.entries()) {
-    if (key === leaseKey || !session.owned || session.preferredTabId === null) continue;
-    ids.add(session.preferredTabId);
-  }
-  return ids;
 }
 
 type OwnedContainerGroup = {
@@ -854,12 +657,6 @@ type OwnedContainerGroupCandidate = OwnedContainerGroup & {
   hasReusableTab: boolean;
 };
 
-// `active` deliberately does NOT reach this function's `focused: true` call — that is
-// the one that steals macOS-level window focus. Only `foreground` does that.
-function wantsActiveTab(mode: WindowMode): boolean {
-  return mode === 'foreground' || mode === 'active';
-}
-
 async function focusOwnedWindowIfRequested(windowId: number, mode: WindowMode): Promise<void> {
   if (mode !== 'foreground') return;
   const updateWindow = (chrome.windows as unknown as { update?: (windowId: number, updateInfo: { focused?: boolean }) => Promise<unknown> }).update;
@@ -867,20 +664,22 @@ async function focusOwnedWindowIfRequested(windowId: number, mode: WindowMode): 
 }
 
 async function toOwnedContainerGroupCandidate(group: chrome.tabGroups.TabGroup): Promise<OwnedContainerGroupCandidate | null> {
+  let chromeWindow: chrome.windows.Window;
   try {
-    const chromeWindow = await chrome.windows.get(group.windowId);
-    const reusableTabId = await findReusableOwnedContainerTab(group.windowId, group.id);
-    return {
-      id: group.id,
-      windowId: group.windowId,
-      title: group.title,
-      focused: !!chromeWindow.focused,
-      hasReusableTab: reusableTabId !== undefined,
-    };
-  } catch {
-    // Ignore stale browser-session group/window state and keep looking.
-    return null;
+    chromeWindow = await chrome.windows.get(group.windowId);
+  } catch (err) {
+    if (err instanceof Error && classifyExtensionError(err.message) === 'tab_gone') return null;
+    throw err;
   }
+
+  const reusableTabId = await findReusableOwnedContainerTab(group.windowId, group.id);
+  return {
+    id: group.id,
+    windowId: group.windowId,
+    title: group.title,
+    focused: !!chromeWindow.focused,
+    hasReusableTab: reusableTabId !== undefined,
+  };
 }
 
 function selectOwnedContainerGroupCandidate(candidates: OwnedContainerGroupCandidate[]): OwnedContainerGroupCandidate | null {
@@ -893,97 +692,98 @@ function selectOwnedContainerGroupCandidate(candidates: OwnedContainerGroupCandi
   })[0];
 }
 
-/**
- * Drop ledger entries whose group no longer exists (closed, or converged away)
- * so the ledger stays bounded and never resurrects a dead id. Returns the
- * groups that are still alive, keyed by id.
- */
-async function pruneOwnedGroupLedger(): Promise<Map<number, chrome.tabGroups.TabGroup>> {
-  const alive = new Map<number, chrome.tabGroups.TabGroup>();
-  let pruned = false;
-  for (const groupId of [...ownedGroupLedger.keys()]) {
-    try {
-      alive.set(groupId, await chrome.tabGroups.get(groupId));
-    } catch {
-      ownedGroupLedger.delete(groupId);
-      for (const container of Object.values(ownedContainers)) {
-        for (const [key, id] of [...container.groups.entries()]) {
-          if (id === groupId) container.groups.delete(key);
-        }
-      }
-      pruned = true;
-    }
-  }
-  if (pruned) await persistRuntimeState();
-  return alive;
+function isMissingTabGroupError(err: unknown): boolean {
+  return err instanceof Error && /No group with id|group no longer exists/i.test(err.message);
 }
 
-/**
- * Every group that could be THIS lease's group. Four layers, all scoped to the
- * one lease key — a group belonging to any other session is never a candidate,
- * so convergence can only ever merge a session with itself:
- *
- *  1. the cached id in `ownedContainers[role].groups`
- *  2. the ledger (ids we created/adopted this browser session for this lease)
- *  3. the title `OpenCLI: <session>`
- *  4. the group the lease's own tab currently sits in, titled or not
- *
- * Layer 4 is what catches the orphan left when the worker died between
- * `chrome.tabs.group` returning and the title update landing. It is hijack-safe
- * because the only signal is "contains this lease's own tab": a group the person
- * built never satisfies it. Layer 3 is filtered the same way in reverse — a
- * group carrying our title but holding another session's tab (a `browser` and
- * an `adapter` session can share a name) is theirs, not ours.
- */
-async function collectOwnedGroupCandidates(role: OwnedWindowRole, leaseKey: string): Promise<OwnedContainerGroupCandidate[]> {
+async function collectOwnedGroupCandidates(role: OwnedWindowRole): Promise<OwnedContainerGroupCandidate[]> {
+  if (role === 'automation') return [];
+
   const container = ownedContainers[role];
   const groupsById = new Map<number, chrome.tabGroups.TabGroup>();
-  const foreignTabIds = otherOwnedPreferredTabIds(leaseKey);
-  const claimedByOther = (groupId: number): boolean => {
-    const owner = ownedGroupLedger.get(groupId);
-    return owner !== undefined && owner !== null && owner !== leaseKey;
-  };
 
-  const cachedGroupId = container.groups.get(leaseKey);
-  if (cachedGroupId !== undefined) {
+  if (container.groupId !== null) {
     try {
-      const group = await chrome.tabGroups.get(cachedGroupId);
+      const group = await chrome.tabGroups.get(container.groupId);
       groupsById.set(group.id, group);
-    } catch {
-      container.groups.delete(leaseKey);
+    } catch (err) {
+      if (!isMissingTabGroupError(err)) throw err;
+      container.groupId = null;
     }
   }
 
-  // Ledger layer. Every entry is checked (not just this lease's) so pruning
-  // happens regardless of which session is being ensured.
-  for (const [groupId, group] of await pruneOwnedGroupLedger()) {
-    if (ownedGroupLedger.get(groupId) === leaseKey && !groupsById.has(groupId)) groupsById.set(groupId, group);
+  // Ledger layer: every interactive group id created/adopted this browser
+  // session (role is guaranteed 'interactive' past the early return above).
+  // Catches the untitled orphan that the lease layer misses. A
+  // missing id means the group has been closed or converged away — drop it so
+  // the ledger stays bounded and never resurrects a dead id.
+  let ledgerPruned = false;
+  for (const groupId of [...interactiveGroupLedger]) {
+    if (groupsById.has(groupId)) continue;
+    try {
+      const group = await chrome.tabGroups.get(groupId);
+      groupsById.set(group.id, group);
+    } catch (err) {
+      if (!isMissingTabGroupError(err)) throw err;
+      interactiveGroupLedger.delete(groupId);
+      ledgerPruned = true;
+    }
+  }
+  if (ledgerPruned) await persistRuntimeState();
+
+  for (const [leaseKey, session] of automationSessions.entries()) {
+    if (!session.owned || session.dedicated || getOwnedWindowRole(leaseKey) !== role || session.preferredTabId === null) continue;
+    let tab: chrome.tabs.Tab;
+    try {
+      tab = await chrome.tabs.get(session.preferredTabId);
+    } catch (err) {
+      if (err instanceof Error && classifyExtensionError(err.message) === 'tab_gone') continue;
+      throw err;
+    }
+    const groupId = tab.groupId;
+    if (typeof groupId !== 'number' || groupId === chrome.tabGroups.TAB_GROUP_ID_NONE) continue;
+    try {
+      const group = await chrome.tabGroups.get(groupId);
+      groupsById.set(group.id, group);
+    } catch (err) {
+      if (!isMissingTabGroupError(err)) throw err;
+    }
   }
 
-  try {
-    const titled = await chrome.tabGroups.query({ title: getOwnedGroupTitle(leaseKey) });
-    for (const group of titled) {
-      if (groupsById.has(group.id) || claimedByOther(group.id)) continue;
+  // 4th layer: scan every window for empty-title orphan groups left behind
+  // when the worker died between `chrome.tabs.group` returning and the
+  // title/color `tabGroups.update` landing. We cannot use color as a signal
+  // (Chrome assigns a default palette color before our update lands), and we
+  // cannot scope by `container.windowId` because the canonical group can
+  // converge into the user window after cross-window moves so `windowId`
+  // would miss the multi-window orphan symptom. Hijack-protected via a
+  // per-role ownership-tab signal: the orphan must contain a tab that is the
+  // `preferredTabId` of a still-registered owned session for this role.
+  // User-built untitled groups never satisfy that condition.
+  const ownedPreferredTabIds = new Set<number>();
+  for (const [leaseKey, session] of automationSessions.entries()) {
+    if (!session.owned || session.dedicated || getOwnedWindowRole(leaseKey) !== role || session.preferredTabId === null) continue;
+    ownedPreferredTabIds.add(session.preferredTabId);
+  }
+  if (ownedPreferredTabIds.size > 0) {
+    const allGroups = await chrome.tabGroups.query({});
+    for (const group of allGroups) {
+      if (group.title) continue;
+      if (groupsById.has(group.id)) continue;
       const tabsInGroup = await chrome.tabs.query({ groupId: group.id });
-      if (tabsInGroup.some((tab) => tab.id !== undefined && foreignTabIds.has(tab.id))) continue;
-      groupsById.set(group.id, group);
-    }
-  } catch {
-    // Transient query failure: convergence proceeds with the other layers.
-  }
-
-  const session = automationSessions.get(leaseKey);
-  if (session?.owned && session.preferredTabId !== null) {
-    try {
-      const tab = await chrome.tabs.get(session.preferredTabId);
-      const groupId = tab.groupId;
-      if (typeof groupId === 'number' && groupId !== chrome.tabGroups.TAB_GROUP_ID_NONE && !claimedByOther(groupId)) {
-        const group = await chrome.tabGroups.get(groupId);
+      if (tabsInGroup.some((tab) => tab.id !== undefined && ownedPreferredTabIds.has(tab.id))) {
         groupsById.set(group.id, group);
       }
-    } catch {
-      // Lease tabs and browser-session groups can disappear independently.
     }
+  }
+
+  // A persisted extension-owned placeholder is evidence across browser restarts;
+  // group titles, colors, and restored numeric IDs are not.
+  if (groupsById.size === 0) {
+    const reservedTabs = new Set([...automationSessions.values()]
+      .flatMap(session => session.preferredTabId === null ? [] : [session.preferredTabId]));
+    const idleGroup = await findIdleInteractiveGroup(reservedTabs);
+    if (idleGroup) groupsById.set(idleGroup.id, idleGroup);
   }
 
   const candidates = await Promise.all([...groupsById.values()].map(toOwnedContainerGroupCandidate));
@@ -993,7 +793,7 @@ async function collectOwnedGroupCandidates(role: OwnedWindowRole, leaseKey: stri
 function updateOwnedSessionWindowForTabs(role: OwnedWindowRole, tabIds: number[], windowId: number): void {
   const moved = new Set(tabIds);
   for (const [leaseKey, session] of automationSessions.entries()) {
-    if (!session.owned || getOwnedWindowRole(leaseKey) !== role) continue;
+    if (!session.owned || session.dedicated || getOwnedWindowRole(leaseKey) !== role) continue;
     if (session.preferredTabId !== null && moved.has(session.preferredTabId)) {
       session.windowId = windowId;
     }
@@ -1006,45 +806,35 @@ async function ensureTabsInWindow(tabIds: number[], windowId: number): Promise<n
     try {
       const tab = await chrome.tabs.get(tabId);
       if (tab.windowId !== windowId) {
-        await moveTabSelf(tabId, windowId);
+        await chrome.tabs.move(tabId, { windowId, index: -1 });
         movedIds.push(tabId);
       }
-    } catch {
-      // The caller may be cleaning stale session state. Missing tabs are ignored here.
+    } catch (err) {
+      if (!(err instanceof Error) || classifyExtensionError(err.message) !== 'tab_gone') throw err;
     }
   }
   return movedIds;
 }
 
-async function ensureCanonicalGroupTitle(leaseKey: string, group: OwnedContainerGroup): Promise<OwnedContainerGroup> {
-  const title = getOwnedGroupTitle(leaseKey);
-  if (group.title === title) return group;
+async function ensureCanonicalGroupTitle(role: OwnedWindowRole, group: OwnedContainerGroup): Promise<OwnedContainerGroup> {
+  const canonicalTitle = CONTAINER_TAB_GROUP_TITLE[role];
+  if (group.title === canonicalTitle) return group;
   const updated = await chrome.tabGroups.update(group.id, {
-    title,
+    title: canonicalTitle,
     color: OWNED_TAB_GROUP_COLOR,
   });
   return { id: updated.id, windowId: updated.windowId, title: updated.title };
 }
 
-/**
- * Fold duplicate groups of ONE lease into its canonical group. `candidates`
- * already came through `collectOwnedGroupCandidates(role, leaseKey)`, so every
- * group here is this session's; the per-tab check below is belt-and-braces
- * against a tab of another session that landed in one of them.
- */
 async function convergeOwnedGroupDuplicates(
   role: OwnedWindowRole,
-  leaseKey: string,
   canonical: OwnedContainerGroup,
   candidates: OwnedContainerGroup[],
 ): Promise<OwnedContainerGroup> {
-  const foreignTabIds = otherOwnedPreferredTabIds(leaseKey);
   for (const duplicate of candidates) {
     if (duplicate.id === canonical.id) continue;
     const tabs = await chrome.tabs.query({ groupId: duplicate.id });
-    const tabIds = tabs
-      .map((tab) => tab.id)
-      .filter((id): id is number => id !== undefined && !foreignTabIds.has(id));
+    const tabIds = tabs.map((tab) => tab.id).filter((id): id is number => id !== undefined);
     if (tabIds.length === 0) continue;
     await ensureTabsInWindow(tabIds, canonical.windowId);
     await chrome.tabs.group({ groupId: canonical.id, tabIds });
@@ -1060,7 +850,14 @@ async function attachTabsToOwnedGroup(
 ): Promise<OwnedContainerGroup> {
   if (ids.length === 0) return group;
   await ensureTabsInWindow(ids, group.windowId);
-  const tabs = await Promise.all(ids.map((id) => chrome.tabs.get(id).catch(() => null)));
+  const tabs = await Promise.all(ids.map(async (id) => {
+    try {
+      return await chrome.tabs.get(id);
+    } catch (err) {
+      if (err instanceof Error && classifyExtensionError(err.message) === 'tab_gone') return null;
+      throw err;
+    }
+  }));
   const missing = tabs
     .filter((tab): tab is chrome.tabs.Tab => tab !== null && tab.id !== undefined && tab.groupId !== group.id)
     .map((tab) => tab.id!);
@@ -1071,27 +868,24 @@ async function attachTabsToOwnedGroup(
 
 async function createOwnedGroup(
   role: OwnedWindowRole,
-  leaseKey: string,
   windowId: number,
   ids: number[],
 ): Promise<OwnedContainerGroup> {
   if (ids.length === 0) throw new Error(`Cannot create ${role} tab group without tabs`);
   await ensureTabsInWindow(ids, windowId);
   const groupId = await chrome.tabs.group({ tabIds: ids, createProperties: { windowId } });
-  ownedContainers[role].groups.set(leaseKey, groupId);
-  // A dedicated window is never a role container; recording it there would let
-  // default-mode sessions and `isolated` treat it as theirs.
-  if (!isDedicatedWindow(windowId)) ownedContainers[role].windowId = windowId;
+  ownedContainers[role].groupId = groupId;
+  ownedContainers[role].windowId = windowId;
   // Record in the ledger and persist BEFORE the title/color update lands so a
   // worker crash between the two API calls can self-heal on resume:
   // `ensureCanonicalGroupTitle` repairs the title on the next ensure cycle
   // once the ledger surfaces the untitled orphan. We must not `tabs.ungroup`
   // on failure or the recorded id dangles.
-  ownedGroupLedger.set(groupId, leaseKey);
+  if (role === 'interactive') interactiveGroupLedger.add(groupId);
   await persistRuntimeState();
   const group = await chrome.tabGroups.update(groupId, {
     color: OWNED_TAB_GROUP_COLOR,
-    title: getOwnedGroupTitle(leaseKey),
+    title: CONTAINER_TAB_GROUP_TITLE[role],
     collapsed: false,
   });
   updateOwnedSessionWindowForTabs(role, ids, group.windowId);
@@ -1100,37 +894,21 @@ async function createOwnedGroup(
 
 async function ensureOwnedContainerGroup(
   role: OwnedWindowRole,
-  leaseKey: string,
   fallbackWindowId: number | null,
   tabIds: Array<number | undefined>,
-  // The group must live in THIS window. Defaults to `fallbackWindowId`, and that
-  // default is the point: convergence walks to the canonical group wherever it
-  // happens to be and MOVES tabs there, so every call that knew its window but
-  // forgot to say so was a door for relocating tabs across windows. Emptying a
-  // window that way makes Chrome close it, which killed every session inside.
-  // Four separate bugs came through four different unpinned calls before this
-  // stopped being a per-call-site decision.
-  //
-  // Cross-window adoption is now only possible where it is meaningful: the
-  // discovery call that passes `fallbackWindowId: null` because it does not yet
-  // know which window it wants.
-  pinWindowId?: number,
 ): Promise<OwnedContainerGroup | null> {
+  // Adapter automation runs in an owned background window but no longer creates
+  // a visible "OpenCLI Adapter" tab group. Its ownership anchors are the
+  // persisted container windowId and per-lease preferredTabId.
+  if (role === 'automation') return null;
+
   const ids = [...new Set(tabIds.filter((id): id is number => id !== undefined))];
 
-  // One queue per role, not per lease: the ledger is shared across leases and
-  // two sessions grouping at once must not interleave their pruning/persisting.
   const container = ownedContainers[role];
   const previousGroupPromise = container.groupPromise ?? Promise.resolve(null);
   const nextGroupPromise = previousGroupPromise
     .catch(() => null)
-    .then(() => ensureOwnedContainerGroupUnlocked(
-      role,
-      leaseKey,
-      fallbackWindowId,
-      ids,
-      pinWindowId ?? (fallbackWindowId ?? undefined),
-    ));
+    .then(() => ensureOwnedContainerGroupUnlocked(role, fallbackWindowId, ids));
   const trackedGroupPromise = nextGroupPromise.finally(() => {
     if (container.groupPromise === trackedGroupPromise) container.groupPromise = null;
   });
@@ -1140,53 +918,39 @@ async function ensureOwnedContainerGroup(
 
 async function ensureOwnedContainerGroupUnlocked(
   role: OwnedWindowRole,
-  leaseKey: string,
   fallbackWindowId: number | null,
   ids: number[],
-  pinWindowId?: number,
 ): Promise<OwnedContainerGroup | null> {
   try {
-    const allCandidates = await collectOwnedGroupCandidates(role, leaseKey);
-    const candidates = pinWindowId === undefined
-      ? allCandidates
-      : allCandidates.filter(candidate => candidate.windowId === pinWindowId);
+    const candidates = await collectOwnedGroupCandidates(role);
     const selected = selectOwnedContainerGroupCandidate(candidates);
     let canonical: OwnedContainerGroup | null = selected
       ? { id: selected.id, windowId: selected.windowId, title: selected.title }
       : null;
 
     if (canonical) {
-      canonical = await convergeOwnedGroupDuplicates(role, leaseKey, canonical, candidates);
-      canonical = await ensureCanonicalGroupTitle(leaseKey, canonical);
+      canonical = await convergeOwnedGroupDuplicates(role, canonical, candidates);
+      canonical = await ensureCanonicalGroupTitle(role, canonical);
       canonical = await attachTabsToOwnedGroup(role, canonical, ids);
     } else if (fallbackWindowId !== null && ids.length > 0) {
-      canonical = await createOwnedGroup(role, leaseKey, fallbackWindowId, ids);
+      canonical = await createOwnedGroup(role, fallbackWindowId, ids);
     }
 
-    const container = ownedContainers[role];
     if (canonical) {
-      // Adopting a group tells us where it lives but not who owns that window.
-      // Anything other than a window we created is borrowed until proven otherwise.
-      if (!isDedicatedWindow(canonical.windowId)) {
-        if (container.windowId !== canonical.windowId) {
-          container.borrowed = true;
-          container.windowFallbackReason = null;
-        }
-        container.windowId = canonical.windowId;
-      }
-      container.groups.set(leaseKey, canonical.id);
-      // Adopt into the session ledger — covers canonicals found via the
-      // title/lease layers that createOwnedGroup never recorded.
-      if (ownedGroupLedger.get(canonical.id) !== leaseKey) {
-        ownedGroupLedger.set(canonical.id, leaseKey);
+      ownedContainers[role].windowId = canonical.windowId;
+      ownedContainers[role].groupId = canonical.id;
+      // Adopt groups recovered through leases into the session ledger.
+      if (!interactiveGroupLedger.has(canonical.id)) {
+        interactiveGroupLedger.add(canonical.id);
         await persistRuntimeState();
       }
     } else {
-      container.groups.delete(leaseKey);
+      ownedContainers[role].groupId = null;
+      if (fallbackWindowId === null) ownedContainers[role].windowId = null;
     }
     return canonical;
   } catch (err) {
-    console.warn(`[opencli] Failed to ensure ${role} tab group for ${getSessionFromKey(leaseKey)}: ${err instanceof Error ? err.message : String(err)}`);
+    console.warn(`[opencli] Failed to ensure ${role} tab group: ${err instanceof Error ? err.message : String(err)}`);
     throw err;
   }
 }
@@ -1197,129 +961,42 @@ async function ensureOwnedContainerGroupUnlocked(
  * First-principles model:
  * - BrowserContext is the user's default Chrome profile.
  * - Session identity maps to a TargetLease (usually a tab), not a window.
- * - Both roles default to borrowing the window the person is already in, each
- *   session in its own labelled tab group. `--window isolated` opts a session
- *   out into a window of our own.
+ * - Browser commands and adapters use separate owned windows so foreground
+ *   interactive work cannot drag background adapter automation into view.
  */
 async function ensureOwnedContainerWindow(
   role: OwnedWindowRole,
-  leaseKey: string,
   initialUrl?: string,
   mode: WindowMode = 'background',
 ): Promise<{ windowId: number; initialTabId?: number }> {
   const container = ownedContainers[role];
   if (container.promise) return container.promise;
-  container.promise = ensureOwnedContainerWindowUnlocked(role, leaseKey, initialUrl, mode)
+  container.promise = ensureOwnedContainerWindowUnlocked(role, initialUrl, mode)
     .finally(() => {
       container.promise = null;
     });
   return container.promise;
 }
 
-/**
- * Is the container window one we created, or one we are borrowing?
- *
- * The `borrowed` flag alone is not enough to answer this: a container adopted
- * through a stray tab group, or restored from a registry written by an older
- * build, carries no flag at all and would read as dedicated. So confirm against
- * the window itself — a window of ours holds nothing but our own tabs. Any tab
- * outside the owned group means the window belongs to the person.
- */
-async function containerWindowIsDedicated(role: OwnedWindowRole): Promise<boolean> {
-  const container = ownedContainers[role];
-  if (container.windowId === null) return false;
-  if (container.borrowed) return false;
-  // `isolated` keeps its own window; it never moves into a dedicated slot window.
-  if (isDedicatedWindow(container.windowId)) return false;
-  // Ownership has to be PROVEN, and the only proof is: we know our group ids, and
-  // every tab in the window belongs to one of them. Anything short of that — no
-  // group recorded, a tab outside our groups, a query that throws — is answered
-  // "borrowed". Guessing from tab URLs was tried and misfires: a window holding
-  // nothing but chrome://newtab is a perfectly ordinary window someone just
-  // opened, and reading it as ours is how `--window isolated` silently kept
-  // landing in it. Being wrong in this direction costs one extra window, which
-  // is what the caller asked for anyway; being wrong the other way ignores the
-  // flag entirely.
-  const ours = new Set<number>();
-  for (const [groupId, owner] of ownedGroupLedger.entries()) {
-    if (owner !== null && getOwnedWindowRole(owner) === role) ours.add(groupId);
-  }
-  for (const groupId of container.groups.values()) ours.add(groupId);
-  if (ours.size === 0) return false;
-  try {
-    const tabs = await chrome.tabs.query({ windowId: container.windowId });
-    if (tabs.length === 0) return true;
-    return tabs.every(tab => typeof tab.groupId === 'number' && ours.has(tab.groupId));
-  } catch {
-    return false;
-  }
-}
-
-function forgetContainerWindow(role: OwnedWindowRole): void {
-  const container = ownedContainers[role];
-  container.windowId = null;
-  container.groups.clear();
-  container.borrowed = false;
-  container.windowFallbackReason = null;
-}
-
 async function ensureOwnedContainerWindowUnlocked(
   role: OwnedWindowRole,
-  leaseKey: string,
   initialUrl?: string,
   mode: WindowMode = 'background',
 ): Promise<{ windowId: number; initialTabId?: number }> {
   const container = ownedContainers[role];
-  // `isolated` asks for a window of our own. A container currently borrowing the
-  // person's window does not satisfy that, so drop it and fall through to create one.
-  const wantsDedicated = mode === 'isolated';
-  if (wantsDedicated && !(await containerWindowIsDedicated(role))) {
-    forgetContainerWindow(role);
-  }
-  // Where is the person right now? Ask on every non-isolated session, and move
-  // the container if the answer changed. Two different ways this goes wrong
-  // without it, and the role only has one container slot to express both:
-  //
-  //  - a window we borrowed once is not ours to keep coming back to. The person
-  //    moves on, and piling every later session into the window they were in an
-  //    hour ago is the same complaint as opening a new one, just quieter.
-  //  - a dedicated window created for `--window isolated` would otherwise
-  //    capture every later default-mode session too, silently sending work the
-  //    person asked to see into the window they cannot see.
-  //
-  // `findHostWindowForContainer` skips our own container windows, so this only
-  // ever moves toward a real window of theirs. No such window (every window is
-  // ours) leaves the container alone rather than spawning another one.
-  //
-  // This used to be interactive-only; adapter runs got a window of their own by
-  // design. That design is gone: a second Chrome window is the interruption, no
-  // matter which surface opened it.
-  if (!wantsDedicated && container.windowId !== null) {
-    // A borrowed container is one of the person's own windows, so it stays a
-    // legitimate candidate — otherwise we would move away from it every time.
-    // A dedicated one must not be: keeping it eligible is exactly how default
-    // sessions got captured by the isolated window.
-    const current = await findHostWindowForContainer(container.borrowed ? container.windowId : undefined);
-    if (current.windowId !== undefined && current.windowId !== container.windowId) {
-      forgetContainerWindow(role);
-    }
-  }
   if (container.windowId !== null) {
+    const windowId = container.windowId;
     try {
-      await chrome.windows.get(container.windowId);
-      // Pin here too, not just on the create path. Without it, a second
-      // `--window isolated` session takes the reuse branch, convergence adopts
-      // the canonical group wherever it lives — usually the person's window —
-      // and the flag is silently ignored while the first isolated session loses
-      // its container. Reuse is exactly where a dedicated window is easiest to
-      // lose, because nothing is being created to pin.
-      const group = await ensureOwnedContainerGroup(
-        role,
-        leaseKey,
-        container.windowId,
-        [],
-        wantsDedicated ? container.windowId : undefined,
-      );
+      await chrome.windows.get(windowId);
+    } catch (err) {
+      if (!(err instanceof Error) || classifyExtensionError(err.message) !== 'tab_gone') throw err;
+      console.warn(`[opencli] Owned ${role} window ${windowId} is unavailable: ${err instanceof Error ? err.message : String(err)}`);
+      container.windowId = null;
+      container.groupId = null;
+    }
+
+    if (container.windowId === windowId) {
+      const group = await ensureOwnedContainerGroup(role, windowId, []);
       if (group) {
         await focusOwnedWindowIfRequested(group.windowId, mode);
         const initialTabId = await findReusableOwnedContainerTab(group.windowId, group.id);
@@ -1328,42 +1005,21 @@ async function ensureOwnedContainerWindowUnlocked(
           initialTabId,
         };
       }
-      await focusOwnedWindowIfRequested(container.windowId, mode);
-      const initialTabId = await findReusableOwnedContainerTab(container.windowId, null);
-      const createdGroup = await ensureOwnedContainerGroup(
-        role,
-        leaseKey,
-        container.windowId,
-        [initialTabId],
-        wantsDedicated ? container.windowId : undefined,
-      );
-      if (createdGroup) {
+      if (role === 'interactive') {
+        container.windowId = null;
+        container.groupId = null;
+      } else {
+        await focusOwnedWindowIfRequested(windowId, mode);
+        const initialTabId = await findReusableOwnedContainerTab(windowId, null);
         return {
-          windowId: createdGroup.windowId,
+          windowId,
           initialTabId,
         };
       }
-      return {
-        windowId: container.windowId,
-        initialTabId,
-      };
-    } catch {
-      forgetContainerWindow(role);
     }
   }
 
-  // Adopting a stray group would land us right back in whatever window it lives in,
-  // which is the thing `isolated` exists to avoid.
-  // Decide the destination BEFORE adopting a group. Group convergence walks to
-  // the canonical group wherever it lives, so adopting first quietly overrides
-  // everything decided above — that is how the third variant of this bug worked:
-  // the container was correctly moved off the isolated window, and then the
-  // group sitting in that window pulled it straight back.
-  const host = wantsDedicated ? { windowId: undefined, reason: undefined } : await findHostWindowForContainer();
-  const hostWindowId = host.windowId;
-  const existingGroup = wantsDedicated
-    ? null
-    : await ensureOwnedContainerGroup(role, leaseKey, null, [], hostWindowId);
+  const existingGroup = await ensureOwnedContainerGroup(role, null, []);
   if (existingGroup) {
     await focusOwnedWindowIfRequested(existingGroup.windowId, mode);
     const initialTabId = await findReusableOwnedContainerTab(existingGroup.windowId, existingGroup.id);
@@ -1376,51 +1032,26 @@ async function ensureOwnedContainerWindowUnlocked(
 
   const startUrl = (initialUrl && isSafeNavigationUrl(initialUrl)) ? initialUrl : BLANK_PAGE;
 
-  // hostWindowId was resolved above, before group adoption could override it.
-  let initialTabId: number | undefined;
+  // Note: Do NOT set `state` parameter here. Chrome 146+ rejects 'normal' as an invalid
+  // state value for windows.create(). The window defaults to 'normal' state anyway.
+  const win = await chrome.windows.create({
+    url: startUrl,
+    focused: mode === 'foreground',
+    width: 1280,
+    height: 900,
+    type: 'normal',
+  });
+  container.windowId = win.id!;
+  // Persist windowId before any further awaits so a worker crash between
+  // `windows.create` returning and the subsequent `tabs.group` call still
+  // lets the next ensure cycle reuse this window instead of spawning a
+  // second owned window in `chrome.windows.create`.
+  await persistRuntimeState();
+  console.log(`[opencli] Created owned ${role} window ${container.windowId} (start=${startUrl})`);
 
-  if (hostWindowId !== undefined) {
-    const hostTab = await chrome.tabs.create({
-      windowId: hostWindowId,
-      url: startUrl,
-      active: wantsActiveTab(mode),
-    });
-    container.windowId = hostWindowId;
-    container.borrowed = true;
-    container.windowFallbackReason = null;
-    initialTabId = hostTab.id;
-    await persistRuntimeState();
-    console.log(`[opencli] Using existing window ${hostWindowId} for ${role} container (start=${startUrl})`);
-    await focusOwnedWindowIfRequested(hostWindowId, mode);
-  } else {
-    // Note: Do NOT set `state` parameter here. Chrome 146+ rejects 'normal' as an invalid
-    // state value for windows.create(). The window defaults to 'normal' state anyway.
-    const win = await chrome.windows.create({
-      url: startUrl,
-      focused: mode === 'foreground',
-      width: 1280,
-      height: 900,
-      type: 'normal',
-    });
-    container.windowId = win.id!;
-    container.borrowed = false;
-    // Remember WHY a window was created rather than borrowed. `isolated` is the
-    // person's own choice and needs no explanation; every other path here is a
-    // fallback they will want to see the reason for in `sessions`.
-    container.windowFallbackReason = wantsDedicated ? null : (host.reason ?? 'no-normal-window');
-    // Persist windowId before any further awaits so a worker crash between
-    // `windows.create` returning and the subsequent `tabs.group` call still
-    // lets the next ensure cycle reuse this window instead of spawning a
-    // second owned window in `chrome.windows.create`.
-    await persistRuntimeState();
-    console.log(`[opencli] Created owned ${role} window ${container.windowId} (start=${startUrl}${container.windowFallbackReason ? `, reason=${container.windowFallbackReason}` : ''})`);
-
-    // Wait for the initial tab to finish loading instead of a fixed 200ms sleep.
-    const winTabs = await chrome.tabs.query({ windowId: win.id! });
-    initialTabId = winTabs[0]?.id;
-  }
-
-  const tabs = initialTabId !== undefined ? [await chrome.tabs.get(initialTabId).catch(() => undefined)].filter(Boolean) as chrome.tabs.Tab[] : [];
+  // Wait for the initial tab to finish loading instead of a fixed 200ms sleep.
+  const tabs = await chrome.tabs.query({ windowId: win.id! });
+  const initialTabId = tabs[0]?.id;
   if (initialTabId) {
     await new Promise<void>((resolve) => {
       const timeout = setTimeout(resolve, 500); // fallback cap
@@ -1432,7 +1063,7 @@ async function ensureOwnedContainerWindowUnlocked(
         }
       };
       // Check if already complete before listening
-      if (tabs[0]?.status === 'complete') {
+      if (tabs[0].status === 'complete') {
         clearTimeout(timeout);
         resolve();
       } else {
@@ -1440,132 +1071,27 @@ async function ensureOwnedContainerWindowUnlocked(
       }
     });
   }
-  // Always pin: by this point the window is decided — created, or borrowed from
-  // the person — and convergence must not relocate the tab we just put there.
-  // Pinning only for `isolated` was not enough: a default-mode session created
-  // its tab in the right window and then got dragged into whichever window held
-  // the canonical group, which after any isolated run was the dedicated one.
-  const group = await ensureOwnedContainerGroup(
-    role,
-    leaseKey,
-    container.windowId,
-    [initialTabId],
-    container.windowId ?? undefined,
-  );
+  const group = await ensureOwnedContainerGroup(role, container.windowId, [initialTabId]);
   await persistRuntimeState();
   return { windowId: group?.windowId ?? container.windowId, initialTabId };
 }
 
-type HostWindowLookup = { windowId?: number; reason?: WindowFallbackReason };
-
-/**
- * Pick the window the person is already working in, so automation opens a tab
- * there instead of spawning a second Chrome window.
- *
- * Both surfaces borrow. The person asked for this, they are looking at Chrome
- * right now, and a brand-new 1280x900 window landing on top of their layout is
- * a worse interruption than the tab itself — for an adapter run just as much as
- * for a `browser` command. Every session's tabs are grouped and labelled with
- * the session name, so they stay identifiable inside the shared window.
- *
- * Excludes windows we created ourselves (a dedicated container is never a host) and incognito
- * windows (different context; the session cookies would not be the user's).
- * Returns no `windowId` when there is no usable window, with a `reason` the
- * caller records so `sessions` can explain the window it then creates.
- */
-async function findHostWindowForContainer(excludeWindowId?: number): Promise<HostWindowLookup> {
-  const usable = (win: chrome.windows.Window | undefined): win is chrome.windows.Window =>
-    win !== undefined && win.id !== undefined && win.type === 'normal' && !win.incognito;
-  // Only windows we CREATED are off limits. A window a container is borrowing is
-  // one of the person's, and the other role is as welcome in it as the first.
-  const owned = new Set(
-    Object.values(ownedContainers)
-      .filter(container => !container.borrowed)
-      .map(container => container.windowId)
-      .filter((id): id is number => id !== null && id !== excludeWindowId),
-  );
-  // Dedicated windows are never a host, whatever the caller excludes.
-  for (const id of dedicatedWindowIds()) owned.add(id);
-  const eligible = (win: chrome.windows.Window) => usable(win) && !owned.has(win.id!);
-
-  // `getLastFocused` is the right question: "which window was the person last in".
-  // `getAll().find(w => w.focused)` is NOT — `focused` is false for every window
-  // whenever Chrome itself is not the frontmost app, which is the normal state while
-  // an agent drives it from a terminal. That fallback then picked an arbitrary window
-  // (last in the list), which is how automation kept landing somewhere the person
-  // was not looking.
-  try {
-    const lastFocused = await chrome.windows.getLastFocused({ windowTypes: ['normal'] });
-    if (eligible(lastFocused)) return { windowId: lastFocused.id };
-  } catch { /* fall through to the full scan */ }
-
-  let reason: WindowFallbackReason;
-  try {
-    const windows = await chrome.windows.getAll({ windowTypes: ['normal'] });
-    const normal = windows.filter(win => win !== undefined && win.id !== undefined && win.type === 'normal');
-    const notIncognito = normal.filter(win => !win.incognito);
-    const candidates = notIncognito.filter(eligible);
-    if (candidates.length > 0) {
-      return { windowId: (candidates.find(win => win.focused) ?? candidates[candidates.length - 1])!.id };
-    }
-    reason = normal.length === 0 ? 'no-normal-window'
-      : notIncognito.length === 0 ? 'all-incognito'
-      : 'all-owned';
-  } catch {
-    reason = 'query-failed';
-  }
-
-  // Nothing of the person's to borrow. A window we created only because they
-  // had none open is a stand-in for theirs, so the other role shares it rather
-  // than opening a second stand-in. A window created for `--window isolated`
-  // carries no reason and is never shared this way — the person asked for that
-  // one to stay apart.
-  for (const container of Object.values(ownedContainers)) {
-    if (container.windowId === null || container.windowId === excludeWindowId) continue;
-    if (container.borrowed || container.windowFallbackReason === null) continue;
-    if (isDedicatedWindow(container.windowId)) continue;
-    try {
-      const win = await chrome.windows.get(container.windowId);
-      if (win && !win.incognito) return { windowId: container.windowId };
-    } catch {
-      // Gone; the caller will create a fresh one.
-    }
-  }
-  return { reason };
-}
-
 async function findReusableOwnedContainerTab(windowId: number, ownedGroupId?: number | null): Promise<number | undefined> {
-  try {
-    const tabs = await chrome.tabs.query({ windowId });
-    // When a canonical owned group lives in a user window (cross-window
-    // convergence can land it there), an http(s) tab outside the group is
-    // user content and must not be reused. Group members and non-http tabs
-    // (about:blank / data: / fresh container) stay eligible. A null group id
-    // means no ownership signal exists, so only non-http placeholders qualify —
-    // and only ones sitting in a group of ours or in no group at all: a blank
-    // tab inside a group the person built is theirs, however blank it is.
-    // In a window we merely borrowed there is nothing of ours to recycle (we
-    // close placeholders there on release), so an ungrouped blank tab is the
-    // person's and stays untouched.
-    const borrowedWindow = Object.values(ownedContainers).some(c => c.windowId === windowId && c.borrowed);
-    const inOurGroup = (tab: chrome.tabs.Tab): boolean =>
-      typeof tab.groupId === 'number' && tab.groupId !== chrome.tabGroups.TAB_GROUP_ID_NONE && ownedGroupLedger.has(tab.groupId);
-    const ungrouped = (tab: chrome.tabs.Tab): boolean =>
-      typeof tab.groupId !== 'number' || tab.groupId === chrome.tabGroups.TAB_GROUP_ID_NONE;
-    const reusable = tabs.find(tab =>
-      tab.id !== undefined &&
-      initialTabIsAvailable(tab.id) &&
-      isDebuggableUrl(tab.url) &&
-      (
-        ownedGroupId === undefined ||
-        (ownedGroupId !== null && tab.groupId === ownedGroupId) ||
-        (!isSafeNavigationUrl(tab.url ?? '') && (inOurGroup(tab) || (ungrouped(tab) && !borrowedWindow)))
-      ),
-    );
-    return reusable?.id;
-  } catch {
-    return undefined;
-  }
+  const idleUrl = await idlePlaceholderUrl();
+  const tabs = await chrome.tabs.query({ windowId });
+  // Group members and non-http placeholders stay eligible. Without a group
+  // signal, only non-http placeholders can be reused.
+  const reusable = tabs.find(tab =>
+    tab.id !== undefined &&
+    initialTabIsAvailable(tab.id) &&
+    (isDebuggableUrl(tab.url) || (idleUrl !== null && tab.url === idleUrl && !tab.pendingUrl)) &&
+    (
+      ownedGroupId === undefined ||
+      (ownedGroupId !== null && tab.groupId === ownedGroupId) ||
+      !isSafeNavigationUrl(tab.url ?? '')
+    ),
+  );
+  return reusable?.id;
 }
 
 function initialTabIsAvailable(tabId: number | undefined): tabId is number {
@@ -1576,1539 +1102,52 @@ function initialTabIsAvailable(tabId: number | undefined): tabId is number {
   return true;
 }
 
-// ─── Dedicated automation windows (`--window dedicated`) ────────────────
-//
-// "I use my windows, OpenCLI uses its own." A dedicated window is a normal
-// window of the person's own Chrome profile (same cookies, same logins — never a
-// separate profile or instance) that OpenCLI creates unfocused, optionally places
-// on a given display, and keeps to itself:
-//
-//  - Lifecycle. One window per *slot* (default slot `default`). Created on the
-//    first dedicated command, recreated on demand after it is closed, kept alive
-//    between runs by a placeholder tab when its last lease is released. The id
-//    lives in chrome.storage.session for the same reason the lease registry does:
-//    window ids die with the browser session, and a recycled id must never make a
-//    window of the person's look like ours.
-//  - Placement. Explicit bounds, else a display-name pattern resolved through
-//    chrome.system.display (same coordinate space as chrome.windows), else Chrome's
-//    default. Detection lives here rather than in callers: the extension is the one
-//    party that sees displays and windows in one coordinate system, and every
-//    caller (CLI, scripts) gets it for free. Moving a window never passes `focused`.
-//  - Ownership is decided by what OpenCLI itself recorded (lease tabs, placeholders,
-//    our tab groups, tabs opened by our tabs) — never by "does the window contain
-//    anything foreign". A foreign tab therefore cannot demote the window to
-//    "borrowed"; it is moved back to the person's last-focused normal window
-//    (policy `evict`, the default) or left alone and ignored (`tolerate`).
-//    Evicting is the quieter choice: the window is meant to be out of sight, so a
-//    tab that landed there (a link opened from another app while it was last
-//    focused, Cmd+T, a drag) is lost to the person, and as the active tab it would
-//    also hide the automation tab. A lease tab the person drags OUT becomes theirs.
-//  - Visibility. Only a window's active tab is visible, so before every
-//    page-scoped command the session's tab is made the active tab of its dedicated
-//    window (`autoSelect`, default on; `tabs.update({active})` never focuses the
-//    window). Sessions that need visibility at the same time use different slots —
-//    one window each, tiled on the display — instead of queueing for one window: a
-//    cross-process visibility lock would need holders, TTLs and stale-holder
-//    recovery, and that is exactly the class of bug this code base keeps paying for.
-
-type Rect = { left: number; top: number; width: number; height: number };
-type ForeignTabPolicy = 'evict' | 'tolerate';
-type DedicatedPlacement = {
-  /** `auto` = chosen here (automation display + fixed tile), the default since the pool landed. */
-  source: 'bounds' | 'display' | 'auto' | 'none';
-  requestedBounds: Rect | null;
-  displayPattern: string | null;
-  displayName: string | null;
-  displayFound: boolean | null;
-  cell: number | null;
-  excludedDisplayBounds?: Rect | null;
-  /** Diagnostic/warning deduplication only; never used to size automatic tiles. */
-  relocatedFrom?: Rect;
-};
-type DedicatedEnsureResult = { windowId: number; initialTabId?: number; created: boolean; moved: boolean };
-type DedicatedSlotState = {
-  slot: string;
-  /** Allocated from the pool (name generated here) rather than pinned by a caller. */
-  pooled: boolean;
-  windowId: number | null;
-  placeholderTabIds: Set<number>;
-  placement: DedicatedPlacement;
-  half: boolean;
-  fullBounds: Rect | null;
-  autoSelect: boolean;
-  foreignTabPolicy: ForeignTabPolicy;
-  evictedTabs: number;
-  promise: Promise<DedicatedEnsureResult> | null;
-  /** Lease keys currently holding this window. Empty = idle = reusable and reapable. */
-  holders: Set<string>;
-  /** When the last holder left. null while held. */
-  idleSince: number | null;
-  /** Tile index on the automation display; local index within displayId. */
-  tileIndex: number | null;
-  displayId: string | null;
-  reconciledAt?: number;
-};
-type DisplayInfo = { id: string; name: string; primary: boolean; internal: boolean; bounds: Rect; workArea: Rect | null };
-type DedicatedTabOwner = 'lease' | 'placeholder' | 'automation' | 'foreign';
-type DedicatedPlacementRequest = { half?: boolean; bounds?: Rect; display?: string; avoidDisplayBounds?: Rect };
-let dedicatedAvoidDisplayBounds: Rect | undefined;
-
-const DEDICATED_SLOT_PATTERN = /^[A-Za-z0-9_.-]{1,40}$/;
-// Placeholder URL carries the slot, so a window orphaned by an extension reload (which
-// clears chrome.storage.session) can be recognised and adopted instead of duplicated.
-const DEDICATED_PLACEHOLDER_PREFIX = 'about:blank#opencli-dedicated=';
-function dedicatedPlaceholderUrl(slot: string): string {
-  return `${DEDICATED_PLACEHOLDER_PREFIX}${slot}`;
-}
-const DEDICATED_CELL = { width: 1280, height: 900, offsetX: 80, offsetY: 60 };
-/** Tile a window gets when there is room: the size every scraper's DOM was calibrated against. */
-const DEDICATED_PREFERRED_TILE = { width: 1280, height: 900 };
-/**
- * Smallest tile we will hand out. Below this a report page reflows into its narrow
- * layout and the captured DOM stops being comparable with a single-window run, so
- * additional windows cascade instead of shrinking the fixed grid.
- */
-const DEDICATED_MIN_TILE = { width: 900, height: 620 };
-const DEDICATED_MAX_TILE = { width: 1600, height: 1100 };
-const DEDICATED_POOL_MIN = 4;
-/** Pooled window names. `pool-1`, `pool-2`, … — never a caller's session name. */
-const DEDICATED_POOL_PREFIX = 'pool-';
-/** Idle windows live for 15 seconds; OPENCLI_DEDICATED_IDLE_MS overrides it. */
-const DEDICATED_IDLE_TTL_DEFAULT_MS = 15_000;
-const DEDICATED_REAP_ALARM = 'opencli-dedicated-reap';
-let dedicatedIdleTtlMs = DEDICATED_IDLE_TTL_DEFAULT_MS;
-const DEDICATED_CAPABILITIES = [
-  'dedicated-window', 'window-slots', 'window-bounds', 'window-display', 'auto-select', 'foreign-tab-policy',
-  'window-pool', 'window-close', 'window-list', 'idle-reap', 'auto-display', 'dynamic-layout', 'fixed-layout', 'window-relayout',
-] as const;
-
-function emptyDedicatedPlacement(): DedicatedPlacement {
-  return { source: 'none', requestedBounds: null, displayPattern: null, displayName: null, displayFound: null, cell: null };
-}
-
-function normalizeDedicatedSlot(raw: unknown): string {
-  return typeof raw === 'string' && DEDICATED_SLOT_PATTERN.test(raw) ? raw : DEFAULT_DEDICATED_SLOT;
-}
-
-function isRect(value: unknown): value is Rect {
-  if (!value || typeof value !== 'object') return false;
-  const r = value as Record<string, unknown>;
-  const finite = (k: string) => typeof r[k] === 'number' && Number.isFinite(r[k] as number);
-  return finite('left') && finite('top') && finite('width') && finite('height')
-    && (r.width as number) > 0 && (r.height as number) > 0;
-}
-
-function normalizeRect(r: Rect): Rect {
-  return { left: Math.round(r.left), top: Math.round(r.top), width: Math.round(r.width), height: Math.round(r.height) };
-}
-
-function rectFromUnknown(value: unknown): Rect {
-  const r = (value && typeof value === 'object' ? value : {}) as Record<string, unknown>;
-  const n = (k: string) => (typeof r[k] === 'number' && Number.isFinite(r[k] as number) ? r[k] as number : 0);
-  return { left: n('left'), top: n('top'), width: n('width'), height: n('height') };
-}
-
-function rectFromWindow(win: chrome.windows.Window | null | undefined): Rect | null {
-  if (!win) return null;
-  const { left, top, width, height } = win;
-  if ([left, top, width, height].some(v => typeof v !== 'number')) return null;
-  return { left: left!, top: top!, width: width!, height: height! };
-}
-
-function rectsOverlap(rect: Rect, area: Rect): boolean {
-  return Math.max(rect.left, area.left) < Math.min(rect.left + rect.width, area.left + area.width)
-    && Math.max(rect.top, area.top) < Math.min(rect.top + rect.height, area.top + area.height);
-}
-
-function rectCenterInside(rect: Rect, area: Rect): boolean {
-  const cx = rect.left + rect.width / 2;
-  const cy = rect.top + rect.height / 2;
-  return cx >= area.left && cx < area.left + area.width && cy >= area.top && cy < area.top + area.height;
-}
-
-/** `/re/flags` → RegExp; anything else → case-insensitive substring. Same grammar the backlink scripts use. */
-function compileDisplayMatcher(pattern: string | null | undefined): RegExp | null {
-  const raw = typeof pattern === 'string' ? pattern.trim() : '';
-  if (!raw) return null;
-  const re = /^\/(.+)\/([a-z]*)$/i.exec(raw);
-  if (re) {
-    try {
-      return new RegExp(re[1], re[2].replace(/[gy]/g, ''));
-    } catch {
-      // A malformed regex is treated as a literal substring below.
-    }
-  }
-  return new RegExp(raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-}
-
-/**
- * Matching non-primary display (the virtual screen, not the one the person looks at).
- * The primary display is used only when it is the ONLY display — e.g. the physical
- * screen went to sleep and the virtual one inherited the global origin — never while a
- * second display exists, however well its name matches.
- */
-function pickDisplay(displays: DisplayInfo[] | null, pattern: string | null): DisplayInfo | null {
-  const matcher = compileDisplayMatcher(pattern);
-  if (!matcher || !displays) return null;
-  const usable = (d: DisplayInfo) => d.bounds.width > 0 && d.bounds.height > 0 && matcher.test(d.name);
-  const secondary = displays.find(d => !d.primary && usable(d));
-  if (secondary) return secondary;
-  return displays.length === 1 && usable(displays[0]) ? displays[0] : null;
-}
-
-/** Resolution alone determines the grid. Count is retained for existing callers. */
-function dedicatedGrid(area: Rect, _count?: number): { cols: number; rows: number; width: number; height: number } {
-  const divisions = (length: number, preferred: number, min: number, max: number): number => {
-    const upper = Math.max(1, Math.floor(length / min));
-    const lower = Math.max(1, Math.ceil(length / max));
-    // Some resolutions cannot satisfy both bounds with equal tiles (e.g. 1700px).
-    // Keep the minimum and full coverage in that case; the maximum is a preference.
-    return Math.min(upper, Math.max(lower, Math.round(length / preferred)));
-  };
-  const cols = divisions(area.width, DEDICATED_PREFERRED_TILE.width, DEDICATED_MIN_TILE.width, DEDICATED_MAX_TILE.width);
-  const rows = divisions(area.height, DEDICATED_PREFERRED_TILE.height, DEDICATED_MIN_TILE.height, DEDICATED_MAX_TILE.height);
-  return { cols, rows, width: Math.floor(area.width / cols), height: Math.floor(area.height / rows) };
-}
-
-function dedicatedCapacity(area: Rect): number {
-  const { cols, rows } = dedicatedGrid(area);
-  return cols * rows;
-}
-
-function dedicatedCellGrid(display: Rect): { width: number; height: number; cols: number; rows: number; offsetX: number; offsetY: number } {
-  const width = Math.max(1, Math.min(DEDICATED_CELL.width, display.width));
-  const height = Math.max(1, Math.min(DEDICATED_CELL.height, display.height));
-  const cols = Math.max(1, Math.floor(display.width / width));
-  const rows = Math.max(1, Math.floor(display.height / height));
-  const offsetX = Math.max(0, Math.min(DEDICATED_CELL.offsetX, Math.floor((display.width - cols * width) / cols)));
-  const offsetY = Math.max(0, Math.min(DEDICATED_CELL.offsetY, Math.floor((display.height - rows * height) / rows)));
-  return { width, height, cols, rows, offsetX, offsetY };
-}
-
-/** Fixed row-major tiles; only overflow cascades. Remainder pixels go to edge cells. */
-function dedicatedTile(area: Rect, index: number, _count?: number): Rect {
-  const grid = dedicatedGrid(area);
-  const capacity = grid.cols * grid.rows;
-  if (index >= capacity) {
-    const step = index - capacity + 1;
-    return {
-      left: area.left + (step * DEDICATED_CELL.offsetX) % (area.width - grid.width + 1),
-      top: area.top + (step * DEDICATED_CELL.offsetY) % (area.height - grid.height + 1),
-      width: grid.width,
-      height: grid.height,
-    };
-  }
-  const i = ((Math.trunc(index) % capacity) + capacity) % capacity;
-  const col = i % grid.cols;
-  const row = Math.floor(i / grid.cols);
-  return {
-    left: area.left + col * grid.width,
-    top: area.top + row * grid.height,
-    width: col === grid.cols - 1 ? area.width - col * grid.width : grid.width,
-    height: row === grid.rows - 1 ? area.height - row * grid.height : grid.height,
-  };
-}
-
-function sameDisplayBounds(a: Rect, b: Rect): boolean {
-  return a.left === b.left && a.top === b.top && a.width === b.width && a.height === b.height;
-}
-
-function excludedDisplayBounds(displays: DisplayInfo[] | null): Rect | null {
-  const excluded = displays?.find(d => dedicatedAvoidDisplayBounds && sameDisplayBounds(d.bounds, dedicatedAvoidDisplayBounds));
-  return excluded && pickAutomationDisplays(displays, dedicatedAvoidDisplayBounds).every(d => d.id !== excluded.id) ? excluded.bounds : null;
-}
-
-/** Stable automation set: secondary screens only, primary as the sole fallback. */
-function pickAutomationDisplays(displays: DisplayInfo[] | null, _avoidDisplayBounds?: Rect): DisplayInfo[] {
-  const usable = (displays ?? []).filter(d => d.bounds.width > 0 && d.bounds.height > 0)
-    .sort((a, b) => Number(a.internal) - Number(b.internal) || a.id.localeCompare(b.id, undefined, { numeric: true }));
-  const secondary = usable.filter(d => !d.primary);
-  return secondary.length ? secondary : usable.slice(0, 1);
-}
-
-function pickAutomationDisplay(displays: DisplayInfo[] | null): DisplayInfo | null {
-  return pickAutomationDisplays(displays)[0] ?? null;
-}
-
-function displayArea(display: DisplayInfo): Rect {
-  return display.workArea && display.workArea.width > 0 && display.workArea.height > 0 ? display.workArea : display.bounds;
-}
-
-/** Slots with a live window, in allocation order. */
-function liveDedicatedStates(): DedicatedSlotState[] {
-  return [...dedicatedSlots.values()]
-    .filter(state => state.windowId !== null)
-    .sort((a, b) => (a.tileIndex ?? 0) - (b.tileIndex ?? 0) || a.slot.localeCompare(b.slot));
-}
-
-/** Reserve a local cell. Mouse preference applies only to a new assignment. */
-function claimTileIndex(state: DedicatedSlotState, displays: DisplayInfo[], avoid?: Rect): DisplayInfo {
-  const taken = (display: DisplayInfo) => new Set([...dedicatedSlots.values()]
-    .filter(s => s !== state && s.placement.source === 'auto' && s.displayId === display.id && s.windowId !== null)
-    .map(s => s.tileIndex));
-  const existing = displays.find(d => d.id === state.displayId);
-  if (existing && state.tileIndex !== null && state.tileIndex >= 0
-    && state.tileIndex < dedicatedCapacity(displayArea(existing)) && !taken(existing).has(state.tileIndex)) return existing;
-  // Old registries had no displayId. Adopt the remembered screen rather than
-  // moving all legacy windows to the first display during the initial upgrade.
-  if (state.displayId === null && state.windowId !== null && state.placement.requestedBounds) {
-    const bounds = state.placement.requestedBounds;
-    const display = displays.find(d => rectCenterInside(bounds, displayArea(d)));
-    if (display) {
-      const area = displayArea(display);
-      const grid = dedicatedGrid(area);
-      const col = Math.max(0, Math.min(grid.cols - 1, Math.round((bounds.left - area.left) / grid.width)));
-      const row = Math.max(0, Math.min(grid.rows - 1, Math.round((bounds.top - area.top) / grid.height)));
-      const index = row * grid.cols + col;
-      if (!taken(display).has(index)) {
-        state.displayId = display.id;
-        state.tileIndex = index;
-        return display;
-      }
-      // A conflicting legacy cell uses the normal allocator across all screens.
-      // Never cascade on the remembered screen while another grid has space.
-    }
-  }
-  const candidates = avoid
-    ? [...displays.filter(d => !sameDisplayBounds(d.bounds, avoid)), ...displays.filter(d => sameDisplayBounds(d.bounds, avoid))]
-    : displays;
-  for (const display of candidates) {
-    const used = taken(display);
-    for (let i = 0; i < dedicatedCapacity(displayArea(display)); i += 1) {
-      if (used.has(i)) continue;
-      state.displayId = display.id;
-      state.tileIndex = i;
-      return display;
-    }
-  }
-  const display = displays[displays.length - 1];
-  const used = taken(display);
-  let index = dedicatedCapacity(displayArea(display));
-  while (used.has(index)) index += 1;
-  state.displayId = display.id;
-  state.tileIndex = index;
-  return display;
-}
-
-type DedicatedRelayoutEntry = {
-  slot: string; windowId: number; displayId: string | null; tileIndex: number | null;
-  old: { bounds: Rect | null; state: string | null };
-  new: { bounds: Rect | null; state: string | null };
-  changed: boolean; error?: string;
-};
-
-/** Runs inside the same queue as creation. Existing screen assignments never use avoid. */
-async function retileDedicatedWindows(displays: DisplayInfo[] | null): Promise<DedicatedRelayoutEntry[]> {
-  const automationDisplays = pickAutomationDisplays(displays);
-  const entries: DedicatedRelayoutEntry[] = [];
-  if (!automationDisplays.length) return entries;
-  let dirty = false;
-  for (const state of liveDedicatedStates().filter(s => s.placement.source === 'auto')) {
-    const windowId = state.windowId!;
-    let win: chrome.windows.Window;
-    try {
-      win = await chrome.windows.get(windowId);
-    } catch {
-      forgetDedicatedWindow(state);
-      dirty = true;
-      continue;
-    }
-    const old = { bounds: rectFromWindow(win), state: win.state ?? null };
-    const display = claimTileIndex(state, automationDisplays);
-    const fullBounds = dedicatedTile(displayArea(display), state.tileIndex!);
-    const target = state.half ? { ...fullBounds, width: Math.floor(fullBounds.width / 2) } : fullBounds;
-    const placementChanged = !state.fullBounds || !sameDisplayBounds(state.fullBounds, fullBounds)
-      || state.placement.displayName !== display.name || state.placement.cell !== state.tileIndex;
-    state.fullBounds = fullBounds;
-    state.placement.requestedBounds = fullBounds;
-    state.placement.cell = state.tileIndex;
-    state.placement.displayName = display.name;
-    state.placement.displayFound = true;
-    const entry: DedicatedRelayoutEntry = { slot: state.slot, windowId, displayId: state.displayId, tileIndex: state.tileIndex, old, new: old, changed: false };
-    try {
-      if (win.state !== undefined && win.state !== 'normal') {
-        win = await chrome.windows.update(windowId, { state: 'normal' });
-        entry.changed = true;
-      }
-      const bounds = rectFromWindow(win);
-      if (!bounds || !sameDisplayBounds(bounds, target)) {
-        win = await chrome.windows.update(windowId, target);
-        entry.changed = true;
-      }
-      entry.new = { bounds: rectFromWindow(win), state: win.state ?? null };
-      if (entry.changed || placementChanged || state.reconciledAt === undefined) {
-        state.reconciledAt = Date.now();
-        dirty = true;
-      }
-    } catch (err) {
-      entry.new = { bounds: rectFromWindow(win), state: win.state ?? null };
-      entry.error = err instanceof Error ? err.message : String(err);
-      dirty = true;
-    }
-    entries.push(entry);
-  }
-  if (dirty) await persistDedicatedState();
-  return entries;
-}
-
-function reconcileDedicatedWindows(): Promise<DedicatedRelayoutEntry[]> {
-  const next = dedicatedEnsureQueue.catch(() => null).then(async () => {
-    if (!liveDedicatedStates().some(s => s.placement.source === 'auto')) return [];
-    const { displays } = await listDisplays();
-    return retileDedicatedWindows(displays);
-  });
-  dedicatedEnsureQueue = next.catch(() => null);
-  return next;
-}
-
-/** Enforce the pool limit; windows beyond natural capacity are cascaded. */
-async function assertDedicatedCapacity(state: DedicatedSlotState): Promise<void> {
-  if (state.windowId !== null) return;
-  const { displays } = await listDisplays();
-  const automationDisplays = pickAutomationDisplays(displays, dedicatedAvoidDisplayBounds);
-  const display = automationDisplays[0];
-  const naturalCapacity = automationDisplays.length ? automationDisplays.reduce((sum, d) => sum + dedicatedCapacity(displayArea(d)), 0) : null;
-  const capacity = Math.max(DEDICATED_POOL_MIN, naturalCapacity ?? DEDICATED_POOL_MIN);
-  let live = liveDedicatedStates().length;
-  if (live >= capacity) {
-    const idle = liveDedicatedStates()
-      .filter(candidate => candidate.holders.size === 0 && candidate.idleSince !== null)
-      .sort((a, b) => a.idleSince! - b.idleSince!);
-    for (const candidate of idle) {
-      await closeDedicatedWindows({ slot: candidate.slot });
-      live = liveDedicatedStates().length;
-      if (live < capacity) break;
-    }
-  }
-  if (live >= capacity) {
-    throw new Error(`dedicated-pool-exhausted: ${live} automation window(s) already fill ${display?.name || 'the automation display'} `
-      + `(capacity ${capacity}). Windows beyond naturalCapacity ${naturalCapacity ?? 'unknown'} are cascaded. `
-      + 'Wait for a running task to finish, or close one with `opencli browser <session> window close --slot <name>`.');
-  }
-}
-
-/**
- * Close idle automation windows. Nobody should have to tidy up after OpenCLI: a window
- * whose last lease ended more than the idle TTL ago is closed here, and the pooled slot
- * that owned it disappears with it. The next command creates a fresh one.
- */
-async function reapIdleDedicatedWindows(now = Date.now(), target?: DedicatedSlotState): Promise<number> {
-  let closed = 0;
-  // Holders are lease keys; a key with no live lease behind it can only be a leak
-  // (a crashed command, a lease dropped through a path that did not pass here).
-  // Reconcile before deciding what is idle, or one leak would pin a window forever.
-  const states = [...dedicatedSlots.values()].filter(state => !target || state === target);
-  for (const state of states) {
-    for (const leaseKey of [...state.holders]) {
-      // A window/tab creation holds its slot before the lease is registered.
-      if (!automationSessions.has(leaseKey) && state.promise === null && dedicatedTabCreatesInFlight === 0) state.holders.delete(leaseKey);
-    }
-    if (state.holders.size === 0 && state.idleSince === null) state.idleSince = now;
-  }
-  for (const state of states) {
-    if (state.holders.size > 0 || state.idleSince === null) continue;
-    if (now - state.idleSince < dedicatedIdleTtlMs) continue;
-    if (state.windowId !== null) {
-      const windowId = state.windowId;
-      try {
-        await chrome.windows.remove(windowId);
-        closed += 1;
-        console.log(`[opencli] Closed idle dedicated window ${windowId} (slot=${state.slot}, idle ${Math.round((now - state.idleSince) / 1000)}s)`);
-      } catch {
-        // Already gone; fall through and forget it either way.
-      }
-      forgetDedicatedWindow(state);
-    }
-    state.tileIndex = null;
-    if (state.pooled) dedicatedSlots.delete(state.slot);
-  }
-  if (closed) {
-    await persistDedicatedState();
-  }
-  return closed;
-}
-
-function computeDisplayCell(display: Rect, cell: number): Rect {
-  const g = dedicatedCellGrid(display);
-  const capacity = g.cols * g.rows;
-  const index = ((Math.trunc(cell) % capacity) + capacity) % capacity;
-  const col = index % g.cols;
-  const row = Math.floor(index / g.cols);
-  return {
-    left: display.left + g.offsetX + col * (g.width + g.offsetX),
-    top: display.top + g.offsetY + row * (g.height + g.offsetY),
-    width: g.width,
-    height: g.height,
-  };
-}
-
-async function listDisplays(): Promise<{ displays: DisplayInfo[] | null; error?: string }> {
-  const api = (chrome as unknown as { system?: { display?: { getInfo?: (callback: (info: unknown[]) => void) => unknown } } }).system?.display;
-  if (typeof api?.getInfo !== 'function') {
-    return { displays: null, error: 'chrome.system.display is unavailable (extension lacks the "system.display" permission; reload it)' };
-  }
-  try {
-    const raw = await new Promise<unknown[]>((resolve, reject) => {
-      try {
-        const maybe = api.getInfo!((info) => {
-          const lastError = (chrome as unknown as { runtime?: { lastError?: { message?: string } } }).runtime?.lastError;
-          if (lastError) reject(new Error(lastError.message ?? 'system.display.getInfo failed'));
-          else resolve(info);
-        });
-        if (maybe && typeof (maybe as Promise<unknown[]>).then === 'function') (maybe as Promise<unknown[]>).then(resolve, reject);
-      } catch (err) {
-        reject(err);
-      }
-    });
-    const displays = (Array.isArray(raw) ? raw : []).map((entry): DisplayInfo => {
-      const d = (entry && typeof entry === 'object' ? entry : {}) as Record<string, unknown>;
-      return {
-        id: String(d.id ?? ''),
-        name: String(d.name ?? ''),
-        primary: d.isPrimary === true,
-        internal: d.isInternal === true,
-        bounds: rectFromUnknown(d.bounds),
-        workArea: d.workArea ? rectFromUnknown(d.workArea) : null,
-      };
-    });
-    return { displays };
-  } catch (err) {
-    return { displays: null, error: err instanceof Error ? err.message : String(err) };
-  }
-}
-
-function getDedicatedSlot(slot: string, pooled = false): DedicatedSlotState {
-  let state = dedicatedSlots.get(slot);
-  if (!state) {
-    state = {
-      slot,
-      pooled,
-      windowId: null,
-      placeholderTabIds: new Set(),
-      placement: emptyDedicatedPlacement(),
-      half: false,
-      fullBounds: null,
-      autoSelect: true,
-      foreignTabPolicy: 'evict',
-      evictedTabs: 0,
-      promise: null,
-      holders: new Set(),
-      idleSince: Date.now(),
-      tileIndex: null,
-      displayId: null,
-    };
-    dedicatedSlots.set(slot, state);
-  }
-  return state;
-}
-
-/**
- * A pooled window for this lease. The pool is what makes "one window, reused" the
- * normal case: a session name no longer owns a window for the life of the browser —
- * it borrows one while it has a tab there, and hands it back when the lease ends.
- * An idle window is reused whatever session emptied it; only when every window is
- * held at the same time does the pool grow, and `ensureDedicatedWindowUnlocked`
- * refuses to grow past what the display can show without overlap.
- */
-function poolSlotFor(leaseKey: string, hold = false): DedicatedSlotState {
-  for (const state of dedicatedSlots.values()) if (state.holders.has(leaseKey)) return state;
-  const idle = [...dedicatedSlots.values()]
-    .filter(state => state.pooled && state.holders.size === 0)
-    // A live window first (no creation cost), then the one idle longest.
-    .sort((a, b) => Number(b.windowId !== null) - Number(a.windowId !== null) || (a.idleSince ?? 0) - (b.idleSince ?? 0));
-  // Only an actual lease claims a window. A command that merely records policy (or a
-  // `close` for a session that no longer has a lease) must not take one: nothing would
-  // ever hand it back, and the slot would sit "busy" with no window behind it.
-  const state = idle[0] ?? getDedicatedSlot(nextPoolSlotName(), true);
-  if (hold) holdDedicatedSlot(state, leaseKey);
-  return state;
-}
-
-function nextPoolSlotName(): string {
-  for (let n = 1; ; n += 1) {
-    const name = `${DEDICATED_POOL_PREFIX}${n}`;
-    if (!dedicatedSlots.has(name)) return name;
-  }
-}
-
-function holdDedicatedSlot(state: DedicatedSlotState, leaseKey: string): void {
-  state.holders.add(leaseKey);
-  state.idleSince = null;
-}
-
-/** The lease let go: the window becomes reusable now and reapable later. */
-async function releaseDedicatedHolder(leaseKey: string): Promise<void> {
-  for (const state of dedicatedSlots.values()) {
-    if (!state.holders.delete(leaseKey)) continue;
-    if (state.holders.size === 0) {
-      if (state.half) {
-        state.half = false;
-        if (state.windowId !== null && state.fullBounds) {
-          await chrome.windows.update(state.windowId, state.fullBounds).catch(() => {});
-        }
-      }
-      state.idleSince = Date.now();
-      const idleSince = state.idleSince;
-      setTimeout(() => {
-        if (state.idleSince === idleSince && state.holders.size === 0) {
-          void reapIdleDedicatedWindows(Date.now(), state).catch(() => 0);
-        }
-      }, dedicatedIdleTtlMs);
-    }
-  }
-}
-
-function dedicatedSlotForWindow(windowId: number | null | undefined): DedicatedSlotState | undefined {
-  if (windowId === null || windowId === undefined) return undefined;
-  for (const state of dedicatedSlots.values()) {
-    if (state.windowId === windowId) return state;
-  }
-  return undefined;
-}
-
-function isDedicatedWindow(windowId: number | null | undefined): boolean {
-  return dedicatedSlotForWindow(windowId) !== undefined;
-}
-
-function dedicatedWindowIds(): number[] {
-  return [...dedicatedSlots.values()].map(s => s.windowId).filter((id): id is number => id !== null);
-}
-
-function forgetDedicatedWindow(state: DedicatedSlotState): void {
-  state.windowId = null;
-  state.placeholderTabIds.clear();
-  state.tileIndex = null;
-  state.displayId = null;
-}
-
-async function persistDedicatedState(): Promise<void> {
-  const slots: Record<string, unknown> = {};
-  for (const state of dedicatedSlots.values()) {
-    slots[state.slot] = {
-      windowId: state.windowId,
-      placeholderTabIds: [...state.placeholderTabIds],
-      placement: state.placement,
-      half: state.half,
-      fullBounds: state.fullBounds,
-      autoSelect: state.autoSelect,
-      foreignTabPolicy: state.foreignTabPolicy,
-      evictedTabs: state.evictedTabs,
-      pooled: state.pooled,
-      idleSince: state.idleSince,
-      tileIndex: state.tileIndex,
-      displayId: state.displayId,
-      reconciledAt: state.reconciledAt,
-    };
-  }
-  try {
-    await chrome.storage?.session?.set({ [DEDICATED_REGISTRY_KEY]: { version: 1, slots } });
-  } catch {
-    // Recovery aid only, like the lease registry.
-  }
-}
-
-function coerceDedicatedPlacement(raw: unknown): DedicatedPlacement {
-  const p = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
-  const source = p.source === 'bounds' || p.source === 'display' || p.source === 'auto' ? p.source : 'none';
-  return {
-    source,
-    requestedBounds: isRect(p.requestedBounds) ? normalizeRect(p.requestedBounds) : null,
-    displayPattern: typeof p.displayPattern === 'string' ? p.displayPattern : null,
-    displayName: typeof p.displayName === 'string' ? p.displayName : null,
-    displayFound: typeof p.displayFound === 'boolean' ? p.displayFound : null,
-    ...(p.excludedDisplayBounds !== undefined ? { excludedDisplayBounds: p.excludedDisplayBounds as Rect | null } : {}),
-    ...(isRect(p.relocatedFrom) ? { relocatedFrom: normalizeRect(p.relocatedFrom) } : {}),
-    cell: typeof p.cell === 'number' && Number.isInteger(p.cell) ? p.cell : null,
-  };
-}
-
-/** Restore slot state after a service-worker restart; a window that no longer exists is forgotten. */
-async function restoreDedicatedState(): Promise<void> {
-  dedicatedSlots.clear();
-  let stored: { version?: unknown; slots?: unknown } | undefined;
-  try {
-    const session = chrome.storage?.session;
-    if (!session) return;
-    const raw = await (session as unknown as { get(key: string): Promise<Record<string, unknown> | undefined> }).get(DEDICATED_REGISTRY_KEY);
-    stored = raw?.[DEDICATED_REGISTRY_KEY] as typeof stored;
-  } catch {
-    return;
-  }
-  if (!stored || stored.version !== 1 || !stored.slots || typeof stored.slots !== 'object') return;
-  for (const [slot, value] of Object.entries(stored.slots as Record<string, unknown>)) {
-    if (!DEDICATED_SLOT_PATTERN.test(slot) || !value || typeof value !== 'object') continue;
-    const raw = value as Record<string, unknown>;
-    const state = getDedicatedSlot(slot, raw.pooled === true || slot.startsWith(DEDICATED_POOL_PREFIX));
-    state.autoSelect = raw.autoSelect !== false;
-    state.foreignTabPolicy = raw.foreignTabPolicy === 'tolerate' ? 'tolerate' : 'evict';
-    state.evictedTabs = typeof raw.evictedTabs === 'number' ? raw.evictedTabs : 0;
-    state.placement = coerceDedicatedPlacement(raw.placement);
-    state.tileIndex = typeof raw.tileIndex === 'number' && Number.isInteger(raw.tileIndex) ? raw.tileIndex : null;
-    state.displayId = typeof raw.displayId === 'string' ? raw.displayId : null;
-    state.reconciledAt = typeof raw.reconciledAt === 'number' ? raw.reconciledAt : undefined;
-    // Leases do not survive a worker restart, so every restored window starts idle —
-    // and its idle clock starts now rather than before the restart, so a window is
-    // never reaped for time it spent while nothing could have used it.
-    state.holders.clear();
-    state.idleSince = Date.now();
-    if (typeof raw.windowId !== 'number') continue;
-    try {
-      await chrome.windows.get(raw.windowId);
-    } catch {
-      continue;
-    }
-    state.windowId = raw.windowId;
-    state.fullBounds = (raw.fullBounds as Rect | null) ?? null;
-    if (raw.half === true && state.fullBounds) {
-      await chrome.windows.update(state.windowId, state.fullBounds).catch(() => {});
-    }
-    for (const tabId of Array.isArray(raw.placeholderTabIds) ? raw.placeholderTabIds : []) {
-      if (typeof tabId !== 'number') continue;
-      try {
-        const tab = await chrome.tabs.get(tabId);
-        if (tab.windowId === raw.windowId) state.placeholderTabIds.add(tabId);
-      } catch {
-        // Closed while the worker was asleep.
-      }
-    }
-  }
-}
-
-function dedicatedPlacementRequest(leaseKey: string): DedicatedPlacementRequest {
-  const overrides = sessionOverrides.get(leaseKey);
-  return {
-    half: overrides?.half === true,
-    ...(overrides?.windowBounds ? { bounds: overrides.windowBounds } : {}),
-    ...(overrides?.windowDisplay ? { display: overrides.windowDisplay } : {}),
-    ...(overrides?.avoidDisplayBounds ? { avoidDisplayBounds: overrides.avoidDisplayBounds } : {}),
-  };
-}
-
-/**
- * The window this lease uses: the slot the caller pinned with `--window-slot`, else
- * one borrowed from the pool. Pinning stays supported (a script that wants a stable
- * window per tool still gets it) but is no longer what happens by default.
- */
-function dedicatedSlotNameFor(leaseKey: string, { hold = false }: { hold?: boolean } = {}): string {
-  const pinned = sessionOverrides.get(leaseKey)?.windowSlot;
-  if (typeof pinned === 'string' && DEDICATED_SLOT_PATTERN.test(pinned)) {
-    if (hold) holdDedicatedSlot(getDedicatedSlot(pinned), leaseKey);
-    return pinned;
-  }
-  return poolSlotFor(leaseKey, hold).slot;
-}
-
-/** Record the dedicated-mode fields a command carries. Slot-level policy is last-writer-wins. */
-function applyDedicatedCommandFields(leaseKey: string, cmd: Command): void {
-  if (typeof cmd.dedicatedIdleMs === 'number' && Number.isFinite(cmd.dedicatedIdleMs) && cmd.dedicatedIdleMs > 0) {
-    dedicatedIdleTtlMs = Math.round(cmd.dedicatedIdleMs);
-  }
-  // No slot on the command means "any pooled window", not the slot literally named
-  // `default` — that difference is the whole point of the pool.
-  const pinnedSlot = typeof cmd.windowSlot === 'string' && DEDICATED_SLOT_PATTERN.test(cmd.windowSlot) ? cmd.windowSlot : null;
-  const slot = pinnedSlot ?? dedicatedSlotNameFor(leaseKey);
-  dedicatedAvoidDisplayBounds = cmd.avoidDisplayBounds;
-  const patch: SessionOverrides = { half: cmd.half === true, avoidDisplayBounds: cmd.avoidDisplayBounds, autoSelect: cmd.autoSelect !== false, ...(pinnedSlot ? { windowSlot: pinnedSlot } : {}) };
-  // Placement is replaced as a whole: bounds and a display pattern never linger from an earlier command.
-  if (isRect(cmd.windowBounds)) {
-    patch.windowBounds = normalizeRect(cmd.windowBounds);
-    patch.windowDisplay = typeof cmd.windowDisplay === 'string' && cmd.windowDisplay.trim() ? cmd.windowDisplay.trim() : undefined;
-  } else if (typeof cmd.windowDisplay === 'string' && cmd.windowDisplay.trim()) {
-    patch.windowDisplay = cmd.windowDisplay.trim();
-    patch.windowBounds = undefined;
-  }
-  setSessionOverride(leaseKey, patch);
-  const state = getDedicatedSlot(slot);
-  state.autoSelect = patch.autoSelect !== false;
-  if (cmd.foreignTabPolicy === 'evict' || cmd.foreignTabPolicy === 'tolerate') state.foreignTabPolicy = cmd.foreignTabPolicy;
-}
-
-function tabActivationFor(leaseKey: string): boolean {
-  const mode = getWindowMode(leaseKey);
-  if (mode === 'dedicated') return sessionOverrides.get(leaseKey)?.autoSelect !== false;
-  return wantsActiveTab(mode);
-}
-
-/**
- * Where the slot's window should be. A request replaces the remembered placement;
- * no request reuses it, so a window recreated after being closed lands where the
- * last caller asked. Returns the target rectangle and the area whose containment
- * of the window's centre counts as "already placed" (the requested rectangle, or
- * the whole display — a window the person nudged within the display is left alone).
- */
-async function resolveDedicatedTarget(state: DedicatedSlotState, request: DedicatedPlacementRequest): Promise<{ target: Rect | null; area: Rect | null }> {
-  if (request.bounds && !request.display) {
-    const { displays } = await listDisplays();
-    const userDisplayBounds = dedicatedAvoidDisplayBounds ?? displays?.find(d => d.primary)?.bounds;
-    const bounds = normalizeRect(request.bounds);
-    if (userDisplayBounds && rectsOverlap(bounds, userDisplayBounds)) {
-      const relocatedFrom = state.placement.relocatedFrom;
-      const alreadyLogged = relocatedFrom?.left === bounds.left && relocatedFrom.top === bounds.top
-        && relocatedFrom.width === bounds.width && relocatedFrom.height === bounds.height;
-      state.placement = { ...emptyDedicatedPlacement(), relocatedFrom: bounds };
-      request = { ...request, bounds: undefined };
-      if (!alreadyLogged) {
-        console.warn(`[opencli] WARN: 显式 bounds 落在用户当前屏，位置和尺寸已改到自动宫格 (slot=${state.slot}, bounds=${JSON.stringify(bounds)})`);
-      }
-    }
-  }
-  const previous = state.placement;
-  if (!request.bounds && !request.display && state.windowId !== null && previous.source === 'auto' && previous.requestedBounds) {
-    return { target: previous.requestedBounds, area: previous.requestedBounds };
-  }
-  if (request.bounds || request.display) {
-    state.tileIndex = null;
-    state.displayId = null;
-  }
-  if (request.bounds) {
-    state.placement = { ...emptyDedicatedPlacement(), source: 'bounds', requestedBounds: normalizeRect(request.bounds), displayPattern: request.display ?? null };
-  } else if (request.display) {
-    state.placement = { ...emptyDedicatedPlacement(), source: 'display', displayPattern: request.display };
-  }
-  const placement = state.placement;
-  if (placement.source === 'bounds' && placement.requestedBounds) {
-    return { target: placement.requestedBounds, area: placement.requestedBounds };
-  }
-  // Nobody named a place: put it on the automation display, in its own tile of the
-  // fixed grid calculated from the work area. This is what makes plain
-  // `opencli browser <session> open <url>` land off the person's screen by itself.
-  if (placement.source !== 'display' || !placement.displayPattern) {
-    const { displays } = await listDisplays();
-    const automationDisplays = pickAutomationDisplays(displays, dedicatedAvoidDisplayBounds);
-    if (!automationDisplays.length) {
-      state.placement = { ...emptyDedicatedPlacement(), source: 'auto', ...(placement.relocatedFrom && { relocatedFrom: placement.relocatedFrom }) };
-      return { target: null, area: null };
-    }
-    const display = claimTileIndex(state, automationDisplays, request.avoidDisplayBounds);
-    const index = state.tileIndex!;
-    const target = dedicatedTile(displayArea(display), index);
-    state.placement = {
-      source: 'auto',
-      requestedBounds: target,
-      displayPattern: null,
-      displayName: display.name,
-      displayFound: true,
-      cell: target ? index : null,
-      excludedDisplayBounds: excludedDisplayBounds(displays),
-      ...(placement.relocatedFrom && { relocatedFrom: placement.relocatedFrom }),
-    };
-    return { target, area: target };
-  }
-
-  const { displays } = await listDisplays();
-  const display = pickDisplay(displays, placement.displayPattern);
-  if (!display) {
-    placement.displayFound = false;
-    placement.displayName = null;
-    placement.cell = null;
-    return { target: null, area: null };
-  }
-  const grid = dedicatedCellGrid(display.bounds);
-  const capacity = grid.cols * grid.rows;
-  const used = new Set<number>();
-  for (const other of dedicatedSlots.values()) {
-    // A slot whose window is being created right now holds its cell too.
-    if (other === state || (other.windowId === null && other.promise === null)) continue;
-    if (other.placement.source !== 'display' || other.placement.displayName !== display.name || other.placement.cell === null) continue;
-    used.add(other.placement.cell % capacity);
-  }
-  const previousCell = previous.displayName === display.name ? previous.cell : null;
-  let cell = previousCell !== null && !used.has(previousCell % capacity) ? previousCell : -1;
-  for (let i = 0; cell < 0 && i < capacity; i += 1) if (!used.has(i)) cell = i;
-  if (cell < 0) cell = used.size;
-  placement.displayFound = true;
-  placement.displayName = display.name;
-  placement.cell = cell;
-  return { target: computeDisplayCell(display.bounds, cell), area: display.bounds };
-}
-
-async function ensureDedicatedWindow(
-  slot: string,
-  request: DedicatedPlacementRequest & { reposition?: boolean; initialUrl?: string } = {},
-): Promise<DedicatedEnsureResult> {
-  const state = getDedicatedSlot(slot);
-  const next = dedicatedEnsureQueue.catch(() => null).then(() => ensureDedicatedWindowUnlocked(state, request));
-  const tracked: Promise<DedicatedEnsureResult> = next.finally(() => {
-    if (state.promise === tracked) state.promise = null;
-  });
-  state.promise = tracked;
-  dedicatedEnsureQueue = tracked.catch(() => null);
-  return tracked;
-}
-
-async function ensureDedicatedWindowUnlocked(
-  state: DedicatedSlotState,
-  request: DedicatedPlacementRequest & { reposition?: boolean; initialUrl?: string },
-): Promise<DedicatedEnsureResult> {
-  dedicatedAvoidDisplayBounds = request.avoidDisplayBounds;
-  await reapIdleDedicatedWindows();
-  let preflightMoved = false;
-  if (liveDedicatedStates().some(s => s.placement.source === 'auto')) {
-    const { displays } = await listDisplays();
-    preflightMoved = (await retileDedicatedWindows(displays)).some(entry => entry.slot === state.slot && entry.changed);
-  }
-  let win: chrome.windows.Window | null = null;
-  if (state.windowId !== null) {
-    try {
-      win = await chrome.windows.get(state.windowId);
-    } catch {
-      forgetDedicatedWindow(state);
-    }
-  }
-  if (!win) {
-    const adopted = await adoptOrphanDedicatedWindow(state);
-    if (adopted) win = adopted;
-  }
-  if (!win || state.windowId === null) await assertDedicatedCapacity(state);
-  const halfChanged = state.half !== (request.half === true);
-  state.half = request.half === true;
-  const { target: fullTarget, area } = await resolveDedicatedTarget(state, request);
-  state.fullBounds = fullTarget ?? state.fullBounds ?? { left: win?.left ?? 0, top: win?.top ?? 0, width: DEDICATED_CELL.width, height: DEDICATED_CELL.height };
-  const target = state.half ? { ...state.fullBounds, width: Math.floor(state.fullBounds.width / 2) } : fullTarget ?? (halfChanged ? state.fullBounds : null);
-  let created = false;
-  let moved = preflightMoved;
-  let createdTabId: number | undefined;
-  if (!win || state.windowId === null) {
-    const startUrl = request.initialUrl && isSafeNavigationUrl(request.initialUrl) ? request.initialUrl : dedicatedPlaceholderUrl(state.slot);
-    dedicatedTabCreatesInFlight += 1;
-    try {
-      // Never focused, never `state` (Chrome 146+ rejects 'normal'), and sized even
-      // when unplaced so it matches the other owned windows.
-      const newWindow = await chrome.windows.create({
-        url: startUrl,
-        focused: false,
-        type: 'normal',
-        ...(target ?? { width: DEDICATED_CELL.width, height: DEDICATED_CELL.height }),
-      });
-      state.windowId = newWindow.id!;
-      state.placeholderTabIds.clear();
-      const initialTabs = await chrome.tabs.query({ windowId: state.windowId }).catch(() => [] as chrome.tabs.Tab[]);
-      for (const tab of initialTabs) if (tab.id !== undefined) state.placeholderTabIds.add(tab.id);
-      // The starter tab may already sit on the caller's URL; it is the lease candidate as-is.
-      createdTabId = initialTabs.find(tab => tab.id !== undefined)?.id;
-      created = true;
-    } finally {
-      dedicatedTabCreatesInFlight -= 1;
-    }
-    console.log(`[opencli] Created dedicated window ${state.windowId} (slot=${state.slot}, placement=${state.placement.source}${state.placement.displayName ? `:${state.placement.displayName}#${state.placement.cell}` : ''})`);
-  } else if ((halfChanged || (request.reposition && area)) && target && (win.state === undefined || win.state === 'normal')) {
-    // Automatic placements were normalized by preflight. Explicit placements
-    // retain the previous policy for minimized/maximized/fullscreen windows.
-    const current = rectFromWindow(win);
-    if (halfChanged || (state.half && current?.width !== target.width) || (state.placement.source === 'auto' && (!current || !sameDisplayBounds(current, target))) || !current || !rectCenterInside(current, area ?? state.fullBounds)) {
-      // No `focused` here: moving the window must never raise it.
-      const updateWindow = (chrome.windows as unknown as { update?: (id: number, info: Partial<Rect>) => Promise<unknown> }).update;
-      if (typeof updateWindow === 'function') {
-        try {
-          await updateWindow(state.windowId, target);
-          moved = true;
-        } catch (err) {
-          console.warn(`[opencli] Failed to move dedicated window ${state.windowId}: ${err instanceof Error ? err.message : String(err)}`);
-        }
-      }
-    }
-  }
-  await persistDedicatedState();
-  const initialTabId = createdTabId !== undefined && initialTabIsAvailable(createdTabId)
-    ? createdTabId
-    : await findDedicatedPlaceholder(state);
-  return { windowId: state.windowId!, initialTabId, created, moved };
-}
-
-/**
- * After an extension reload the slot registry is gone but the window is not. Find a
- * window holding this slot's marked placeholder and take it back.
- */
-async function adoptOrphanDedicatedWindow(state: DedicatedSlotState): Promise<chrome.windows.Window | null> {
-  let marked: chrome.tabs.Tab[] = [];
-  try {
-    marked = (await chrome.tabs.query({})).filter(tab => tab.url === dedicatedPlaceholderUrl(state.slot) && tab.id !== undefined);
-  } catch {
-    return null;
-  }
-  for (const tab of marked) {
-    if (isDedicatedWindow(tab.windowId)) continue;
-    try {
-      const win = await chrome.windows.get(tab.windowId);
-      if (win.type !== undefined && win.type !== 'normal') continue;
-      if (win.incognito) continue;
-      state.windowId = tab.windowId;
-      state.placeholderTabIds.add(tab.id!);
-      console.log(`[opencli] Adopted dedicated window ${tab.windowId} for slot ${state.slot} from its placeholder tab`);
-      return win;
-    } catch {
-      // Gone between query and get.
-    }
-  }
-  return null;
-}
-
-function isPlaceholderUrl(url: string | undefined): boolean {
-  return !url || url === BLANK_PAGE || url.startsWith(DEDICATED_PLACEHOLDER_PREFIX);
-}
-
-/** A placeholder tab of this slot that no lease holds. Foreign tabs are never candidates. */
-async function findDedicatedPlaceholder(state: DedicatedSlotState): Promise<number | undefined> {
-  for (const tabId of [...state.placeholderTabIds]) {
-    try {
-      const tab = await chrome.tabs.get(tabId);
-      // Someone typed a URL into the placeholder: it is their tab now, not ours to overwrite.
-      if (!isPlaceholderUrl(tab.url)) {
-        state.placeholderTabIds.delete(tabId);
-        continue;
-      }
-      if (tab.windowId === state.windowId && initialTabIsAvailable(tabId)) return tabId;
-      if (tab.windowId !== state.windowId) state.placeholderTabIds.delete(tabId);
-    } catch {
-      state.placeholderTabIds.delete(tabId);
-    }
-  }
-  return undefined;
-}
-
-function ownedLeaseForTab(tabId: number): [string, TargetLease] | undefined {
-  for (const entry of automationSessions.entries()) {
-    if (entry[1].owned && entry[1].preferredTabId === tabId) return entry;
-  }
-  return undefined;
-}
-
-function isOpenCliTabId(tabId: number): boolean {
-  if (ownedLeaseForTab(tabId)) return true;
-  if (selfCreatedTabIds.has(tabId)) return true;
-  for (const state of dedicatedSlots.values()) if (state.placeholderTabIds.has(tabId)) return true;
-  return false;
-}
-
-function classifyDedicatedTab(state: DedicatedSlotState, tab: chrome.tabs.Tab): DedicatedTabOwner {
-  if (tab.id === undefined) return 'foreign';
-  if (ownedLeaseForTab(tab.id)) return 'lease';
-  if (state.placeholderTabIds.has(tab.id)) return isPlaceholderUrl(tab.url) ? 'placeholder' : 'foreign';
-  if (selfCreatedTabIds.has(tab.id)) return 'automation';
-  // Opened by one of our tabs (target=_blank, window.open into a tab): automation's own doing.
-  // Recorded so the ownership carries down an opener chain (SSO → OAuth → callback).
-  const inOurGroup = typeof tab.groupId === 'number' && tab.groupId !== chrome.tabGroups.TAB_GROUP_ID_NONE && ownedGroupLedger.has(tab.groupId);
-  if (inOurGroup || (typeof tab.openerTabId === 'number' && isOpenCliTabId(tab.openerTabId))) {
-    selfCreatedTabIds.add(tab.id);
-    return 'automation';
-  }
-  return 'foreign';
-}
-
-async function moveTabSelf(tabId: number, windowId: number): Promise<void> {
-  // Our own moves must not read as the person dragging a tab.
-  selfMovingTabIds.set(tabId, (selfMovingTabIds.get(tabId) ?? 0) + 1);
-  try {
-    await chrome.tabs.move(tabId, { windowId, index: -1 });
-  } finally {
-    setTimeout(() => {
-      const left = (selfMovingTabIds.get(tabId) ?? 1) - 1;
-      if (left <= 0) selfMovingTabIds.delete(tabId);
-      else selfMovingTabIds.set(tabId, left);
-    }, 2000);
-  }
-}
-
-/** The person's window to send a foreign tab back to: last focused normal window that is not one of ours. */
-async function findEvictionWindow(tab: chrome.tabs.Tab): Promise<number | undefined> {
-  const created = new Set(
-    Object.values(ownedContainers)
-      .filter(container => !container.borrowed)
-      .map(container => container.windowId)
-      .filter((id): id is number => id !== null),
-  );
-  const eligible = (win: chrome.windows.Window | undefined): win is chrome.windows.Window =>
-    !!win && win.id !== undefined && win.type === 'normal' && !!win.incognito === !!tab.incognito
-    && win.id !== tab.windowId && !isDedicatedWindow(win.id) && !created.has(win.id);
-  try {
-    const lastFocused = await chrome.windows.getLastFocused({ windowTypes: ['normal'] });
-    if (eligible(lastFocused)) return lastFocused.id;
-  } catch { /* fall through */ }
-  try {
-    const candidates = (await chrome.windows.getAll({ windowTypes: ['normal'] })).filter(eligible);
-    if (candidates.length > 0) return (candidates.find(win => win.focused) ?? candidates[candidates.length - 1]).id;
-  } catch { /* no window to evict to */ }
-  return undefined;
-}
-
-type ForeignTabCheck = 'evicted' | 'tolerated' | 'ours' | 'not-dedicated' | 'gone' | 'deferred' | 'stranded';
-
-async function checkDedicatedForeignTab(tabId: number, attempt = 0): Promise<ForeignTabCheck> {
-  await workerReady;
-  // A lease being created or relocated may not have recorded its tab yet.
-  if (dedicatedTabCreatesInFlight > 0 && attempt < 10) {
-    setTimeout(() => { void checkDedicatedForeignTab(tabId, attempt + 1); }, Math.max(200, foreignTabSettleMs));
-    return 'deferred';
-  }
-  let tab: chrome.tabs.Tab;
-  try {
-    tab = await chrome.tabs.get(tabId);
-  } catch {
-    return 'gone';
-  }
-  const state = dedicatedSlotForWindow(tab.windowId);
-  if (!state) return 'not-dedicated';
-  if (classifyDedicatedTab(state, tab) !== 'foreign') return 'ours';
-  if (state.foreignTabPolicy === 'tolerate') return 'tolerated';
-  const target = await findEvictionWindow(tab);
-  if (target === undefined) {
-    console.warn(`[opencli] Foreign tab ${tabId} in dedicated window ${state.windowId} (slot=${state.slot}) has no window of yours to go back to; leaving it`);
-    return 'stranded';
-  }
-  try {
-    await chrome.tabs.move(tabId, { windowId: target, index: -1 });
-    // Shown where it went (it was opened or dragged by the person); the window itself is not focused.
-    await chrome.tabs.update(tabId, { active: true }).catch(() => {});
-    state.evictedTabs += 1;
-    await persistDedicatedState();
-    console.log(`[opencli] Moved foreign tab ${tabId} out of dedicated window ${state.windowId} into window ${target}`);
-    return 'evicted';
-  } catch {
-    return 'stranded';
-  }
-}
-
-function scheduleForeignTabCheck(tabId: number): void {
-  setTimeout(() => { void checkDedicatedForeignTab(tabId); }, foreignTabSettleMs);
-}
-
-async function handleTabAttached(tabId: number, info: { newWindowId: number }): Promise<void> {
-  await workerReady;
-  if (selfMovingTabIds.has(tabId)) return;
-  let changed = false;
-  for (const state of dedicatedSlots.values()) {
-    if (state.windowId !== info.newWindowId && state.placeholderTabIds.delete(tabId)) changed = true;
-  }
-  if (isDedicatedWindow(info.newWindowId)) {
-    if (changed) await persistDedicatedState();
-    scheduleForeignTabCheck(tabId);
-    return;
-  }
-  const owned = ownedLeaseForTab(tabId);
-  if (owned && isDedicatedWindow(owned[1].windowId)) {
-    // The person dragged a lease tab out of the dedicated window: it is theirs now.
-    const [leaseKey, lease] = owned;
-    if (lease.idleTimer) clearTimeout(lease.idleTimer);
-    automationSessions.delete(leaseKey);
-    sessionOverrides.delete(leaseKey);
-    scheduleIdleAlarm(leaseKey, IDLE_TIMEOUT_NONE);
-    await safeDetach(tabId);
-    try {
-      await chrome.tabs.ungroup(tabId);
-    } catch {
-      // Dragging a tab out of its group usually ungroups it already.
-    }
-    console.log(`[opencli] Session ${lease.session} gave up tab ${tabId}: it was dragged out of its dedicated window`);
-    await persistRuntimeState();
-  }
-  if (changed) await persistDedicatedState();
-}
-
-async function closeRedundantPlaceholders(state: DedicatedSlotState): Promise<void> {
-  if (state.windowId === null || state.placeholderTabIds.size === 0) return;
-  const hasLease = [...automationSessions.values()].some(s => s.owned && s.windowId === state.windowId && s.preferredTabId !== null);
-  if (!hasLease) return;
-  for (const tabId of [...state.placeholderTabIds]) {
-    if (!initialTabIsAvailable(tabId)) continue;
-    state.placeholderTabIds.delete(tabId);
-    const tab = await chrome.tabs.get(tabId).catch(() => null);
-    // Only an untouched placeholder is ours to close.
-    if (tab && isPlaceholderUrl(tab.url)) await chrome.tabs.remove(tabId).catch(() => {});
-  }
-  await persistDedicatedState();
-}
-
-async function createDedicatedTabLease(leaseKey: string, targetUrl: string, guard?: CommandGuard): Promise<ResolvedTab> {
-  try {
-    return await createDedicatedTabLeaseInner(leaseKey, targetUrl, guard);
-  } catch (err) {
-    // No lease was created, so nothing will release the window later: hand it back
-    // now, or a failed command (a full pool, a closed window) would leak a holder and
-    // keep a window out of the pool for the rest of the browser session.
-    if (!(err instanceof CommandFailure && err.code === 'command_reclaimed')) await releaseDedicatedHolder(leaseKey);
-    throw err;
-  }
-}
-
-async function createDedicatedTabLeaseInner(leaseKey: string, targetUrl: string, guard?: CommandGuard): Promise<ResolvedTab> {
-  guard?.();
-  await reapIdleDedicatedWindows();
-  guard?.();
-  // A lease is about to live in this window, so this is the one call that claims it.
-  const slot = dedicatedSlotNameFor(leaseKey, { hold: true });
-  const state = getDedicatedSlot(slot);
-  const role = getOwnedWindowRole(leaseKey);
-  const active = tabActivationFor(leaseKey);
-  dedicatedTabCreatesInFlight += 1;
-  try {
-    const { windowId, initialTabId } = await ensureDedicatedWindow(slot, {
-      ...dedicatedPlacementRequest(leaseKey),
-      reposition: true,
-      initialUrl: targetUrl,
-    });
-    let tab: chrome.tabs.Tab;
-    if (initialTabId !== undefined) {
-      state.placeholderTabIds.delete(initialTabId);
-      tab = await chrome.tabs.get(initialTabId);
-      if (!isTargetUrl(tab.url, targetUrl)) {
-        tab = await chrome.tabs.update(initialTabId, { url: targetUrl });
-        await new Promise(resolve => setTimeout(resolve, 300));
-        tab = await chrome.tabs.get(initialTabId);
-      }
-    } else {
-      tab = await chrome.tabs.create({ windowId, url: targetUrl, active });
-    }
-    const tabId = tab.id;
-    if (!tabId) throw new Error('Failed to create tab lease in dedicated window');
-    guardCreatedTab(guard, tabId);
-    selfCreatedTabIds.add(tabId);
-    const group = await ensureOwnedContainerGroup(role, leaseKey, windowId, [tabId], windowId);
-    if (active && !tab.active) tab = (await chrome.tabs.update(tabId, { active: true })) ?? tab;
-    if (tab.windowId !== windowId) tab = await chrome.tabs.get(tabId);
-    guardCreatedTab(guard, tabId);
-    setLeaseSession(leaseKey, {
-      session: getSessionFromKey(leaseKey),
-      surface: getSurfaceFromKey(leaseKey),
-      kind: 'owned',
-      windowId: group?.windowId ?? windowId,
-      owned: true,
-      preferredTabId: tabId,
-    });
-    resetWindowIdleTimer(leaseKey);
-    await persistDedicatedState();
-    return { tabId, tab };
-  } finally {
-    dedicatedTabCreatesInFlight -= 1;
-  }
-}
-
-/**
- * Per-command dedicated policy: a lease tab found outside its slot window (created
- * earlier in another mode, or the window was recreated) is moved in, then made the
- * window's active tab so it is the one that renders.
- */
-async function applyDedicatedSessionPolicy(leaseKey: string, resolved: ResolvedTab, guard?: CommandGuard): Promise<ResolvedTab> {
-  const lease = automationSessions.get(leaseKey);
-  if (!lease?.owned || lease.preferredTabId !== resolved.tabId) return resolved;
-  await reapIdleDedicatedWindows();
-  // An existing lease is being moved into its window: it holds the slot from here on.
-  const slot = dedicatedSlotNameFor(leaseKey, { hold: true });
-  const state = getDedicatedSlot(slot);
-  let tab = resolved.tab ?? await chrome.tabs.get(resolved.tabId);
-  if (state.windowId === null || tab.windowId !== state.windowId) {
-    dedicatedTabCreatesInFlight += 1;
-    try {
-      const { windowId } = await ensureDedicatedWindow(slot, { ...dedicatedPlacementRequest(leaseKey), reposition: true });
-      if (tab.windowId !== windowId) {
-        // Point the lease at its new window BEFORE moving: if the move empties the old
-        // window, Chrome closes it and onRemoved must not take this lease with it.
-        guard?.();
-        lease.windowId = windowId;
-        await moveTabSelf(resolved.tabId, windowId);
-        const group = await ensureOwnedContainerGroup(getOwnedWindowRole(leaseKey), leaseKey, windowId, [resolved.tabId], windowId);
-        guard?.();
-        lease.windowId = group?.windowId ?? windowId;
-        console.log(`[opencli] Moved session ${lease.session} tab ${resolved.tabId} into dedicated window ${windowId} (slot=${slot})`);
-        await closeRedundantPlaceholders(state);
-        await persistRuntimeState();
-      }
-      tab = await chrome.tabs.get(resolved.tabId);
-    } finally {
-      dedicatedTabCreatesInFlight -= 1;
-    }
-  }
-  if (sessionOverrides.get(leaseKey)?.autoSelect !== false && !tab.active) {
-    tab = (await chrome.tabs.update(resolved.tabId, { active: true })) ?? tab;
-  }
-  return { tabId: resolved.tabId, tab };
-}
-
-/** Release of the lease tab inside a dedicated window: keep the window alive with one placeholder. */
-async function releaseDedicatedLeaseTab(state: DedicatedSlotState, tabId: number): Promise<'removed' | 'placeholder'> {
-  const run = dedicatedReleaseQueue.catch(() => null).then(() => releaseDedicatedLeaseTabUnlocked(state, tabId));
-  dedicatedReleaseQueue = run.catch(() => null);
-  return run;
-}
-
-async function releaseDedicatedLeaseTabUnlocked(state: DedicatedSlotState, tabId: number): Promise<'removed' | 'placeholder'> {
-  let tab: chrome.tabs.Tab | null = null;
-  try {
-    tab = await chrome.tabs.get(tabId);
-  } catch {
-    return 'removed';
-  }
-  // Asked of the window itself, not of the lease table: two releases racing each other
-  // must not both conclude "someone else keeps the window".
-  let keepsWindow = tab.windowId !== state.windowId;
-  if (!keepsWindow && state.windowId !== null) {
-    const others = (await chrome.tabs.query({ windowId: state.windowId }).catch(() => [] as chrome.tabs.Tab[]))
-      .filter(other => other.id !== undefined && other.id !== tabId);
-    keepsWindow = others.some(other => classifyDedicatedTab(state, other) !== 'foreign');
-  }
-  if (keepsWindow) {
-    await chrome.tabs.remove(tabId).catch(() => {});
-    return 'removed';
-  }
-  try {
-    await chrome.tabs.update(tabId, { url: dedicatedPlaceholderUrl(state.slot) });
-    await chrome.tabs.ungroup(tabId).catch(() => {});
-    state.placeholderTabIds.add(tabId);
-    await persistDedicatedState();
-    return 'placeholder';
-  } catch {
-    await chrome.tabs.remove(tabId).catch(() => {});
-    return 'removed';
-  }
-}
-
-type DedicatedWindowInfo = {
-  slot: string;
-  pooled: boolean;
-  half: boolean;
-  holders: number;
-  busy: boolean;
-  idleMs: number | null;
-  tileIndex: number | null;
-  displayId: string | null;
-  reconciledAt?: number;
-  windowId: number | null;
-  exists: boolean;
-  state: string | null;
-  bounds: Rect | null;
-  placement: DedicatedPlacement;
-  onDisplay: boolean | null;
-  activeTab: { tabId: number; owner: DedicatedTabOwner; session: string | null; url?: string; title?: string } | null;
-  tabs: { total: number; leases: number; placeholders: number; automation: number; foreign: number };
-  sessions: string[];
-  autoSelect: boolean;
-  foreignTabPolicy: ForeignTabPolicy;
-  evictedTabs: number;
-};
-
-async function describeDedicatedSlot(state: DedicatedSlotState, displays: DisplayInfo[] | null): Promise<DedicatedWindowInfo> {
-  let win: chrome.windows.Window | null = null;
-  if (state.windowId !== null) {
-    try {
-      win = await chrome.windows.get(state.windowId);
-    } catch {
-      forgetDedicatedWindow(state);
-    }
-  }
-  const bounds = rectFromWindow(win);
-  let onDisplay: boolean | null = null;
-  if (state.placement.displayPattern && displays) {
-    const display = pickDisplay(displays, state.placement.displayPattern);
-    onDisplay = display && bounds ? rectCenterInside(bounds, display.bounds) : false;
-  }
-  const counts = { total: 0, leases: 0, placeholders: 0, automation: 0, foreign: 0 };
-  let activeTab: DedicatedWindowInfo['activeTab'] = null;
-  const sessions: string[] = [];
-  if (win && state.windowId !== null) {
-    const tabs = await chrome.tabs.query({ windowId: state.windowId }).catch(() => [] as chrome.tabs.Tab[]);
-    for (const tab of tabs) {
-      if (tab.id === undefined) continue;
-      const owner = classifyDedicatedTab(state, tab);
-      counts.total += 1;
-      if (owner === 'lease') counts.leases += 1;
-      else if (owner === 'placeholder') counts.placeholders += 1;
-      else if (owner === 'automation') counts.automation += 1;
-      else counts.foreign += 1;
-      const lease = ownedLeaseForTab(tab.id);
-      if (lease && !sessions.includes(lease[1].session)) sessions.push(lease[1].session);
-      if (tab.active) {
-        activeTab = {
-          tabId: tab.id,
-          owner,
-          session: lease ? lease[1].session : null,
-          // Foreign tabs are the person's: never echo their URL or title.
-          ...(owner === 'foreign' ? {} : { url: tab.url, title: tab.title }),
-        };
-      }
-    }
-  }
-  return {
-    slot: state.slot,
-    pooled: state.pooled,
-    half: state.half,
-    holders: state.holders.size,
-    busy: state.holders.size > 0,
-    idleMs: state.idleSince === null ? null : Math.max(0, Date.now() - state.idleSince),
-    tileIndex: state.tileIndex,
-    displayId: state.displayId,
-    reconciledAt: state.reconciledAt,
-    windowId: win ? state.windowId : null,
-    exists: !!win,
-    state: win?.state ?? null,
-    bounds,
-    placement: { ...state.placement },
-    onDisplay: win ? onDisplay : null,
-    activeTab,
-    tabs: counts,
-    sessions,
-    autoSelect: state.autoSelect,
-    foreignTabPolicy: state.foreignTabPolicy,
-    evictedTabs: state.evictedTabs,
-  };
-}
-
-/**
- * Close one automation window (or all of them) and forget the slot. The pool makes
- * windows disposable, so this is the honest counterpart to `ensure`: a caller that is
- * done, or a person tidying up, has a command for it instead of hunting for the window.
- * A window still held by a live lease is only closed with `force`.
- */
-async function closeDedicatedWindows(target: { slot?: string | null; all?: boolean; force?: boolean }): Promise<{ closed: string[]; skipped: { slot: string; reason: string }[] }> {
-  const closed: string[] = [];
-  const skipped: { slot: string; reason: string }[] = [];
-  const states = target.all
-    ? [...dedicatedSlots.values()]
-    : [...dedicatedSlots.values()].filter(state => state.slot === target.slot);
-  for (const state of states) {
-    if (state.holders.size > 0 && !target.force) {
-      skipped.push({ slot: state.slot, reason: `held by ${state.holders.size} live lease(s); pass force to close anyway` });
-      continue;
-    }
-    if (state.windowId !== null) {
-      try {
-        await chrome.windows.remove(state.windowId);
-      } catch {
-        // Already gone.
-      }
-      forgetDedicatedWindow(state);
-    }
-    state.holders.clear();
-    state.idleSince = Date.now();
-    state.tileIndex = null;
-    dedicatedSlots.delete(state.slot);
-    closed.push(state.slot);
-  }
-  if (closed.length) {
-    await persistDedicatedState();
-  }
-  return { closed, skipped };
-}
-
-async function handleDedicatedWindowOp(cmd: Command): Promise<Result> {
-  if (cmd.op === 'runtime-reload') {
-    // Applying a new extension build used to need a human in chrome://extensions;
-    // the reply is sent first because the reload kills this worker mid-flight.
-    setTimeout(() => { try { chrome.runtime.reload(); } catch { /* nothing left to do */ } }, 150);
-    return { id: cmd.id, ok: true, data: { reloading: true, note: 'extension reloading; leases and dedicated windows are dropped' } };
-  }
-  if (cmd.op === 'window-relayout') {
-    const windows = await reconcileDedicatedWindows();
-    return { id: cmd.id, ok: true, data: { windows, changed: windows.filter(w => w.changed).length } };
-  }
-  if (cmd.op === 'window-status' || cmd.op === 'window-list') await reconcileDedicatedWindows();
-  if (cmd.op === 'window-close') {
-    const all = cmd.windowSlot === undefined || cmd.windowSlot === null || cmd.windowSlot === '';
-    const { closed, skipped } = await closeDedicatedWindows({
-      ...(all ? { all: true } : { slot: String(cmd.windowSlot) }),
-      force: cmd.force === true,
-    });
-    return { id: cmd.id, ok: true, data: { closed, skipped, remaining: [...dedicatedSlots.keys()].sort() } };
-  }
-  if (cmd.op === 'window-ensure') {
-    const slot = normalizeDedicatedSlot(cmd.windowSlot);
-    const state = getDedicatedSlot(slot);
-    if (cmd.foreignTabPolicy === 'evict' || cmd.foreignTabPolicy === 'tolerate') state.foreignTabPolicy = cmd.foreignTabPolicy;
-    if (typeof cmd.autoSelect === 'boolean') state.autoSelect = cmd.autoSelect;
-    const result = await ensureDedicatedWindow(slot, {
-      half: cmd.half === true,
-      ...(cmd.avoidDisplayBounds ? { avoidDisplayBounds: cmd.avoidDisplayBounds } : {}),
-      ...(isRect(cmd.windowBounds) ? { bounds: normalizeRect(cmd.windowBounds) } : {}),
-      ...(typeof cmd.windowDisplay === 'string' && cmd.windowDisplay.trim() ? { display: cmd.windowDisplay.trim() } : {}),
-      reposition: true,
-    });
-    const { displays } = await listDisplays();
-    return { id: cmd.id, ok: true, data: { ...(await describeDedicatedSlot(state, displays)), created: result.created, moved: result.moved } };
-  }
-  const { displays, error } = await listDisplays();
-  const filter = typeof cmd.windowSlot === 'string' && cmd.windowSlot ? cmd.windowSlot : null;
-  const windows: DedicatedWindowInfo[] = [];
-  for (const state of [...dedicatedSlots.values()].sort((a, b) => a.slot.localeCompare(b.slot))) {
-    if (filter && state.slot !== filter) continue;
-    windows.push(await describeDedicatedSlot(state, displays));
-  }
-  const automationDisplays = pickAutomationDisplays(displays, dedicatedAvoidDisplayBounds);
-  const automationDisplay = automationDisplays[0] ?? null;
-  const area = automationDisplay ? displayArea(automationDisplay) : null;
-  const naturalCapacity = automationDisplays.length ? automationDisplays.reduce((sum, d) => sum + dedicatedCapacity(displayArea(d)), 0) : null;
-  const capacity = Math.max(DEDICATED_POOL_MIN, naturalCapacity ?? DEDICATED_POOL_MIN);
-  const live = liveDedicatedStates().length;
-  return {
-    id: cmd.id,
-    ok: true,
-    data: {
-      supported: true,
-      protocol: 1,
-      capabilities: [...DEDICATED_CAPABILITIES],
-      displays,
-      ...(displays === null ? { displaysError: error } : {}),
-      pool: {
-        // What a caller needs to decide "run now or queue": how many windows the
-        // pool allows, its non-overlapping natural capacity, and how many are free.
-        automationDisplay: automationDisplay ? { id: automationDisplay.id, name: automationDisplay.name, primary: automationDisplay.primary, internal: automationDisplay.internal, area } : null,
-        automationDisplays: automationDisplays.map(d => {
-          const grid = dedicatedGrid(displayArea(d));
-          return { id: d.id, name: d.name, area: displayArea(d), naturalCapacity: grid.cols * grid.rows, cols: grid.cols, rows: grid.rows, tile: { width: grid.width, height: grid.height } };
-        }),
-        capacity,
-        naturalCapacity,
-        live,
-        idle: [...dedicatedSlots.values()].filter(s => s.holders.size === 0).length,
-        free: Math.max(0, capacity - live) + [...dedicatedSlots.values()].filter(s => s.holders.size === 0 && s.windowId !== null).length,
-        idleTtlMs: dedicatedIdleTtlMs,
-      },
-      windows,
-    },
-  };
-}
-
-async function createOwnedTabLease(leaseKey: string, initialUrl?: string, guard?: CommandGuard): Promise<ResolvedTab> {
-  return withLeaseMutation(() => createOwnedTabLeaseUnlocked(leaseKey, initialUrl, guard));
+async function createOwnedTabLease(leaseKey: string, initialUrl?: string): Promise<ResolvedTab> {
+  return withLeaseMutation(() => createOwnedTabLeaseUnlocked(leaseKey, initialUrl));
 }
 
-async function createOwnedTabLeaseUnlocked(leaseKey: string, initialUrl?: string, guard?: CommandGuard): Promise<ResolvedTab> {
-  guard?.();
+async function createOwnedTabLeaseUnlocked(leaseKey: string, initialUrl?: string): Promise<ResolvedTab> {
   const targetUrl = (initialUrl && isSafeNavigationUrl(initialUrl)) ? initialUrl : BLANK_PAGE;
   const role = getOwnedWindowRole(leaseKey);
-  const mode = getWindowMode(leaseKey);
-  if (mode === 'dedicated') return createDedicatedTabLease(leaseKey, targetUrl, guard);
-  const { windowId, initialTabId } = await ensureOwnedContainerWindow(role, leaseKey, targetUrl, mode);
+  if (getWindowMode(leaseKey) === 'dedicated') {
+    const windowIds = new Set([...automationSessions.values()].filter(lease => lease.dedicated).map(lease => lease.windowId));
+    const windows = await Promise.all([...windowIds].map(id => chrome.windows.get(id).catch(() => undefined)));
+    const bounds = await dedicatedBounds(windows.flatMap(win =>
+      win?.left !== undefined && win.top !== undefined && win.width !== undefined && win.height !== undefined
+        ? [{ left: win.left, top: win.top, width: win.width, height: win.height }] : []));
+    const win = await chrome.windows.create({ url: targetUrl, focused: false, ...bounds });
+    if (win?.id === undefined) throw new Error('Failed to create dedicated window');
+    const [tab] = win.tabs?.length ? win.tabs : await chrome.tabs.query({ windowId: win.id });
+    if (tab?.id === undefined) throw new Error('Dedicated window did not return a tab');
+    setLeaseSession(leaseKey, {
+      session: getSessionFromKey(leaseKey), surface: getSurfaceFromKey(leaseKey),
+      kind: 'owned', windowId: win.id, owned: true, preferredTabId: tab.id, dedicated: true,
+    });
+    resetWindowIdleTimer(leaseKey);
+    return { tabId: tab.id, tab };
+  }
+  // Container creation must not start the lease's navigation as well. A slow
+  // initial load can still expose about:blank, causing a duplicate tabs.update.
+  const { windowId, initialTabId } = await ensureOwnedContainerWindow(role, BLANK_PAGE, getWindowMode(leaseKey));
   let tab: chrome.tabs.Tab;
 
   if (initialTabIsAvailable(initialTabId)) {
     tab = await chrome.tabs.get(initialTabId);
+    await consumeIdlePlaceholder(tab);
     if (!isTargetUrl(tab.url, targetUrl)) {
       tab = await chrome.tabs.update(initialTabId, { url: targetUrl });
       await new Promise(resolve => setTimeout(resolve, 300));
       tab = await chrome.tabs.get(initialTabId);
     }
   } else {
-    // Selecting the tab inside its window yanks the view away from whatever tab the
-    // user was reading in that same window, so only do it when `foreground` or the
-    // lighter `active` mode was explicitly asked for. Neither of those two touches
-    // OS-level window focus here — that only happens via focusOwnedWindowIfRequested,
-    // which is gated to `foreground` alone.
-    tab = await chrome.tabs.create({ windowId, url: targetUrl, active: wantsActiveTab(mode) });
+    tab = await chrome.tabs.create({ windowId, url: targetUrl, active: true });
   }
   const tabId = tab.id;
   if (!tabId) throw new Error('Failed to create tab lease in automation container');
-  guardCreatedTab(guard, tabId);
-  // Same pinning as the container: an `isolated` lease must not be converged back
-  // into a group living in the person's window.
-  const group = await ensureOwnedContainerGroup(
-    role,
-    leaseKey,
-    windowId,
-    [tabId],
-    mode === 'isolated' ? windowId : undefined,
-  );
+  const group = await ensureOwnedContainerGroup(role, windowId, [tabId]);
   const sessionWindowId = group?.windowId ?? tab.windowId;
   if (tab.windowId !== sessionWindowId) tab = await chrome.tabs.get(tabId);
 
-  guardCreatedTab(guard, tabId);
   setLeaseSession(leaseKey, {
     session: getSessionFromKey(leaseKey),
     surface: getSurfaceFromKey(leaseKey),
@@ -3121,12 +1160,11 @@ async function createOwnedTabLeaseUnlocked(leaseKey: string, initialUrl?: string
   return { tabId, tab };
 }
 
-/** Get or create the container window for this lease (borrowed from the person by default).
+/** Get or create the dedicated automation container window.
  *  This compatibility helper returns the shared owned container. Leases
  *  lease tabs inside it instead of owning separate windows.
  */
-async function getAutomationWindow(leaseKey: string, initialUrl?: string, guard?: CommandGuard): Promise<number> {
-  guard?.();
+async function getAutomationWindow(leaseKey: string, initialUrl?: string): Promise<number> {
   // Check if our window is still alive.
   const existing = automationSessions.get(leaseKey);
   if (existing) {
@@ -3147,21 +1185,12 @@ async function getAutomationWindow(leaseKey: string, initialUrl?: string, guard?
       return existing.windowId;
     } catch {
       // Tab/window was closed by user
-      guard?.();
       await removeLeaseSession(leaseKey);
     }
   }
 
-  if (getWindowMode(leaseKey) === 'dedicated') {
-    await reapIdleDedicatedWindows();
-    return (await ensureDedicatedWindow(dedicatedSlotNameFor(leaseKey, { hold: true }), {
-      ...dedicatedPlacementRequest(leaseKey),
-      reposition: true,
-      initialUrl,
-    })).windowId;
-  }
   const role = getOwnedWindowRole(leaseKey);
-  return (await ensureOwnedContainerWindow(role, leaseKey, initialUrl, getWindowMode(leaseKey))).windowId;
+  return (await ensureOwnedContainerWindow(role, initialUrl, getWindowMode(leaseKey))).windowId;
 }
 
 // Clean up when an owned container window is closed
@@ -3169,15 +1198,11 @@ chrome.windows.onRemoved.addListener(async (windowId) => {
   // A window-close event can wake the worker before recovery; persisting the
   // empty pre-recovery snapshot here would wipe the registry.
   await workerReady;
-  for (const role of Object.keys(ownedContainers) as OwnedWindowRole[]) {
-    if (ownedContainers[role].windowId === windowId) forgetContainerWindow(role);
-  }
-  const dedicated = dedicatedSlotForWindow(windowId);
-  if (dedicated) {
-    // Recreated on demand by the next dedicated command, with the same placement.
-    console.log(`[opencli] Dedicated window ${windowId} closed (slot=${dedicated.slot})`);
-    forgetDedicatedWindow(dedicated);
-    await persistDedicatedState();
+  for (const container of Object.values(ownedContainers)) {
+    if (container.windowId === windowId) {
+      container.windowId = null;
+      container.groupId = null;
+    }
   }
   for (const [leaseKey, session] of automationSessions.entries()) {
     if (session.windowId === windowId) {
@@ -3196,12 +1221,6 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
   // Same wake-before-recovery hazard as windows.onRemoved.
   await workerReady;
   identity.evictTab(tabId);
-  selfCreatedTabIds.delete(tabId);
-  let placeholderGone = false;
-  for (const state of dedicatedSlots.values()) {
-    if (state.placeholderTabIds.delete(tabId)) placeholderGone = true;
-  }
-  if (placeholderGone) await persistDedicatedState();
   for (const [leaseKey, session] of automationSessions.entries()) {
     if (session.preferredTabId === tabId) {
       if (session.idleTimer) clearTimeout(session.idleTimer);
@@ -3214,22 +1233,6 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
   await persistRuntimeState();
 });
 
-// Dedicated windows: judge tabs that appear in them (created there, or attached by a
-// drag / a link opened from another app), and let a lease tab dragged out go.
-// Optional-chained: older test harnesses and Chrome builds may lack these events.
-chrome.tabs.onCreated?.addListener?.((tab: chrome.tabs.Tab) => {
-  void (async () => {
-    await workerReady;
-    if (tab.id === undefined) return;
-    // The opener may be closed by the time the settle check runs; decide ownership now.
-    if (typeof tab.openerTabId === 'number' && isOpenCliTabId(tab.openerTabId)) selfCreatedTabIds.add(tab.id);
-    if (isDedicatedWindow(tab.windowId)) scheduleForeignTabCheck(tab.id);
-  })();
-});
-chrome.tabs.onAttached?.addListener?.((tabId: number, info: chrome.tabs.TabAttachInfo) => {
-  void handleTabAttached(tabId, info);
-});
-
 // ─── Lifecycle events ────────────────────────────────────────────────
 
 let initialized = false;
@@ -3238,7 +1241,6 @@ function initialize(): void {
   if (initialized) return;
   initialized = true;
   chrome.alarms.create('keepalive', { periodInMinutes: 0.5 }); // Chrome production minimum: 30 seconds
-  chrome.alarms.create(DEDICATED_REAP_ALARM, { periodInMinutes: 0.5 });
   executor.registerListeners();
   try {
     const registerFrameTracking = (executor as { registerFrameTracking?: () => void }).registerFrameTracking;
@@ -3293,20 +1295,15 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   // gate on recovery so releaseLease never persists an empty snapshot.
   await workerReady;
   if (alarm.name === 'keepalive') void connect();
-  if (alarm.name === DEDICATED_REAP_ALARM) {
-    await reconcileDedicatedWindows().catch(() => []);
-    await reapIdleDedicatedWindows().catch(() => 0);
-    return;
-  }
   const leaseKey = leaseKeyFromAlarmName(alarm.name);
   if (!leaseKey) return;
-  await handleIdleExpiry(leaseKey, 'idle alarm');
-});
-
-chrome.system?.display?.onDisplayChanged?.addListener(async () => {
-  await workerReady.then(() => reconcileDedicatedWindows()).catch(err => {
-    console.warn(`[opencli] Display reconciliation failed: ${err instanceof Error ? err.message : String(err)}`);
-  });
+  if ((activeCommandCounts.get(leaseKey) ?? 0) > 0) {
+    // A command is mid-flight (the alarm can fire while a long command runs
+    // in a woken worker) — defer; command completion re-arms the idle timer.
+    resetWindowIdleTimer(leaseKey);
+    return;
+  }
+  await releaseLease(leaseKey, 'idle alarm');
 });
 
 // ─── Popup status API ───────────────────────────────────────────────
@@ -3354,91 +1351,93 @@ async function fetchDaemonVersion(): Promise<string | null> {
 // ─── Command dispatcher ─────────────────────────────────────────────
 
 async function handleCommand(cmd: Command): Promise<Result> {
-  // Reconcile before acquiring/using any window. Relayout must capture its own before snapshot.
-  if (cmd.action !== 'sessions') await reconcileDedicatedWindows();
-  // Session-independent actions — handle before session resolution.
-  if (cmd.action === 'sessions') return handleSessions(cmd);
-
+  if (cmd.action === 'sessions') {
+    return { id: cmd.id, ok: true, data: [...automationSessions.entries()].map(([key, lease]) => ({
+      session: lease.session, surface: lease.surface, windowId: lease.windowId,
+      dedicated: lease.dedicated === true, keepAlive: getIdleTimeout(key) === IDLE_TIMEOUT_NONE,
+    })) };
+  }
+  // Native browser resources do not belong to a page session or idle timer.
+  if (cmd.action === 'chrome-describe' || cmd.action === 'chrome-call') {
+    try {
+      if (cmd.action === 'chrome-describe') return { id: cmd.id, ok: true, data: await describeChrome(cmd.chromeMethod) };
+      return await withLeaseMutation(async () => ({ id: cmd.id, ok: true, data: await callChrome(
+        cmd.chromeMethod ?? '', cmd.chromeArgs ?? [],
+        new Set([...automationSessions.values()].map(s => s.preferredTabId).filter((id): id is number => id !== null)),
+        new Set([...interactiveGroupLedger, ...Object.values(ownedContainers).map(c => c.groupId).filter((id): id is number => id !== null)]),
+      ) }));
+    } catch (error) { return errorResult(cmd.id, error); }
+  }
   const session = getSessionName(cmd.session);
   const surface = getCommandSurface(cmd);
   const leaseKey = getLeaseKey(session, surface);
-  if (isWindowMode(cmd.windowMode)) {
+  if (cmd.requireExistingSession && surface === 'browser' && !automationSessions.has(leaseKey)) {
+    return errorResult(cmd.id, new CommandFailure(
+      'session_not_found', `Browser session "${session}" does not exist.`,
+      'Start it with opencli browser --session <name> open <url>.',
+    ));
+  }
+  if (closingLeases.has(leaseKey)) {
+    return errorResult(cmd.id, new CommandFailure('session_busy', 'This session is closing; retry after cleanup finishes.'));
+  }
+  if (cmd.windowMode === 'foreground' || cmd.windowMode === 'background' || cmd.windowMode === 'dedicated') {
     setSessionOverride(leaseKey, { windowMode: cmd.windowMode });
-    if (cmd.windowMode === 'dedicated') applyDedicatedCommandFields(leaseKey, cmd);
   }
   if (surface === 'adapter' && (cmd.siteSession === 'persistent' || cmd.siteSession === 'ephemeral')) {
     setSessionOverride(leaseKey, { lifecycle: cmd.siteSession });
   }
   // Apply custom idle timeout if specified in the command
-  if (cmd.idleTimeout === -1 || (Number.isInteger(cmd.idleTimeout) && cmd.idleTimeout! > 0)) {
-    setSessionOverride(leaseKey, { idleTimeoutMs: cmd.idleTimeout === -1 ? IDLE_TIMEOUT_NONE : cmd.idleTimeout! * 1000 });
+  if (cmd.idleTimeout === -1 || (cmd.idleTimeout != null && cmd.idleTimeout > 0)) {
+    setSessionOverride(leaseKey, { idleTimeoutMs: cmd.idleTimeout === -1 ? IDLE_TIMEOUT_NONE : cmd.idleTimeout * 1000 });
   }
-  const inflight: InflightCommand = {
-    startedAt: Date.now(),
-    // Explicit long operations retain their own timeout budget.
-    maxMs: Math.max(cmd.inflightMaxMs && cmd.inflightMaxMs > 0 ? cmd.inflightMaxMs : INFLIGHT_MAX_MS,
-      (cmd.timeout ?? 0) * 1000, cmd.timeoutMs ?? 0),
-  };
-  const commands = activeCommands.get(leaseKey) ?? new Set<InflightCommand>();
-  commands.add(inflight);
-  activeCommands.set(leaseKey, commands);
+  // Reset idle timer on every command (window stays alive while active).
+  // The in-flight refcount below additionally blocks idle release while a
+  // long command is still executing — otherwise a 30s idle timer could tear
+  // the tab down mid-command.
   resetWindowIdleTimer(leaseKey);
-  const guard: CommandGuard = () => {
-    if (inflight.invalidated) {
-      throw new CommandFailure('command_reclaimed', 'Command was invalidated when its session lease was reclaimed.');
-    }
-  };
+  activeCommandCounts.set(leaseKey, (activeCommandCounts.get(leaseKey) ?? 0) + 1);
   try {
     switch (cmd.action) {
       case 'exec':
-        return await handleExec(cmd, leaseKey, guard);
+        return await handleExec(cmd, leaseKey);
       case 'navigate':
-        return await handleNavigate(cmd, leaseKey, guard);
+        return await handleNavigate(cmd, leaseKey);
       case 'tabs':
-        return await handleTabs(cmd, leaseKey, guard);
+        return await handleTabs(cmd, leaseKey);
       case 'cookies':
         return await handleCookies(cmd);
-      case 'viewport':
-        return await handleViewport(cmd, leaseKey, guard);
       case 'screenshot':
-        return await handleScreenshot(cmd, leaseKey, guard);
+        return await handleScreenshot(cmd, leaseKey);
+      case 'close-owned-tab':
       case 'close-window':
         return await handleCloseWindow(cmd, leaseKey);
       case 'cdp':
-        return await handleCdp(cmd, leaseKey, guard);
+        return await handleCdp(cmd, leaseKey);
       case 'set-file-input':
-        return await handleSetFileInput(cmd, leaseKey, guard);
+        return await handleSetFileInput(cmd, leaseKey);
       case 'insert-text':
-        return await handleInsertText(cmd, leaseKey, guard);
+        return await handleInsertText(cmd, leaseKey);
       case 'bind':
-        return await handleBind(cmd, leaseKey, guard);
+        return await handleBind(cmd, leaseKey);
       case 'network-capture-start':
-        return await handleNetworkCaptureStart(cmd, leaseKey, guard);
-      case 'console-read': {
-        const tabId = await resolveTabId(await resolveCommandTabId(cmd), leaseKey, undefined, guard);
-        return pageScopedResult(cmd.id, tabId, executor.readConsoleCapture(tabId));
-      }
+        return await handleNetworkCaptureStart(cmd, leaseKey);
       case 'network-capture-read':
-        return await handleNetworkCaptureRead(cmd, leaseKey, guard);
+        return await handleNetworkCaptureRead(cmd, leaseKey);
       case 'wait-download':
         return await handleWaitDownload(cmd);
       case 'frames':
-        return await handleFrames(cmd, leaseKey, guard);
-      case 'contexts':
-        return await handleContexts(cmd, leaseKey, guard);
-      case 'clipboard':
-        return await handleClipboard(cmd);
+        return await handleFrames(cmd, leaseKey);
       default:
         return { id: cmd.id, ok: false, error: `Unknown action: ${cmd.action}` };
     }
   } catch (err) {
     return errorResult(cmd.id, err);
   } finally {
-    // A late finally from a released lease must not alter its replacement.
-    if (activeCommands.get(leaseKey) === commands && commands.delete(inflight)) {
-      if (!commands.size) activeCommands.delete(leaseKey);
-      resetWindowIdleTimer(leaseKey);
-    }
+    const remaining = (activeCommandCounts.get(leaseKey) ?? 1) - 1;
+    if (remaining <= 0) activeCommandCounts.delete(leaseKey);
+    else activeCommandCounts.set(leaseKey, remaining);
+    // Grant a fresh idle window measured from command COMPLETION, not start.
+    resetWindowIdleTimer(leaseKey);
   }
 }
 
@@ -3447,13 +1446,10 @@ async function handleCommand(cmd: Command): Promise<Result> {
 /** Internal blank page used when no user URL is provided. */
 const BLANK_PAGE = 'about:blank';
 
-/** Default navigate() timeout when the command carries no `timeoutMs` (older CLI, or unset). */
-const DEFAULT_NAVIGATE_TIMEOUT_MS = 15000;
-
 /** Check if a URL can be attached via CDP — only allow http(s) and blank pages. */
 function isDebuggableUrl(url?: string): boolean {
   if (!url) return true;  // empty/undefined = tab still loading, allow it
-  return url.startsWith('http://') || url.startsWith('https://') || (url === 'about:blank' || url.startsWith('about:blank#')) || url.startsWith('data:');
+  return url.startsWith('http://') || url.startsWith('https://') || url === 'about:blank' || url.startsWith('data:');
 }
 
 /** Check if a URL is safe for user-facing navigation (http/https only). */
@@ -3521,47 +1517,13 @@ function enumerateCrossOriginFrames(tree: any): Array<{ index: number; frameId: 
   return frames;
 }
 
-/**
- * Cross-origin frame list for a tab, merging Page.getFrameTree's childFrames
- * (same-process frames) with chrome.debugger's OOPIF targets (cross-origin
- * frames that site isolation moves out of the parent page's frame tree, so
- * they never show up as childFrames — see executor.listIframeTargets).
- * Shared by handleFrames and handleExec's frameIndex branch so both use the
- * same index ordering.
- */
-async function enumerateFramesForTab(tabId: number): Promise<{ frames: Array<{ index: number; frameId: string; url: string; name: string }>; debug: Record<string, unknown> }> {
-  const tree = await executor.getFrameTree(tabId);
-  const frames = enumerateCrossOriginFrames(tree);
-  const knownFrameIds = new Set(frames.map((f) => f.frameId));
-  const treeChildCount = frames.length;
-
-  let iframeTargets: Array<{ targetId: string; url: string; title: string }> = [];
-  let debug: Record<string, unknown> = {};
-  try {
-    const result = await executor.listIframeTargets(tabId);
-    iframeTargets = result.targets;
-    debug = result.debug;
-  } catch (err) {
-    // OOPIF discovery is best-effort — fall back to the frame-tree-only list.
-    debug = { listError: String(err) };
-  }
-  for (const target of iframeTargets) {
-    if (!target.targetId || knownFrameIds.has(target.targetId)) continue;
-    knownFrameIds.add(target.targetId);
-    frames.push({
-      index: frames.length,
-      frameId: target.targetId,
-      url: target.url,
-      name: target.title || '',
-    });
-  }
-  return { frames, debug: { treeChildCount, ...debug } };
-}
-
 function setLeaseSession(
   leaseKey: string,
   session: Omit<TargetLease, 'idleTimer' | 'idleDeadlineAt' | 'contextId' | 'ownership' | 'lifecycle' | 'windowRole'>,
 ): void {
+  if (session.preferredTabId !== null && closingTabs.has(session.preferredTabId)) {
+    throw new CommandFailure('session_busy', 'This tab is closing; wait for cleanup to finish.');
+  }
   const existing = automationSessions.get(leaseKey);
   if (existing?.idleTimer) clearTimeout(existing.idleTimer);
   const timeout = getIdleTimeout(leaseKey);
@@ -3588,21 +1550,7 @@ type ResolvedTab = { tabId: number; tab: chrome.tabs.Tab | null };
  * Resolve target tab for the session lease, returning both the tabId and
  * the Tab object (when available) so callers can skip a redundant chrome.tabs.get().
  */
-async function resolveTab(tabId: number | undefined, leaseKey: string, initialUrl?: string, guard?: CommandGuard): Promise<ResolvedTab> {
-  const resolved = await resolveTabForLease(tabId, leaseKey, initialUrl, guard);
-  guard?.();
-  const viewport = sessionViewports.get(leaseKey);
-  if (viewport) {
-    await executor.setViewport(resolved.tabId, { width: viewport.width, height: viewport.height });
-    viewport.tabs.add(resolved.tabId);
-    guard?.();
-  }
-  if (getWindowMode(leaseKey) !== 'dedicated') return resolved;
-  return applyDedicatedSessionPolicy(leaseKey, resolved, guard);
-}
-
-async function resolveTabForLease(tabId: number | undefined, leaseKey: string, initialUrl?: string, guard?: CommandGuard): Promise<ResolvedTab> {
-  guard?.();
+async function resolveTab(tabId: number | undefined, leaseKey: string, initialUrl?: string): Promise<ResolvedTab> {
   const existingSession = automationSessions.get(leaseKey);
   // Even when an explicit tabId is provided, validate it is still debuggable.
   if (tabId !== undefined) {
@@ -3667,7 +1615,6 @@ async function resolveTabForLease(tabId: number | undefined, leaseKey: string, i
       }
     } catch (err) {
       if (err instanceof CommandFailure) throw err;
-      guard?.();
       await removeLeaseSession(leaseKey);
       if (!session.owned) {
         throw new CommandFailure(
@@ -3676,49 +1623,19 @@ async function resolveTabForLease(tabId: number | undefined, leaseKey: string, i
           'Run "opencli browser bind" again, then retry the command.',
         );
       }
-      return createOwnedTabLease(leaseKey, initialUrl, guard);
+      return createOwnedTabLease(leaseKey, initialUrl);
     }
   }
 
   if (!existingSession || (existingSession.owned && existingSession.preferredTabId === null)) {
-    // When no URL is provided (non-navigation commands like eval/click/state),
-    // refuse to auto-create a blank tab for a session that doesn't exist.
-    // This prevents a common mistake where $$ in shell expands to a different
-    // PID on each Bash tool invocation, silently creating orphan blank tabs
-    // instead of reusing the intended session.
-    // Only guard the user-facing `opencli browser <session> ...` surface. Adapter
-    // leases (COOKIE/INTERCEPT/UI strategies) legitimately open their automation tab
-    // without a URL, so applying this guard to them breaks every browser-backed
-    // adapter command — and `opencli doctor`'s probe along with them.
-    if (!existingSession && !initialUrl && getSurfaceFromKey(leaseKey) === 'browser') {
-      const sessionName = getSessionFromKey(leaseKey);
-      const activeSessions: string[] = [];
-      for (const [k, s] of automationSessions.entries()) {
-        if (s.owned) {
-          const name = getSessionFromKey(k);
-          const url = s.preferredTabId != null
-            ? await chrome.tabs.get(s.preferredTabId).then(t => t.url ?? '(unknown)').catch(() => '(closed)')
-            : '(no tab)';
-          activeSessions.push(`  ${name}  ${url}`);
-        }
-      }
-      const sessionList = activeSessions.length > 0
-        ? `\nActive sessions:\n${activeSessions.join('\n')}`
-        : '\nNo active sessions.';
-      throw new CommandFailure(
-        'session_not_found',
-        `No active session "${sessionName}".${sessionList}`,
-        'Open a URL first with "opencli browser <session> open <url>". If using $$ for session names, note that $$ changes with each shell process — use a fixed name instead.',
-      );
-    }
-    return createOwnedTabLease(leaseKey, initialUrl, guard);
+    return createOwnedTabLease(leaseKey, initialUrl);
   }
 
-  // Get (or create) the container window for this lease
-  const windowId = await getAutomationWindow(leaseKey, initialUrl, guard);
+  // Get (or create) the dedicated automation container
+  const windowId = await getAutomationWindow(leaseKey, initialUrl);
 
   const role = getOwnedWindowRole(leaseKey);
-  const group = existingSession?.owned ? await ensureOwnedContainerGroup(role, leaseKey, windowId, []) : null;
+  const group = existingSession?.owned ? await ensureOwnedContainerGroup(role, windowId, []) : null;
   const scopedWindowId = group?.windowId ?? windowId;
   const reusableTabId = await findReusableOwnedContainerTab(scopedWindowId, existingSession?.owned ? (group?.id ?? null) : undefined);
   if (reusableTabId !== undefined) return { tabId: reusableTabId, tab: await chrome.tabs.get(reusableTabId) };
@@ -3741,17 +1658,10 @@ async function resolveTabForLease(tabId: number | undefined, leaseKey: string, i
     }
   }
 
-  // Fallback: create a new tab. Not active unless foreground/active was asked for —
-  // see createOwnedTabLeaseUnlocked.
-  const newTab = await chrome.tabs.create({
-    windowId: scopedWindowId,
-    url: BLANK_PAGE,
-    active: tabActivationFor(leaseKey),
-  });
+  // Fallback: create a new tab
+  const newTab = await chrome.tabs.create({ windowId: scopedWindowId, url: BLANK_PAGE, active: true });
   if (!newTab.id) throw new Error('Failed to create tab in automation container');
-  guardCreatedTab(guard, newTab.id);
-  await ensureOwnedContainerGroup(role, leaseKey, scopedWindowId, [newTab.id]);
-  guardCreatedTab(guard, newTab.id);
+  await ensureOwnedContainerGroup(role, scopedWindowId, [newTab.id]);
   return { tabId: newTab.id, tab: await chrome.tabs.get(newTab.id) };
 }
 
@@ -3762,8 +1672,8 @@ async function pageScopedResult(id: string, tabId: number, data?: unknown): Prom
 }
 
 /** Convenience wrapper returning just the tabId (used by most handlers) */
-async function resolveTabId(tabId: number | undefined, leaseKey: string, initialUrl?: string, guard?: CommandGuard): Promise<number> {
-  const resolved = await resolveTab(tabId, leaseKey, initialUrl, guard);
+async function resolveTabId(tabId: number | undefined, leaseKey: string, initialUrl?: string): Promise<number> {
+  const resolved = await resolveTab(tabId, leaseKey, initialUrl);
   return resolved.tabId;
 }
 
@@ -3825,79 +1735,32 @@ function classifyExtensionError(message: string): string | undefined {
   if (/CDP command .* timed out/.test(message)) return 'cdp_timeout';
   if (/attach failed|Debugger is not attached/.test(message)) return 'attach_failed';
   if (/No tab with id|no longer exists|No window with id/.test(message)) return 'tab_gone';
-  if (/No iframe target found for frame|No session with given id|Cannot find context with specified id/.test(message)) return 'frame_not_attached';
   return undefined;
 }
 
 function errorResult(id: string, err: unknown): Result {
   const message = err instanceof Error ? err.message : String(err);
-  if (err instanceof CommandFailure) {
+  if (err instanceof CommandFailure || err instanceof ChromeApiError) {
     return { id, ok: false, error: message, errorCode: err.code, ...(err.hint ? { errorHint: err.hint } : {}) };
   }
   const errorCode = classifyExtensionError(message);
   return { id, ok: false, error: message, ...(errorCode ? { errorCode } : {}) };
 }
 
-async function handleExec(cmd: Command, leaseKey: string, guard?: CommandGuard): Promise<Result> {
+async function handleExec(cmd: Command, leaseKey: string): Promise<Result> {
   if (!cmd.code) return { id: cmd.id, ok: false, error: 'Missing code' };
   const cmdTabId = await resolveCommandTabId(cmd);
-  const tabId = await resolveTabId(cmdTabId, leaseKey, undefined, guard);
+  const tabId = await resolveTabId(cmdTabId, leaseKey);
   try {
     const aggressive = getSurfaceFromKey(leaseKey) === 'browser';
     if (cmd.frameIndex != null) {
-      const { frames } = await enumerateFramesForTab(tabId);
+      const tree = await executor.getFrameTree(tabId);
+      const frames = enumerateCrossOriginFrames(tree);
       if (cmd.frameIndex < 0 || cmd.frameIndex >= frames.length) {
         return { id: cmd.id, ok: false, error: `Frame index ${cmd.frameIndex} out of range (${frames.length} cross-origin frames available)` };
       }
       const data = await executor.evaluateInFrame(tabId, cmd.code, frames[cmd.frameIndex].frameId, aggressive, commandCdpTimeoutMs(cmd));
       return pageScopedResult(cmd.id, tabId, data);
-    }
-    if (cmd.execContextId != null) {
-      await executor.ensureAttached(tabId, aggressive);
-      // A context id created in a child OOPIF flatten session is NOT visible
-      // to a Runtime.evaluate sent on the plain {tabId} (tab-level) debuggee.
-      // Sending it there anyway does not error -- each flatten session numbers
-      // its own contexts independently, so it silently evaluates a
-      // same-numbered context in the wrong (main) frame instead. Resolve
-      // which session actually owns this context id and route there; if it
-      // is unknown or its session has since gone away, fail loudly with a
-      // machine-readable code instead of guessing.
-      const owner = executor.resolveContextSession(tabId, cmd.execContextId);
-      if (!owner) {
-        return {
-          id: cmd.id,
-          ok: false,
-          error: `Execution context ${cmd.execContextId} is not known for this tab (use "browser contexts" for current ids)`,
-          errorCode: 'frame_not_attached',
-        };
-      }
-      if (!owner.live) {
-        return {
-          id: cmd.id,
-          ok: false,
-          error: `Execution context ${cmd.execContextId}'s frame session has detached or navigated away; re-run "browser contexts" and retry`,
-          errorCode: 'frame_not_attached',
-        };
-      }
-      const debuggee = (owner.sessionId
-        ? { tabId, sessionId: owner.sessionId }
-        : { tabId }) as chrome.debugger.Debuggee;
-      const result = await executor.sendDebuggerCommand(debuggee, 'Runtime.evaluate', {
-        expression: cmd.code,
-        contextId: cmd.execContextId,
-        returnByValue: true,
-        awaitPromise: true,
-      }, commandCdpTimeoutMs(cmd)) as {
-        result?: { value?: unknown };
-        exceptionDetails?: { exception?: { description?: string }; text?: string };
-      };
-      if (result.exceptionDetails) {
-        const errMsg = result.exceptionDetails.exception?.description
-          || result.exceptionDetails.text
-          || 'Evaluation error in context';
-        return { id: cmd.id, ok: false, error: errMsg };
-      }
-      return pageScopedResult(cmd.id, tabId, result.result?.value);
     }
     const data = await executor.evaluateAsync(tabId, cmd.code, aggressive, commandCdpTimeoutMs(cmd));
     return pageScopedResult(cmd.id, tabId, data);
@@ -3906,35 +1769,18 @@ async function handleExec(cmd: Command, leaseKey: string, guard?: CommandGuard):
   }
 }
 
-async function handleFrames(cmd: Command, leaseKey: string, guard?: CommandGuard): Promise<Result> {
+async function handleFrames(cmd: Command, leaseKey: string): Promise<Result> {
   const cmdTabId = await resolveCommandTabId(cmd);
-  const tabId = await resolveTabId(cmdTabId, leaseKey, undefined, guard);
+  const tabId = await resolveTabId(cmdTabId, leaseKey);
   try {
-    const result = await enumerateFramesForTab(tabId);
-    if (cmd.debug) {
-      return { id: cmd.id, ok: true, data: result };
-    }
-    return { id: cmd.id, ok: true, data: result.frames };
+    const tree = await executor.getFrameTree(tabId);
+    return { id: cmd.id, ok: true, data: enumerateCrossOriginFrames(tree) };
   } catch (err) {
     return errorResult(cmd.id, err);
   }
 }
 
-async function handleContexts(cmd: Command, leaseKey: string, guard?: CommandGuard): Promise<Result> {
-  const cmdTabId = await resolveCommandTabId(cmd);
-  const tabId = await resolveTabId(cmdTabId, leaseKey, undefined, guard);
-  try {
-    const aggressive = getSurfaceFromKey(leaseKey) === 'browser';
-    await executor.ensureAttached(tabId, aggressive);
-    const contexts = executor.getAllContexts(tabId);
-    return { id: cmd.id, ok: true, data: contexts };
-  } catch (err) {
-    return errorResult(cmd.id, err);
-  }
-}
-
-function preferOwnedTab(leaseKey: string, tabId: number, guard?: CommandGuard): void {
-  guard?.();
+function preferOwnedTab(leaseKey: string, tabId: number): void {
   const session = automationSessions.get(leaseKey);
   if (!session?.owned) return;
   setLeaseSession(leaseKey, {
@@ -3947,37 +1793,40 @@ function preferOwnedTab(leaseKey: string, tabId: number, guard?: CommandGuard): 
   });
 }
 
-async function handleNavigate(cmd: Command, leaseKey: string, guard?: CommandGuard): Promise<Result> {
+async function handleNavigate(cmd: Command, leaseKey: string): Promise<Result> {
   if (!cmd.url) return { id: cmd.id, ok: false, error: 'Missing url' };
-  if (cmd.url !== BLANK_PAGE && !isSafeNavigationUrl(cmd.url)) {
+  if (!isSafeNavigationUrl(cmd.url)) {
     return { id: cmd.id, ok: false, error: 'Blocked URL scheme -- only http:// and https:// are allowed' };
   }
-  // Create a blank tab so Runtime capture is armed before the first page load.
+  // Acquire a blank lease first: this handler alone starts the navigation.
+  // Passing cmd.url into lease creation issues the same request twice while
+  // the first load is pending, which Chromium can reject (#2487).
   const cmdTabId = await resolveCommandTabId(cmd);
-  const resolved = await resolveTab(cmdTabId, leaseKey, BLANK_PAGE, guard);
-  guard?.();
+  const resolved = await resolveTab(cmdTabId, leaseKey);
   const tabId = resolved.tabId;
 
   const beforeTab = resolved.tab ?? await chrome.tabs.get(tabId);
   const beforeNormalized = normalizeUrlForComparison(beforeTab.url);
   const targetUrl = cmd.url;
-  await executor.ensureAttached(tabId);
 
-  // The new window may already be loading this URL; do not navigate it twice.
-  const alreadyAtTarget = isTargetUrl(beforeTab.url, targetUrl);
-  if (alreadyAtTarget && beforeTab.status === 'complete') {
+  // Fast-path: tab is already at the target URL and fully loaded.
+  if (beforeTab.status === 'complete' && isTargetUrl(beforeTab.url, targetUrl)) {
     return pageScopedResult(cmd.id, tabId, { title: beforeTab.title, url: beforeTab.url, timedOut: false });
   }
 
-  let rejectedNavigation: unknown;
-  if (!alreadyAtTarget) {
-    try {
-      await chrome.tabs.update(tabId, { url: targetUrl });
-    } catch (err) {
-      if (!(err instanceof Error) || !err.message.includes('Navigation rejected')) throw err;
-      rejectedNavigation = err;
-    }
+  // Detach any existing debugger before top-level navigation unless network
+  // capture is already armed on this tab. Otherwise we would clear the capture
+  // state right before the page load we are trying to observe.
+  // Some sites (observed on creator.xiaohongshu.com flows) can invalidate the
+  // current inspected target during navigation, which leaves a stale CDP attach
+  // state and causes the next Runtime.evaluate to fail with
+  // "Inspected target navigated or closed". Resetting here forces a clean
+  // re-attach after navigation when capture is not active.
+  if (!executor.hasActiveNetworkCapture(tabId)) {
+    await executor.detach(tabId);
   }
+
+  await chrome.tabs.update(tabId, { url: targetUrl });
 
   // Wait until navigation completes. Resolve when status is 'complete' AND either:
   // - the URL matches the target (handles same-URL / canonicalized navigations), OR
@@ -4019,24 +1868,19 @@ async function handleNavigate(cmd: Command, leaseKey: string, guard?: CommandGua
       } catch { /* tab gone */ }
     }, 100);
 
-    // Timeout fallback with warning. `cmd.timeoutMs` carries the CLI's --timeout
-    // / OPENCLI_NAV_TIMEOUT_MS value; missing/undefined (older CLI) keeps the
-    // previous hardcoded default so older clients see unchanged behavior.
-    const navTimeoutMs = cmd.timeoutMs ?? DEFAULT_NAVIGATE_TIMEOUT_MS;
+    // Timeout fallback with warning
     timeoutTimer = setTimeout(() => {
       timedOut = true;
-      console.warn(`[opencli] Navigate to ${targetUrl} timed out after ${navTimeoutMs}ms`);
+      console.warn(`[opencli] Navigate to ${targetUrl} timed out after 15s`);
       finish();
-    }, navTimeoutMs);
+    }, 15000);
   });
 
   let tab = await chrome.tabs.get(tabId);
-  if (rejectedNavigation && (tab.status !== 'complete' || !isTargetUrl(tab.url, targetUrl))) throw rejectedNavigation;
 
   // Post-navigation drift detection: if the tab moved to another window
   // during navigation (e.g. a tab-management extension regrouped it),
   // try to move it back to maintain session isolation.
-  guard?.();
   const postNavigationSession = automationSessions.get(leaseKey);
   if (postNavigationSession && tab.windowId !== postNavigationSession.windowId) {
     console.warn(`[opencli] Tab ${tabId} drifted to window ${tab.windowId} during navigation, moving back to ${postNavigationSession.windowId}`);
@@ -4051,7 +1895,7 @@ async function handleNavigate(cmd: Command, leaseKey: string, guard?: CommandGua
   return pageScopedResult(cmd.id, tabId, { title: tab.title, url: tab.url, timedOut });
 }
 
-async function handleTabs(cmd: Command, leaseKey: string, guard?: CommandGuard): Promise<Result> {
+async function handleTabs(cmd: Command, leaseKey: string): Promise<Result> {
   const session = automationSessions.get(leaseKey);
   if (session && !session.owned && cmd.op !== 'list') {
     return {
@@ -4077,23 +1921,21 @@ async function handleTabs(cmd: Command, leaseKey: string, guard?: CommandGuard):
         return { id: cmd.id, ok: false, error: 'Blocked URL scheme -- only http:// and https:// are allowed' };
       }
       if (!automationSessions.has(leaseKey)) {
-        const created = await createOwnedTabLease(leaseKey, cmd.url, guard);
+        const created = await createOwnedTabLease(leaseKey, cmd.url);
         return pageScopedResult(cmd.id, created.tabId, { url: created.tab?.url });
       }
-      const windowId = await getAutomationWindow(leaseKey, undefined, guard);
-      let tab = await chrome.tabs.create({
-        windowId,
-        url: cmd.url ?? BLANK_PAGE,
-        active: tabActivationFor(leaseKey),
-      });
-      if (tab.id !== undefined && isDedicatedWindow(windowId)) selfCreatedTabIds.add(tab.id);
+      if (session?.dedicated) {
+        return errorResult(cmd.id, new CommandFailure(
+          'usage_error', 'Dedicated sessions own one tab. Use a new session to open another dedicated window.',
+        ));
+      }
+      const windowId = await getAutomationWindow(leaseKey);
+      let tab = await chrome.tabs.create({ windowId, url: cmd.url ?? BLANK_PAGE, active: true });
       const tabId = tab.id;
       if (!tabId) return { id: cmd.id, ok: false, error: 'Failed to create tab' };
-      guardCreatedTab(guard, tabId);
-      const group = await ensureOwnedContainerGroup(getOwnedWindowRole(leaseKey), leaseKey, windowId, [tabId]);
+      const group = session?.dedicated ? null : await ensureOwnedContainerGroup(getOwnedWindowRole(leaseKey), windowId, [tabId]);
       const sessionWindowId = group?.windowId ?? tab.windowId;
       if (tab.windowId !== sessionWindowId) tab = await chrome.tabs.get(tabId);
-      guardCreatedTab(guard, tabId);
       setLeaseSession(leaseKey, {
         session: getSessionFromKey(leaseKey),
         surface: getSurfaceFromKey(leaseKey),
@@ -4101,6 +1943,7 @@ async function handleTabs(cmd: Command, leaseKey: string, guard?: CommandGuard):
         windowId: sessionWindowId,
         owned: true,
         preferredTabId: tabId,
+        dedicated: session?.dedicated,
       });
       resetWindowIdleTimer(leaseKey);
       return pageScopedResult(cmd.id, tabId, { url: tab.url });
@@ -4149,7 +1992,7 @@ async function handleTabs(cmd: Command, leaseKey: string, guard?: CommandGuard):
         return { id: cmd.id, ok: true, data: { closed: closedPage } };
       }
       const cmdTabId = await resolveCommandTabId(cmd);
-      const tabId = await resolveTabId(cmdTabId, leaseKey, undefined, guard);
+      const tabId = await resolveTabId(cmdTabId, leaseKey);
       const closedPage = await identity.resolveTargetId(tabId).catch(() => undefined);
       const currentSession = automationSessions.get(leaseKey);
       if (currentSession?.preferredTabId === tabId) {
@@ -4176,14 +2019,14 @@ async function handleTabs(cmd: Command, leaseKey: string, guard?: CommandGuard):
           return { id: cmd.id, ok: false, error: `Page is not in the automation container` };
         }
         await chrome.tabs.update(cmdTabId, { active: true });
-        preferOwnedTab(leaseKey, cmdTabId, guard);
+        preferOwnedTab(leaseKey, cmdTabId);
         return pageScopedResult(cmd.id, cmdTabId, { selected: true });
       }
       const tabs = await listAutomationWebTabs(leaseKey);
       const target = tabs[cmd.index!];
       if (!target?.id) return { id: cmd.id, ok: false, error: `Tab index ${cmd.index} not found` };
       await chrome.tabs.update(target.id, { active: true });
-      preferOwnedTab(leaseKey, target.id, guard);
+      preferOwnedTab(leaseKey, target.id);
       return pageScopedResult(cmd.id, target.id, { selected: true });
     }
     default:
@@ -4211,9 +2054,9 @@ async function handleCookies(cmd: Command): Promise<Result> {
   return { id: cmd.id, ok: true, data };
 }
 
-async function handleScreenshot(cmd: Command, leaseKey: string, guard?: CommandGuard): Promise<Result> {
+async function handleScreenshot(cmd: Command, leaseKey: string): Promise<Result> {
   const cmdTabId = await resolveCommandTabId(cmd);
-  const tabId = await resolveTabId(cmdTabId, leaseKey, undefined, guard);
+  const tabId = await resolveTabId(cmdTabId, leaseKey);
   try {
     const data = await executor.screenshot(tabId, {
       format: cmd.format,
@@ -4251,26 +2094,20 @@ const CDP_ALLOWLIST = new Set([
   'Page.captureScreenshot',
   'Page.getFrameTree',
   'Page.handleJavaScriptDialog',
-  // Runtime.enable needed for CDP attach setup (Runtime.evaluate normally goes through
-  // the 'exec' action, but is also allowlisted here for contextId-scoped passthrough
-  // evaluation, e.g. content script isolated worlds discovered via the 'contexts' action)
+  // Runtime.enable needed for CDP attach setup (Runtime.evaluate goes through 'exec' action)
   'Runtime.enable',
-  'Runtime.evaluate',
-  // Iframe discovery diagnostics (read-only)
-  'Target.getTargets',
-  'Target.getTargetInfo',
   // Emulation (used by screenshot full-page)
   'Emulation.setDeviceMetricsOverride',
   'Emulation.clearDeviceMetricsOverride',
 ]);
 
-async function handleCdp(cmd: Command, leaseKey: string, guard?: CommandGuard): Promise<Result> {
+async function handleCdp(cmd: Command, leaseKey: string): Promise<Result> {
   if (!cmd.cdpMethod) return { id: cmd.id, ok: false, error: 'Missing cdpMethod' };
   if (!CDP_ALLOWLIST.has(cmd.cdpMethod)) {
     return { id: cmd.id, ok: false, error: `CDP method not permitted: ${cmd.cdpMethod}` };
   }
   const cmdTabId = await resolveCommandTabId(cmd);
-  const tabId = await resolveTabId(cmdTabId, leaseKey, undefined, guard);
+  const tabId = await resolveTabId(cmdTabId, leaseKey);
   try {
     const aggressive = getSurfaceFromKey(leaseKey) === 'browser';
     await executor.ensureAttached(tabId, aggressive);
@@ -4299,136 +2136,59 @@ function stripOpenCliFrameRoutingParams(params: Record<string, unknown>, stripFr
   return rest;
 }
 
-async function handleSessions(cmd: Command): Promise<Result> {
-  if (cmd.op === 'window-relayout' || cmd.op === 'window-status' || cmd.op === 'window-ensure' || cmd.op === 'window-list' || cmd.op === 'window-close' || cmd.op === 'runtime-reload') return handleDedicatedWindowOp(cmd);
-  if (cmd.op === 'cleanup') {
-    const keys = [...automationSessions.keys()];
-    for (const key of keys) await releaseLease(key, 'cleanup');
-    return { id: cmd.id, ok: true, data: { released: keys.length } };
-  }
-  // Default: list
-  // windowId is here because "which window is this session actually in?" is the
-  // question every tab-ownership problem reduces to, and until now it could only be
-  // answered by squinting at the browser. Reading it back through the extension also
-  // beats asking the OS: AppleScript and the extension can disagree about what Chrome
-  // contains (more than one Chrome instance, a profile the script is not attached to),
-  // and when they do, the extension's view is the one the automation actually acts on.
-  //
-  // groupTitle answers the companion question "which tab group is it in" —
-  // one group per session, titled after it — and windowFallbackReason explains
-  // a window we had to create instead of borrowing (null when the tab sits in
-  // one of the person's own windows, or when they asked for `--window isolated`).
-  const entries: Array<{
-    session: string;
-    surface: string;
-    kind: string;
-    tabId: number | null;
-    windowId: number | null;
-    groupId: number | null;
-    groupTitle: string | null;
-    windowFallbackReason: WindowFallbackReason | null;
-    dedicatedSlot: string | null;
-    tabActive: boolean | null;
-    keepAlive: boolean;
-    idleDeadlineAt: number;
-    url?: string;
-    title?: string;
-  }> = [];
-  for (const [leaseKey, lease] of automationSessions) {
-    let url: string | undefined;
-    let title: string | undefined;
-    let windowId: number | null = lease.windowId ?? null;
-    let groupId: number | null = null;
-    let groupTitle: string | null = null;
-    let tabActive: boolean | null = null;
-    if (lease.preferredTabId !== null) {
-      try {
-        const tab = await chrome.tabs.get(lease.preferredTabId);
-        tabActive = typeof tab.active === 'boolean' ? tab.active : null;
-        url = tab.url;
-        title = tab.title;
-        windowId = tab.windowId ?? windowId;
-        if (typeof tab.groupId === 'number' && tab.groupId !== chrome.tabGroups.TAB_GROUP_ID_NONE) {
-          groupId = tab.groupId;
-          groupTitle = await chrome.tabGroups.get(tab.groupId).then(g => g.title ?? null).catch(() => null);
-        }
-      } catch { /* tab may be gone */ }
-    }
-    // Looked up by window, not by the lease's own role: a stand-in window one
-    // role created can host the other role's sessions too, and the reason
-    // belongs to the window.
-    let windowFallbackReason: WindowFallbackReason | null = null;
-    if (lease.owned && windowId !== null) {
-      for (const container of Object.values(ownedContainers)) {
-        if (container.windowId === windowId && !container.borrowed) {
-          windowFallbackReason = container.windowFallbackReason;
-          break;
-        }
+async function handleCloseWindow(cmd: Command, leaseKey: string): Promise<Result> {
+  if (cmd.action === 'close-owned-tab') {
+    return withLeaseMutation(async () => {
+      if ((activeCommandCounts.get(leaseKey) ?? 0) > 1) {
+        throw new CommandFailure('session_busy', 'Cannot close a tab while another command is using this session.');
       }
-    }
-    entries.push({
-      session: lease.session,
-      surface: lease.surface,
-      kind: lease.kind,
-      tabId: lease.preferredTabId,
-      windowId,
-      groupId,
-      groupTitle,
-      windowFallbackReason,
-      keepAlive: getIdleTimeout(leaseKey) === IDLE_TIMEOUT_NONE,
-      idleDeadlineAt: lease.idleDeadlineAt,
-      dedicatedSlot: dedicatedSlotForWindow(windowId)?.slot ?? null,
-      tabActive,
-      url,
-      title,
+      closingLeases.add(leaseKey);
+      let closingTabId: number | undefined;
+      try {
+        const session = automationSessions.get(leaseKey);
+        if (!session?.owned) {
+          await releaseLease(leaseKey, 'explicit close');
+          return { id: cmd.id, ok: true, data: { closed: true, session: getSessionFromKey(leaseKey), tabCleanup: 'no-owned-tab' } };
+        }
+        const tabId = session.preferredTabId;
+        if (tabId === null) {
+          throw new CommandFailure('owned_tab_identity_missing', 'Cannot close an owned lease without a tab identity.');
+        }
+        if ([...automationSessions.entries()].some(([key, lease]) => key !== leaseKey && lease.preferredTabId === tabId)) {
+          throw new CommandFailure('session_busy', 'Another session also uses this tab; release that session before closing it.');
+        }
+        closingTabId = tabId;
+        closingTabs.add(tabId);
+        // Only touch the lease's tab, even if the user added pages to its window.
+        // Ungroup first so Chrome does not save the closing automation group.
+        const tab = await chrome.tabs.get(tabId);
+        if (tab.groupId !== undefined && tab.groupId !== chrome.tabGroups.TAB_GROUP_ID_NONE) {
+          await chrome.tabs.ungroup(tabId);
+        }
+        await safeDetach(tabId);
+        // Do not evict identity or forget ownership if Chrome rejects removal:
+        // the caller must be able to retry cleanup without repeating the site action.
+        await chrome.tabs.remove(tabId);
+        identity.evictTab(tabId);
+        await removeLeaseSession(leaseKey);
+        return { id: cmd.id, ok: true, data: { closed: true, session: session.session, tabCleanup: 'closed-owned-tab' } };
+      } finally {
+        closingLeases.delete(leaseKey);
+        if (closingTabId !== undefined) closingTabs.delete(closingTabId);
+      }
     });
   }
-  return { id: cmd.id, ok: true, data: entries };
-}
-
-async function handleViewport(cmd: Command, leaseKey: string, guard?: CommandGuard): Promise<Result> {
-  if (cmd.op !== 'set' && cmd.op !== 'reset') return { id: cmd.id, ok: false, error: 'Viewport op must be set or reset' };
-  if (cmd.op === 'set') {
-    if (!Number.isSafeInteger(cmd.width) || cmd.width! <= 0 || !Number.isSafeInteger(cmd.height) || cmd.height! <= 0) {
-      return { id: cmd.id, ok: false, error: 'Viewport width and height must be positive safe integers' };
-    }
-    const previous = sessionViewports.get(leaseKey);
-    const viewport = { width: cmd.width!, height: cmd.height!, tabs: previous?.tabs ?? new Set<number>() };
-    const tabId = automationSessions.get(leaseKey)?.preferredTabId;
-    if (tabId != null) {
-      await executor.setViewport(tabId, { width: viewport.width, height: viewport.height });
-      guard?.();
-      viewport.tabs.add(tabId);
-    }
-    sessionViewports.set(leaseKey, viewport);
-    return { id: cmd.id, ok: true, data: { supported: true, viewport: { width: viewport.width, height: viewport.height, deviceScaleFactor: 1 } } };
-  }
-  await resetSessionViewport(leaseKey);
-  return { id: cmd.id, ok: true, data: { supported: true, viewport: null } };
-}
-
-async function resetSessionViewport(leaseKey: string): Promise<void> {
-  const viewport = sessionViewports.get(leaseKey);
-  if (!viewport) return;
-  for (const tabId of viewport.tabs) {
-    const tab = await chrome.tabs.get(tabId).catch(() => null);
-    if (tab) await executor.setViewport(tabId, null);
-  }
-  sessionViewports.delete(leaseKey);
-}
-
-async function handleCloseWindow(cmd: Command, leaseKey: string): Promise<Result> {
   const sessionName = automationSessions.get(leaseKey)?.session ?? getSessionFromKey(leaseKey);
   await releaseLease(leaseKey, 'explicit close');
   return { id: cmd.id, ok: true, data: { closed: true, session: sessionName } };
 }
 
-async function handleSetFileInput(cmd: Command, leaseKey: string, guard?: CommandGuard): Promise<Result> {
+async function handleSetFileInput(cmd: Command, leaseKey: string): Promise<Result> {
   if (!cmd.files || !Array.isArray(cmd.files) || cmd.files.length === 0) {
     return { id: cmd.id, ok: false, error: 'Missing or empty files array' };
   }
   const cmdTabId = await resolveCommandTabId(cmd);
-  const tabId = await resolveTabId(cmdTabId, leaseKey, undefined, guard);
+  const tabId = await resolveTabId(cmdTabId, leaseKey);
   try {
     await executor.setFileInputFiles(tabId, cmd.files, cmd.selector);
     return pageScopedResult(cmd.id, tabId, { count: cmd.files.length });
@@ -4437,12 +2197,12 @@ async function handleSetFileInput(cmd: Command, leaseKey: string, guard?: Comman
   }
 }
 
-async function handleInsertText(cmd: Command, leaseKey: string, guard?: CommandGuard): Promise<Result> {
+async function handleInsertText(cmd: Command, leaseKey: string): Promise<Result> {
   if (typeof cmd.text !== 'string') {
     return { id: cmd.id, ok: false, error: 'Missing text payload' };
   }
   const cmdTabId = await resolveCommandTabId(cmd);
-  const tabId = await resolveTabId(cmdTabId, leaseKey, undefined, guard);
+  const tabId = await resolveTabId(cmdTabId, leaseKey);
   try {
     await executor.insertText(tabId, cmd.text);
     return pageScopedResult(cmd.id, tabId, { inserted: true });
@@ -4451,20 +2211,9 @@ async function handleInsertText(cmd: Command, leaseKey: string, guard?: CommandG
   }
 }
 
-async function handleNetworkCaptureStart(cmd: Command, leaseKey: string, guard?: CommandGuard): Promise<Result> {
+async function handleNetworkCaptureStart(cmd: Command, leaseKey: string): Promise<Result> {
   const cmdTabId = await resolveCommandTabId(cmd);
-  // network-capture-start is called speculatively before navigation (open command);
-  // if the session doesn't exist yet, return started:false instead of erroring —
-  // the subsequent navigate command will create the session.
-  let tabId: number;
-  try {
-    tabId = await resolveTabId(cmdTabId, leaseKey, undefined, guard);
-  } catch (err) {
-    if (err instanceof CommandFailure && err.code === 'session_not_found') {
-      return { id: cmd.id, ok: true, data: { started: false } };
-    }
-    throw err;
-  }
+  const tabId = await resolveTabId(cmdTabId, leaseKey);
   try {
     await executor.startNetworkCapture(tabId, cmd.pattern);
     return pageScopedResult(cmd.id, tabId, { started: true });
@@ -4473,11 +2222,11 @@ async function handleNetworkCaptureStart(cmd: Command, leaseKey: string, guard?:
   }
 }
 
-async function handleNetworkCaptureRead(cmd: Command, leaseKey: string, guard?: CommandGuard): Promise<Result> {
+async function handleNetworkCaptureRead(cmd: Command, leaseKey: string): Promise<Result> {
   const cmdTabId = await resolveCommandTabId(cmd);
-  const tabId = await resolveTabId(cmdTabId, leaseKey, undefined, guard);
+  const tabId = await resolveTabId(cmdTabId, leaseKey);
   try {
-    const data = await executor.readNetworkCapture(tabId);
+    const data = await executor.readNetworkCapture(tabId, cmd.retainIncomplete === true);
     return pageScopedResult(cmd.id, tabId, data);
   } catch (err) {
     return errorResult(cmd.id, err);
@@ -4493,57 +2242,7 @@ async function handleWaitDownload(cmd: Command): Promise<Result> {
   }
 }
 
-// ─── Clipboard (offscreen document) ────────────────────────────────
-//
-// MV3 service workers have no `document`, and a normal tab's
-// document.execCommand/navigator.clipboard calls are gated behind document
-// focus — opencli's automation tabs run in background windows by default,
-// so that path is essentially never usable. chrome.offscreen with reason
-// `CLIPBOARD` is the documented, focus-exempt way to do clipboard I/O from
-// a service worker. The offscreen document is kept alive indefinitely as a
-// singleton (same pattern as the owned container windows below) rather than
-// closed/recreated per call — there is no per-call cleanup need since it
-// holds no per-session state.
-
-let offscreenDocPromise: Promise<void> | null = null;
-
-async function ensureOffscreenDocument(): Promise<void> {
-  if (await chrome.offscreen.hasDocument()) return;
-  if (offscreenDocPromise) return offscreenDocPromise;
-  offscreenDocPromise = chrome.offscreen.createDocument({
-    url: 'offscreen.html',
-    reasons: ['CLIPBOARD' as chrome.offscreen.Reason],
-    justification: 'Read the system clipboard for the opencli "clipboard" command.',
-  }).finally(() => { offscreenDocPromise = null; });
-  return offscreenDocPromise;
-}
-
-async function readSystemClipboard(timeoutMs = 5000): Promise<string> {
-  await ensureOffscreenDocument();
-  const response = await new Promise<{ text?: string; error?: string }>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('offscreen clipboard read timed out')), timeoutMs);
-    chrome.runtime.sendMessage({ type: 'opencli-read-clipboard' }, (resp) => {
-      clearTimeout(timer);
-      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
-      else resolve(resp ?? {});
-    });
-  });
-  if (response.error) throw new Error(response.error);
-  return response.text ?? '';
-}
-
-async function handleClipboard(cmd: Command): Promise<Result> {
-  try {
-    const text = await readSystemClipboard();
-    return { id: cmd.id, ok: true, data: { text } };
-  } catch (err) {
-    return errorResult(cmd.id, err);
-  }
-}
-
 async function releaseLease(leaseKey: string, reason: string = 'released'): Promise<void> {
-  await resetSessionViewport(leaseKey);
-  activeCommands.delete(leaseKey);
   const session = automationSessions.get(leaseKey);
   if (!session) {
     sessionOverrides.delete(leaseKey);
@@ -4566,30 +2265,16 @@ async function releaseLease(leaseKey: string, reason: string = 'released'): Prom
       );
       await safeDetach(tabId);
       identity.evictTab(tabId);
-      const dedicatedSlot = dedicatedSlotForWindow(session.windowId);
-      // Whatever happens to the tab, the window goes back to the pool for the next
-      // caller and starts its idle clock.
-      await releaseDedicatedHolder(leaseKey);
-      if (dedicatedSlot) {
-        // Dedicated windows outlive their leases: the last tab stays as a placeholder.
-        const outcome = await releaseDedicatedLeaseTab(dedicatedSlot, tabId);
-        console.log(`[opencli] Released dedicated tab lease ${tabId} (${outcome}, slot=${dedicatedSlot.slot}, session=${session.session}, surface=${session.surface}, ${reason})`);
-      } else if (hasOtherOwnedLease) {
+      if (session.dedicated || hasOtherOwnedLease) {
         await chrome.tabs.remove(tabId).catch(() => {});
         console.log(`[opencli] Released owned tab lease ${tabId} (session=${session.session}, surface=${session.surface}, ${reason})`);
-      } else if (ownedContainers[getOwnedWindowRole(leaseKey)].borrowed) {
-        // In a window we merely borrowed, a leftover blank placeholder is litter in
-        // the person's own tab strip. Close it instead — the placeholder only pays
-        // for itself inside a container window nobody else looks at.
-        await chrome.tabs.remove(tabId).catch(() => {});
-        console.log(`[opencli] Closed borrowed tab lease ${tabId} (session=${session.session}, surface=${session.surface}, ${reason})`);
       } else {
         try {
-          // Releasing a lease must never pull the view anywhere: this fires on idle
-          // timeout and on cleanup, so `active: true` here reads to the person as the
-          // browser randomly jumping to a blank page long after they stopped watching.
-          const tab = await chrome.tabs.update(tabId, { url: BLANK_PAGE });
-          const group = await ensureOwnedContainerGroup(getOwnedWindowRole(leaseKey), leaseKey, session.windowId, [tab.id ?? tabId]);
+          const role = getOwnedWindowRole(leaseKey);
+          const idleUrl = role === 'interactive'
+            ? await parkIdleInteractiveTab(tabId, session.windowId) : null;
+          const tab = await chrome.tabs.update(tabId, { url: idleUrl ?? BLANK_PAGE, active: true });
+          const group = await ensureOwnedContainerGroup(getOwnedWindowRole(leaseKey), session.windowId, [tab.id ?? tabId]);
           if (group) session.windowId = group.windowId;
           console.log(`[opencli] Released owned tab lease ${tabId} as reusable placeholder (session=${session.session}, surface=${session.surface}, ${reason})`);
         } catch {
@@ -4612,37 +2297,21 @@ async function releaseLease(leaseKey: string, reason: string = 'released'): Prom
 }
 
 async function reconcileTargetLeaseRegistry(): Promise<void> {
-  // Dedicated slots first: every guard below asks "is this a dedicated window".
-  await restoreDedicatedState();
   const registry = await readRegistry();
   // Restore the orphan-group ledger (readRegistry already coerced it to a
-  // clean shape). Legacy bare `groupIds` come back ownerless: kept only so the
-  // prune pass retires them, never adopted for a session.
-  ownedGroupLedger.clear();
+  // clean number[]).
+  interactiveGroupLedger.clear();
+  for (const id of registry.ownedContainers.interactive.groupIds) interactiveGroupLedger.add(id);
+  // Restore container window ids; group ownership is re-established from the
+  // browser-session ledger and owned lease tabs during convergence.
   for (const role of Object.keys(ownedContainers) as OwnedWindowRole[]) {
-    const stored = registry.ownedContainers[role];
-    for (const [groupId, leaseKey] of Object.entries(stored.groups ?? {})) {
-      if (getOwnedWindowRole(leaseKey) === role) ownedGroupLedger.set(Number(groupId), leaseKey);
-    }
-    for (const groupId of stored.groupIds ?? []) {
-      if (!ownedGroupLedger.has(groupId)) ownedGroupLedger.set(groupId, null);
-    }
-  }
-  // Only windowId/borrowed/reason are restored to the container cache; the
-  // in-memory group map starts empty (a fresh worker) and repopulates via the
-  // session ledger, title, and lease layers during the convergence below.
-  for (const role of Object.keys(ownedContainers) as OwnedWindowRole[]) {
-    const stored = registry.ownedContainers[role];
-    ownedContainers[role].windowId = stored?.windowId ?? null;
-    ownedContainers[role].borrowed = stored?.borrowed === true;
-    ownedContainers[role].windowFallbackReason = stored?.windowFallbackReason ?? null;
-    ownedContainers[role].groups.clear();
+    ownedContainers[role].windowId = registry.ownedContainers[role]?.windowId ?? null;
     const windowId = ownedContainers[role].windowId;
     if (windowId !== null) {
       try {
         await chrome.windows.get(windowId);
       } catch {
-        forgetContainerWindow(role);
+        ownedContainers[role].windowId = null;
       }
     }
   }
@@ -4657,12 +2326,10 @@ async function reconcileTargetLeaseRegistry(): Promise<void> {
       if (stored.lifecycle === 'ephemeral' || stored.lifecycle === 'persistent' || stored.lifecycle === 'pinned') {
         setSessionOverride(leaseKey, { lifecycle: stored.lifecycle });
       }
-      if (stored.idleTimeoutMs === -1 || (Number.isInteger(stored.idleTimeoutMs) && stored.idleTimeoutMs! > 0)) {
+      if (stored.idleTimeoutMs === IDLE_TIMEOUT_NONE || (typeof stored.idleTimeoutMs === 'number' && stored.idleTimeoutMs > 0)) {
         setSessionOverride(leaseKey, { idleTimeoutMs: stored.idleTimeoutMs });
       }
-      if (stored.inflightCommands?.length) {
-        activeCommands.set(leaseKey, new Set(stored.inflightCommands));
-      }
+      if (stored.dedicated === true && stored.owned) setSessionOverride(leaseKey, { windowMode: 'dedicated' });
       const session = makeSession(leaseKey, {
         session: typeof stored.session === 'string' ? stored.session : getSessionFromKey(leaseKey),
         surface: stored.surface === 'adapter' ? 'adapter' : getSurfaceFromKey(leaseKey),
@@ -4670,6 +2337,7 @@ async function reconcileTargetLeaseRegistry(): Promise<void> {
         windowId: tab.windowId,
         owned: stored.owned,
         preferredTabId: tabId,
+        dedicated: stored.dedicated === true && stored.owned,
       });
       const timeout = getIdleTimeout(leaseKey);
       automationSessions.set(leaseKey, {
@@ -4677,10 +2345,10 @@ async function reconcileTargetLeaseRegistry(): Promise<void> {
         idleTimer: null,
         idleDeadlineAt: stored.idleDeadlineAt,
       });
-      if (session.owned) {
+      if (session.owned && !session.dedicated) {
         const role = getOwnedWindowRole(leaseKey);
-        if (ownedContainers[role].windowId === null && !isDedicatedWindow(tab.windowId)) ownedContainers[role].windowId = tab.windowId;
-        const group = await ensureOwnedContainerGroup(role, leaseKey, tab.windowId, [tabId]);
+        if (ownedContainers[role].windowId === null) ownedContainers[role].windowId = tab.windowId;
+        const group = await ensureOwnedContainerGroup(role, tab.windowId, [tabId]);
         if (group) {
           const current = automationSessions.get(leaseKey);
           if (current) current.windowId = group.windowId;
@@ -4689,7 +2357,7 @@ async function reconcileTargetLeaseRegistry(): Promise<void> {
       const remaining = stored.idleDeadlineAt > 0 ? stored.idleDeadlineAt - Date.now() : timeout;
       if (timeout > 0) {
         if (remaining <= 0) {
-          await handleIdleExpiry(leaseKey, 'reconciled idle expiry');
+          await releaseLease(leaseKey, 'reconciled idle expiry');
         } else {
           // Honor the persisted remaining lifetime — not a fresh full timeout —
           // so a lease cannot dodge idle expiry by riding repeated SW restarts.
@@ -4702,29 +2370,21 @@ async function reconcileTargetLeaseRegistry(): Promise<void> {
     }
   }
 
-  // Converge every session's group on startup: adopt/title an orphan the ledger
-  // surfaces, or drop a dangling id when none survives. Walks the ledger's
-  // lease keys, not just live leases, so an orphan left by a mid-create crash
-  // (grouped, never titled, lease never persisted) gets repaired instead of
-  // accumulating as an untitled duplicate (#2097). Best effort — reconcile
-  // must still persist restored leases if this fails.
-  const leaseKeysToConverge = new Set<string>();
-  for (const owner of ownedGroupLedger.values()) if (owner !== null) leaseKeysToConverge.add(owner);
-  for (const [leaseKey, session] of automationSessions.entries()) if (session.owned) leaseKeysToConverge.add(leaseKey);
-  for (const leaseKey of leaseKeysToConverge) {
-    try {
-      await ensureOwnedContainerGroup(getOwnedWindowRole(leaseKey), leaseKey, null, []);
-    } catch (err) {
-      console.warn(`[opencli] Startup group convergence failed for ${getSessionFromKey(leaseKey)}: ${err instanceof Error ? err.message : String(err)}`);
-    }
+  // Converge the interactive owned group on startup: adopt/title an orphan the
+  // ledger surfaces, or clear a dangling groupId when none survives. Runs even
+  // with no leases so orphans left by a mid-create crash get repaired instead
+  // of accumulating as untitled "OpenCLI Browser" duplicates (#2097). Best
+  // effort — reconcile must still persist restored leases if this fails.
+  try {
+    await ensureOwnedContainerGroup('interactive', null, []);
+  } catch (err) {
+    console.warn(`[opencli] Startup interactive group convergence failed: ${err instanceof Error ? err.message : String(err)}`);
   }
-  // Ownerless legacy ids only ever need pruning.
-  await pruneOwnedGroupLedger().catch(() => {});
 
   await persistRuntimeState();
 }
 
-async function handleBind(cmd: Command, leaseKey: string, guard?: CommandGuard): Promise<Result> {
+async function handleBind(cmd: Command, leaseKey: string): Promise<Result> {
   const existing = automationSessions.get(leaseKey);
   if (existing?.owned) {
     await releaseLease(leaseKey, 'rebind');
@@ -4748,7 +2408,6 @@ async function handleBind(cmd: Command, leaseKey: string, guard?: CommandGuard):
     await executor.detach(current.preferredTabId).catch(() => {});
   }
 
-  guard?.();
   setLeaseSession(leaseKey, {
     session: getSessionFromKey(leaseKey),
     surface: getSurfaceFromKey(leaseKey),
@@ -4768,55 +2427,6 @@ async function handleBind(cmd: Command, leaseKey: string, guard?: CommandGuard):
 
 export const __test__ = {
   handleExec,
-  // Dedicated automation windows
-  applyDedicatedCommandFields,
-  ensureDedicatedWindow,
-  checkDedicatedForeignTab,
-  handleTabAttached,
-  computeDisplayCell,
-  pickDisplay,
-  compileDisplayMatcher,
-  restoreDedicatedState,
-  handleDedicatedWindowOp,
-  setForeignTabSettleMs: (ms: number) => { foreignTabSettleMs = ms; },
-  // Lets a test pin the mode a session gets when no command ever named one.
-  setDefaultWindowMode: (mode: WindowMode) => { defaultWindowMode = mode; },
-  resetDefaultWindowMode: () => { defaultWindowMode = DEFAULT_WINDOW_MODE; },
-  // Pool / layout / reaper surface.
-  dedicatedSlotNames: () => [...dedicatedSlots.keys()],
-  reconcileDedicatedWindows,
-  dedicatedGrid,
-  dedicatedTile,
-  dedicatedCapacity,
-  pickAutomationDisplay,
-  pickAutomationDisplays,
-  reapIdleDedicatedWindows,
-  closeDedicatedWindows,
-  setDedicatedIdleTtlMs: (ms: number) => { dedicatedIdleTtlMs = ms; },
-  getDedicatedIdleTtlMs: () => dedicatedIdleTtlMs,
-  // No slot name = "the automation window", whatever the pool called it: tests that
-  // predate pooling asked for slot `default` and meant exactly that.
-  getDedicatedSlot: (slot?: string) => {
-    const state = slot !== undefined
-      ? dedicatedSlots.get(slot)
-      : (liveDedicatedStates()[0] ?? [...dedicatedSlots.values()][0]);
-    return state ? {
-      slot: state.slot,
-      pooled: state.pooled,
-      holders: [...state.holders],
-      idleSince: state.idleSince,
-      tileIndex: state.tileIndex,
-      displayId: state.displayId,
-      reconciledAt: state.reconciledAt,
-      windowId: state.windowId,
-      placeholderTabIds: [...state.placeholderTabIds],
-      placement: { ...state.placement },
-      autoSelect: state.autoSelect,
-      foreignTabPolicy: state.foreignTabPolicy,
-      evictedTabs: state.evictedTabs,
-    } : null;
-  },
-  releaseLease,
   handleNavigate,
   isTargetUrl,
   handleTabs,
@@ -4829,33 +2439,19 @@ export const __test__ = {
   getIdleTimeout,
   getLeaseKey,
   sessionOverrides,
-  activeCommands,
-  handleIdleExpiry,
   reconcileTargetLeaseRegistry,
   ensureOwnedContainerGroup,
-  getContainer: (role: OwnedWindowRole) => ({
-    windowId: ownedContainers[role].windowId,
-    borrowed: ownedContainers[role].borrowed,
-    windowFallbackReason: ownedContainers[role].windowFallbackReason,
-    groups: Object.fromEntries(ownedContainers[role].groups),
-    // Every ledger id (both roles, ownerless legacy ids included).
-    groupIds: [...ownedGroupLedger.keys()],
-    ledger: Object.fromEntries([...ownedGroupLedger.entries()].map(([id, owner]) => [String(id), owner])),
-  }),
   getInteractiveContainer: () => ({
     windowId: ownedContainers.interactive.windowId,
-    groups: Object.fromEntries(ownedContainers.interactive.groups),
-    groupIds: [...ownedGroupLedger.keys()],
+    groupId: ownedContainers.interactive.groupId,
+    groupIds: [...interactiveGroupLedger],
   }),
-  handleSessions,
   connectForTest: connect,
   scheduleReconnectForTest: () => scheduleReconnect(),
   getReconnectAttempts: () => reconnectAttempts,
   setReconnectAttempts: (value: number) => { reconnectAttempts = value; },
   nextReconnectDelayMs,
   resetReconnectState: () => {
-    if (handshakeTimer) clearTimeout(handshakeTimer);
-    handshakeTimer = null;
     if (reconnectTimer) clearTimeout(reconnectTimer);
     reconnectTimer = null;
     reconnectAttempts = 0;
@@ -4866,7 +2462,6 @@ export const __test__ = {
     ws = null;
   },
   getSession: (leaseKey: string = 'default') => automationSessions.get(leaseKey) ?? null,
-  forgetSession: (leaseKey: string) => automationSessions.delete(leaseKey),
   getAutomationWindowId: (leaseKey: string = 'default') => automationSessions.get(leaseKey)?.windowId ?? null,
   setAutomationWindowId: (leaseKey: string, windowId: number | null) => {
     if (windowId === null) {

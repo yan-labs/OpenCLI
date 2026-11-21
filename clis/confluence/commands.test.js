@@ -52,14 +52,6 @@ afterEach(() => {
 });
 
 describe('confluence commands', () => {
-    it('registers expected REST commands', () => {
-        for (const name of ['page', 'search', 'create', 'update']) {
-            const cmd = getRegistry().get(`confluence/${name}`);
-            expect(cmd).toBeDefined();
-            expect(cmd.browser).toBe(false);
-            expect(cmd.strategy).toBe('public');
-        }
-    });
 
     it('requires --execute before create performs remote writes', async () => {
         const cmd = getRegistry().get('confluence/create');

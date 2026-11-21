@@ -16,10 +16,6 @@ function makePage(evaluateResult) {
 }
 
 describe('uisdc/news', () => {
-    it('registers stable URL in columns', () => {
-        expect(uisdcNewsCommand.access).toBe('read');
-        expect(uisdcNewsCommand.columns).toEqual(['rank', 'title', 'summary', 'url']);
-    });
 
     it('validates limit before browser navigation', async () => {
         const page = makePage({ ok: true, rows: [] });

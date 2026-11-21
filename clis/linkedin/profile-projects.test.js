@@ -8,24 +8,6 @@ const { normalizeProfileUrl, profileProjectsUrl, parseProjectText, parseProjects
 describe('linkedin profile-projects adapter', () => {
   const command = getRegistry().get('linkedin/profile-projects');
 
-  it('registers command shape', () => {
-    expect(command).toBeDefined();
-    expect(command.strategy).toBe('cookie');
-    expect(command.browser).toBe(true);
-    expect(command.columns).toEqual([
-      'rank',
-      'title',
-      'date_range',
-      'associated_with',
-      'description',
-      'skills',
-      'media',
-      'urls',
-      'profile_url',
-      'raw_text',
-    ]);
-  });
-
   it('normalizes default and explicit profile URLs', () => {
     expect(normalizeProfileUrl(undefined)).toBe('https://www.linkedin.com/in/me/');
     expect(normalizeProfileUrl('https://www.linkedin.com/in/gauravsaxena1997?x=1')).toBe('https://www.linkedin.com/in/gauravsaxena1997?x=1');

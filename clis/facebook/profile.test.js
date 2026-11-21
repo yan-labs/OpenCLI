@@ -12,11 +12,6 @@ function runExtract(html, username = 'zuck') {
 }
 
 describe('facebook profile', () => {
-    it('keeps the existing profile row contract', () => {
-        const command = getRegistry().get('facebook/profile');
-        expect(command).toBeDefined();
-        expect(command.columns).toEqual(['name', 'username', 'friends', 'followers', 'url']);
-    });
 
     it('extracts the display name from the current profile-avatar header (#2195)', () => {
         const rows = runExtract(`

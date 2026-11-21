@@ -61,26 +61,6 @@ describe('xiaoe — adapter registration', () => {
         ]);
     });
 
-    it('catalog registers as cookie + browser, columns unchanged', () => {
-        const reg = getRegistry();
-        expect(reg.get('xiaoe/catalog')).toBe(catalogCommand);
-        expect(catalogCommand.browser).toBe(true);
-        expect(catalogCommand.strategy).toBe('cookie');
-        expect(catalogCommand.access).toBe('read');
-        expect(catalogCommand.columns).toEqual([
-            'ch', 'chapter', 'no', 'title', 'type', 'resource_id', 'url', 'status',
-        ]);
-    });
-
-    it('courses registers as cookie + browser, columns unchanged', () => {
-        const reg = getRegistry();
-        expect(reg.get('xiaoe/courses')).toBe(coursesCommand);
-        expect(coursesCommand.browser).toBe(true);
-        expect(coursesCommand.strategy).toBe('cookie');
-        expect(coursesCommand.access).toBe('read');
-        expect(coursesCommand.domain).toBe('study.xiaoe-tech.com');
-        expect(coursesCommand.columns).toEqual(['title', 'shop', 'url']);
-    });
 });
 
 // ─── content.js helpers ────────────────────────────────────────────

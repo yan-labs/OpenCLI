@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { CliError } from '../errors.js';
-import { BasePage } from './base-page.js';
+import { BasePage, NATIVE_INPUT_VISIBILITY_JS, NativeInputVisibilityError } from './base-page.js';
 import { TargetError } from './target-errors.js';
 import type { BrowserEvaluateFunction, ScreenshotOptions } from '../types.js';
 
@@ -23,6 +23,7 @@ class TestPage extends BasePage {
 }
 
 class ActionPage extends BasePage {
+  visibility: unknown = 'visible';
   results: unknown[] = [];
   withArgsResults: unknown[] = [];
   scripts: string[] = [];
@@ -39,6 +40,7 @@ class ActionPage extends BasePage {
   async evaluate<T = unknown>(js: string): Promise<T>;
   async evaluate<Args extends unknown[], T>(fn: BrowserEvaluateFunction<Args, T>, ...args: Args): Promise<Awaited<T>>;
   async evaluate(input: string | BrowserEvaluateFunction<unknown[], unknown>): Promise<unknown> {
+    if (input === NATIVE_INPUT_VISIBILITY_JS) return this.visibility;
     this.scripts.push(typeof input === 'string' ? input : input.toString());
     return this.results.shift() ?? null;
   }
@@ -163,9 +165,7 @@ describe('BasePage native input routing', () => {
     await expect(page.typeText('#editor', 'hello')).resolves.toEqual({ matches_n: 1, match_level: 'exact' });
 
     expect(page.nativeType).toHaveBeenCalledWith('hello');
-    // The armInputProbe call ahead of the native insertion adds one more
-    // script (the probe install; the probe itself degrades to unavailable).
-    expect(page.scripts).toHaveLength(3);
+    expect(page.scripts).toHaveLength(2);
     expect(page.scripts[1]).toContain('nearestContentEditableHost');
     expect(page.scripts.join('\n')).not.toContain("return 'typed'");
   });
@@ -190,9 +190,8 @@ describe('BasePage native input routing', () => {
     expect(page.cdp).toHaveBeenCalledWith('DOM.scrollIntoViewIfNeeded', { nodeId: 7 });
     expect(page.cdp).toHaveBeenCalledWith('DOM.focus', { nodeId: 7 });
     expect(page.nativeType).toHaveBeenCalledWith('hello');
-    // The input-probe install runs after the preparation script.
-    expect(page.scripts.at(-2)).toContain('if (false) el.scrollIntoView');
-    expect(page.scripts.at(-2)).toContain('if (false) {');
+    expect(page.scripts.at(-1)).toContain('if (false) el.scrollIntoView');
+    expect(page.scripts.at(-1)).toContain('if (false) {');
   });
 
   it('keeps the DOM setter fallback when native text insertion is unavailable', async () => {
@@ -209,73 +208,13 @@ describe('BasePage native input routing', () => {
   it('falls back to DOM typing if native text insertion fails', async () => {
     const page = new ActionPage();
     page.nativeType = vi.fn().mockRejectedValue(new Error('native failed'));
-    // The explicit null is the input-probe install evaluate (unavailable).
-    page.results = [resolveOk, { ok: true, mode: 'input' }, null, 'typed'];
+    page.results = [resolveOk, { ok: true, mode: 'input' }, 'typed'];
 
     await page.typeText('#q', 'hello');
 
     expect(page.nativeType).toHaveBeenCalledWith('hello');
-    expect(page.scripts).toHaveLength(4);
-    expect(page.scripts[3]).toContain("return 'typed'");
-  });
-
-  it('falls back to DOM typing and flags native_type_dropped when Input.insertText was silently dropped', async () => {
-    const page = new ActionPage();
-    page.nativeType = vi.fn().mockResolvedValue(undefined);
-    // The dedicated-window failure shape: Input.insertText resolves, but no
-    // trusted keydown/beforeinput/input ever reaches the page.
-    page.results = [resolveOk, { ok: true, mode: 'input' }, 'probe-token', { status: 'dropped' }, 'typed'];
-
-    await expect(page.typeText('#q', 'hello')).resolves.toEqual({
-      matches_n: 1,
-      match_level: 'exact',
-      native_type_dropped: true,
-    });
-
-    expect(page.nativeType).toHaveBeenCalledWith('hello');
-    expect(page.scripts).toHaveLength(5);
-    expect(page.scripts[2]).toContain('isTrusted');
-    expect(page.scripts[2]).toContain('beforeinput');
-    // typed=false sent the DOM setter path (typeResolvedJs) after the drop.
-    expect(page.scripts[4]).toContain("return 'typed'");
-  });
-
-  it('keeps the native insertText result when the probe observed a trusted input event', async () => {
-    const page = new ActionPage();
-    page.nativeType = vi.fn().mockResolvedValue(undefined);
-    page.results = [resolveOk, { ok: true, mode: 'input' }, 'probe-token', { status: 'observed' }];
-
-    await expect(page.typeText('#q', 'hello')).resolves.toEqual({ matches_n: 1, match_level: 'exact' });
-
-    expect(page.nativeType).toHaveBeenCalledWith('hello');
-    expect(page.scripts).toHaveLength(4);
-    expect(page.scripts.at(-1)).toContain("'observed'");
-    expect(page.scripts.join('\n')).not.toContain("return 'typed'");
-  });
-
-  it('keeps the native insertText result when the probe is missing (page navigated)', async () => {
-    const page = new ActionPage();
-    page.nativeType = vi.fn().mockResolvedValue(undefined);
-    page.results = [resolveOk, { ok: true, mode: 'input' }, 'probe-token', { status: 'missing' }];
-
-    await expect(page.typeText('#q', 'hello')).resolves.toEqual({ matches_n: 1, match_level: 'exact' });
-
-    expect(page.nativeType).toHaveBeenCalledWith('hello');
-    expect(page.scripts).toHaveLength(4);
-    expect(page.scripts.at(-1)).toContain("'missing'");
-    expect(page.scripts.join('\n')).not.toContain("return 'typed'");
-  });
-
-  it('keeps the native insertText result when the probe cannot be armed', async () => {
-    const page = new ActionPage();
-    page.nativeType = vi.fn().mockResolvedValue(undefined);
-    page.results = [resolveOk, { ok: true, mode: 'input' }, Promise.reject(new Error('transport down'))];
-
-    await expect(page.typeText('#q', 'hello')).resolves.toEqual({ matches_n: 1, match_level: 'exact' });
-
-    expect(page.nativeType).toHaveBeenCalledWith('hello');
     expect(page.scripts).toHaveLength(3);
-    expect(page.scripts.join('\n')).not.toContain("return 'typed'");
+    expect(page.scripts[2]).toContain("return 'typed'");
   });
 
   it('fills text through the native input path and verifies the exact value', async () => {
@@ -363,114 +302,28 @@ describe('BasePage native input routing', () => {
       .mockResolvedValueOnce({ root: { nodeId: 1 } })
       .mockResolvedValueOnce({ nodeId: 9 })
       .mockResolvedValueOnce({});
-    page.results = [resolveOk, { x: 50, y: 100, w: 200, h: 32, visible: true, hit: 'target' }, 'probe-token', { status: 'observed' }];
+    page.results = [resolveOk, { x: 50, y: 100, w: 200, h: 32, visible: true, hit: 'target' }];
     page.withArgsResults = [{ ok: true, multiple: false, accept: 'application/pdf' }, undefined];
 
     await page.click('#save');
 
     expect(page.cdp).toHaveBeenCalledWith('DOM.scrollIntoViewIfNeeded', { nodeId: 9 });
     // After CDP scroll, boundingRectResolvedJs runs with skipScroll=true.
-    const rectScript = page.scripts.find((s: string) => s.includes('getBoundingClientRect'));
-    expect(rectScript).toContain('if (false) el.scrollIntoView');
+    expect(page.scripts.at(-1)).toContain('if (false) el.scrollIntoView');
   });
 
   it('clicks via CDP Input.dispatchMouseEvent when rect is visible', async () => {
     const page = new ActionPage();
     page.nativeClick = vi.fn().mockResolvedValue(undefined);
-    page.results = [
-      resolveOk,
-      { x: 50, y: 100, w: 200, h: 32, visible: true, hit: 'target' },
-      'probe-token',
-      { status: 'observed', tag: 'A' },
-    ];
+    page.results = [resolveOk, { x: 50, y: 100, w: 200, h: 32, visible: true, hit: 'target' }];
 
-    await expect(page.click('#category')).resolves.toEqual({
-      matches_n: 1,
-      match_level: 'exact',
-      click_method: 'cdp',
-      hit: 'target',
-    });
+    await page.click('#category');
 
     expect(page.nativeClick).toHaveBeenCalledWith(50, 100);
     expect(page.nativeClick).toHaveBeenCalledTimes(1);
-    expect(page.scripts).toHaveLength(4);
+    expect(page.scripts).toHaveLength(2);
     expect(page.scripts[1]).toContain('getBoundingClientRect');
-    // The click is verified against an in-page trusted-event probe before the
-    // CDP result is trusted: install before the dispatch, check after it.
-    expect(page.scripts[2]).toContain('isTrusted');
-    expect(page.scripts[3]).toContain("'observed'");
     expect(page.scripts.join('\n')).not.toContain('el.click()');
-  });
-
-  it('keeps the CDP result when the probe is missing (page navigated between install and check)', async () => {
-    const page = new ActionPage();
-    page.nativeClick = vi.fn().mockResolvedValue(undefined);
-    page.results = [
-      resolveOk,
-      { x: 50, y: 100, w: 200, h: 32, visible: true, hit: 'target' },
-      'probe-token',
-      { status: 'missing' },
-    ];
-
-    await expect(page.click('#category')).resolves.toEqual({
-      matches_n: 1,
-      match_level: 'exact',
-      click_method: 'cdp',
-      hit: 'target',
-    });
-
-    expect(page.nativeClick).toHaveBeenCalledTimes(1);
-    expect(page.scripts).toHaveLength(4);
-    expect(page.scripts.join('\n')).not.toContain('el.click()');
-  });
-
-  it('skips probe verification when the probe cannot be armed', async () => {
-    const page = new ActionPage();
-    page.nativeClick = vi.fn().mockResolvedValue(undefined);
-    // The install evaluate throws (transport hiccup) — armClickProbe degrades
-    // to null and the legacy trust-the-CDP-result behaviour applies.
-    page.results = [
-      resolveOk,
-      { x: 50, y: 100, w: 200, h: 32, visible: true, hit: 'target' },
-      Promise.reject(new Error('transport down')),
-    ];
-
-    await expect(page.click('#category')).resolves.toEqual({
-      matches_n: 1,
-      match_level: 'exact',
-      click_method: 'cdp',
-      hit: 'target',
-    });
-
-    expect(page.nativeClick).toHaveBeenCalledTimes(1);
-    expect(page.scripts).toHaveLength(3);
-    expect(page.scripts.join('\n')).not.toContain('el.click()');
-  });
-
-  it('falls back to JS el.click() when the trusted CDP click was silently dropped', async () => {
-    const page = new ActionPage();
-    page.nativeClick = vi.fn().mockResolvedValue(undefined);
-    page.results = [
-      resolveOk,
-      { x: 50, y: 100, w: 200, h: 32, visible: true, hit: 'target' },
-      'probe-token',
-      // The dedicated-window failure shape: Input.dispatchMouseEvent resolves,
-      // but no trusted mousedown/click ever reached the page.
-      { status: 'dropped' },
-      { status: 'clicked', x: 50, y: 100, w: 200, h: 32 },
-    ];
-
-    await expect(page.click('a.learn-more')).resolves.toEqual({
-      matches_n: 1,
-      match_level: 'exact',
-      click_method: 'js',
-      native_click_dropped: true,
-      hit: 'target',
-    });
-
-    expect(page.nativeClick).toHaveBeenCalledTimes(1);
-    expect(page.scripts).toHaveLength(5);
-    expect(page.scripts[4]).toContain('el.click()');
   });
 
   it('clicks AX snapshot refs through backend node coordinates without DOM resolver', async () => {
@@ -505,62 +358,7 @@ describe('BasePage native input routing', () => {
     expect(page.cdp).toHaveBeenCalledWith('Page.getFrameTree', {});
     expect(page.cdp).toHaveBeenCalledWith('DOM.getBoxModel', { backendNodeId: 10 });
     expect(page.nativeClick).toHaveBeenCalledWith(30, 30);
-    // The AX-ref click arms the input probe ahead of the native dispatch; the
-    // probe install is the only script (the probe itself is unavailable here).
-    expect(page.scripts).toHaveLength(1);
-  });
-
-  it('refuses to report AX-ref success when the trusted click was dropped and lets the standard click path take over', async () => {
-    const page = new ActionPage();
-    page.nativeClick = vi.fn().mockResolvedValue(undefined);
-    page.cdp = vi.fn(async (method: string) => {
-      if (method === 'Accessibility.getFullAXTree') {
-        return {
-          nodes: [
-            { nodeId: '1', role: { value: 'RootWebArea' }, name: { value: 'Demo' }, childIds: ['2'] },
-            { nodeId: '2', role: { value: 'button' }, name: { value: 'Submit' }, backendDOMNodeId: 10 },
-          ],
-        };
-      }
-      if (method === 'Page.getFrameTree') {
-        return {
-          frameTree: { frame: { id: 'root', url: 'https://app.example/' } },
-        };
-      }
-      if (method === 'DOM.getBoxModel') {
-        return { model: { content: [10, 20, 50, 20, 50, 40, 10, 40] } };
-      }
-      return {};
-    });
-
-    // The AX fast path dispatches the CDP click, the probe verifies it was
-    // dropped, and tryClickAxRef returns null instead of faking success.
-    // click() then runs the standard resolve + rect + native click path —
-    // which succeeds here and reports click_method 'cdp', proving the AX
-    // drop no longer masquerades as a completed click.
-    page.results = [
-      'ax-probe-token',
-      { status: 'dropped' },
-      resolveOk,
-      { x: 30, y: 30, w: 40, h: 20, visible: true, hit: 'target' },
-      'probe-token',
-      { status: 'observed' },
-    ];
-
-    await page.snapshot({ source: 'ax' });
-    await expect(page.click('1')).resolves.toEqual({
-      matches_n: 1,
-      match_level: 'exact',
-      click_method: 'cdp',
-      hit: 'target',
-    });
-
-    // One dispatch inside the AX fast path, one in the standard path — both
-    // aimed at the same AX-derived point.
-    expect(page.nativeClick).toHaveBeenCalledTimes(2);
-    expect(page.nativeClick).toHaveBeenNthCalledWith(1, 30, 30);
-    expect(page.nativeClick).toHaveBeenNthCalledWith(2, 30, 30);
-    expect(page.scripts.join('\n')).not.toContain("click_method: 'ax'");
+    expect(page.scripts).toHaveLength(0);
   });
 
   it('adds same-origin iframe AX refs and clicks them by frame-scoped backend node', async () => {
@@ -854,9 +652,7 @@ describe('BasePage native input routing', () => {
     page.results = [
       resolveOk,
       { x: 10, y: 20, w: 100, h: 30, visible: true, hit: 'target' },
-      'probe-token',
       { status: 'js_failed', x: 10, y: 20, error: 'click intercepted' },
-      { status: 'observed' },
     ];
 
     await page.click('#flaky');
@@ -874,86 +670,7 @@ describe('BasePage native input routing', () => {
     await expect(page.hover('#menu')).resolves.toEqual({ matches_n: 1, match_level: 'exact' });
 
     expect(page.cdp).toHaveBeenCalledWith('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 70, y: 80 });
-    // The input-probe install runs after the rect measurement script.
-    expect(page.scripts.at(-2)).toContain('getBoundingClientRect');
-  });
-
-  it('falls back to synthetic hover events and flags native_hover_dropped when CDP mouseMoved was dropped', async () => {
-    const page = new ActionPage();
-    page.cdp = vi.fn().mockResolvedValue({});
-    // The dedicated-window failure shape: mouseMoved resolves, but no trusted
-    // mousemove/mouseover ever reaches the page.
-    page.results = [
-      resolveOk,
-      { x: 70, y: 80, w: 100, h: 20, visible: true },
-      'probe-token',
-      { status: 'dropped' },
-    ];
-
-    await expect(page.hover('#menu')).resolves.toEqual({
-      matches_n: 1,
-      match_level: 'exact',
-      native_hover_dropped: true,
-    });
-
-    expect(page.cdp).toHaveBeenCalledWith('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 70, y: 80 });
-    expect(page.scripts).toHaveLength(6);
-    expect(page.scripts[3]).toContain('isTrusted');
-    expect(page.scripts[3]).toContain('mouseover');
-    // The fallback dispatches the synthetic hover chain, mouseenter included.
-    expect(page.scripts[5]).toContain('mouseenter');
-    expect(page.scripts[5]).toContain('mousemove');
-  });
-
-  it('keeps the native hover result when the probe observed a trusted mousemove', async () => {
-    const page = new ActionPage();
-    page.cdp = vi.fn().mockResolvedValue({});
-    page.results = [
-      resolveOk,
-      { x: 70, y: 80, w: 100, h: 20, visible: true },
-      'probe-token',
-      { status: 'observed', tag: 'DIV' },
-    ];
-
-    await expect(page.hover('#menu')).resolves.toEqual({ matches_n: 1, match_level: 'exact' });
-
-    expect(page.cdp).toHaveBeenCalledWith('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 70, y: 80 });
-    expect(page.scripts).toHaveLength(5);
-    expect(page.scripts.at(-1)).toContain("'observed'");
-    expect(page.scripts.join('\n')).not.toContain("'mouseenter'");
-  });
-
-  it('keeps the native hover result when the probe is missing (page navigated)', async () => {
-    const page = new ActionPage();
-    page.cdp = vi.fn().mockResolvedValue({});
-    page.results = [
-      resolveOk,
-      { x: 70, y: 80, w: 100, h: 20, visible: true },
-      'probe-token',
-      { status: 'missing' },
-    ];
-
-    await expect(page.hover('#menu')).resolves.toEqual({ matches_n: 1, match_level: 'exact' });
-
-    expect(page.scripts).toHaveLength(5);
-    expect(page.scripts.at(-1)).toContain("'missing'");
-    expect(page.scripts.join('\n')).not.toContain("'mouseenter'");
-  });
-
-  it('keeps the native hover result when the probe cannot be armed', async () => {
-    const page = new ActionPage();
-    page.cdp = vi.fn().mockResolvedValue({});
-    page.results = [
-      resolveOk,
-      { x: 70, y: 80, w: 100, h: 20, visible: true },
-      Promise.reject(new Error('transport down')),
-    ];
-
-    await expect(page.hover('#menu')).resolves.toEqual({ matches_n: 1, match_level: 'exact' });
-
-    expect(page.cdp).toHaveBeenCalledWith('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 70, y: 80 });
-    expect(page.scripts).toHaveLength(4);
-    expect(page.scripts.join('\n')).not.toContain("'mouseenter'");
+    expect(page.scripts.at(-1)).toContain('getBoundingClientRect');
   });
 
   it('focuses through CDP DOM.focus when available', async () => {
@@ -1000,87 +717,6 @@ describe('BasePage native input routing', () => {
     expect(page.cdp).toHaveBeenCalledWith('Input.dispatchMouseEvent', { type: 'mouseReleased', x: 20, y: 30, button: 'left', clickCount: 2 });
   });
 
-  it('falls back to the full synthetic double-click sequence and flags native_dblclick_dropped', async () => {
-    const page = new ActionPage();
-    page.cdp = vi.fn().mockResolvedValue({});
-    // The dedicated-window failure shape: both press/release pairs resolve,
-    // but no trusted dblclick/mousedown ever reaches the page.
-    page.results = [
-      resolveOk,
-      { x: 20, y: 30, w: 100, h: 20, visible: true },
-      'probe-token',
-      { status: 'dropped' },
-    ];
-
-    await expect(page.dblClick('#row')).resolves.toEqual({
-      matches_n: 1,
-      match_level: 'exact',
-      native_dblclick_dropped: true,
-    });
-
-    expect(page.cdp).toHaveBeenCalledWith('Input.dispatchMouseEvent', { type: 'mousePressed', x: 20, y: 30, button: 'left', clickCount: 2 });
-    expect(page.scripts).toHaveLength(6);
-    expect(page.scripts[3]).toContain('isTrusted');
-    expect(page.scripts[3]).toContain('mousedown');
-    // The fallback fires the complete double-click chain — not just dblclick.
-    const fallback = page.scripts[5];
-    expect(fallback).toContain("'dblclick'");
-    expect(fallback).toContain("'mousedown'");
-    expect(fallback).toContain("'mouseup'");
-    expect(fallback).toContain("'click'");
-  });
-
-  it('keeps the native double-click result when the probe observed a trusted event', async () => {
-    const page = new ActionPage();
-    page.cdp = vi.fn().mockResolvedValue({});
-    page.results = [
-      resolveOk,
-      { x: 20, y: 30, w: 100, h: 20, visible: true },
-      'probe-token',
-      { status: 'observed', tag: 'DIV' },
-    ];
-
-    await expect(page.dblClick('#row')).resolves.toEqual({ matches_n: 1, match_level: 'exact' });
-
-    expect(page.cdp).toHaveBeenCalledWith('Input.dispatchMouseEvent', { type: 'mousePressed', x: 20, y: 30, button: 'left', clickCount: 2 });
-    expect(page.scripts).toHaveLength(5);
-    expect(page.scripts.at(-1)).toContain("'observed'");
-    expect(page.scripts.join('\n')).not.toContain("'dblclick'");
-  });
-
-  it('keeps the native double-click result when the probe is missing (page navigated)', async () => {
-    const page = new ActionPage();
-    page.cdp = vi.fn().mockResolvedValue({});
-    page.results = [
-      resolveOk,
-      { x: 20, y: 30, w: 100, h: 20, visible: true },
-      'probe-token',
-      { status: 'missing' },
-    ];
-
-    await expect(page.dblClick('#row')).resolves.toEqual({ matches_n: 1, match_level: 'exact' });
-
-    expect(page.scripts).toHaveLength(5);
-    expect(page.scripts.at(-1)).toContain("'missing'");
-    expect(page.scripts.join('\n')).not.toContain("'dblclick'");
-  });
-
-  it('keeps the native double-click result when the probe cannot be armed', async () => {
-    const page = new ActionPage();
-    page.cdp = vi.fn().mockResolvedValue({});
-    page.results = [
-      resolveOk,
-      { x: 20, y: 30, w: 100, h: 20, visible: true },
-      Promise.reject(new Error('transport down')),
-    ];
-
-    await expect(page.dblClick('#row')).resolves.toEqual({ matches_n: 1, match_level: 'exact' });
-
-    expect(page.cdp).toHaveBeenCalledWith('Input.dispatchMouseEvent', { type: 'mousePressed', x: 20, y: 30, button: 'left', clickCount: 2 });
-    expect(page.scripts).toHaveLength(4);
-    expect(page.scripts.join('\n')).not.toContain("'dblclick'");
-  });
-
   it('checks a checkbox only when its current state differs', async () => {
     const page = new ActionPage();
     page.nativeClick = vi.fn().mockResolvedValue(undefined);
@@ -1089,8 +725,6 @@ describe('BasePage native input routing', () => {
       { ok: true, checked: false, disabled: false, kind: 'checkbox' },
       resolveOk,
       { x: 20, y: 30, w: 40, h: 20, visible: true, hit: 'target' },
-      'probe-token',
-      { status: 'observed' },
       { ok: true, checked: true, disabled: false, kind: 'checkbox' },
     ];
 
@@ -1234,168 +868,6 @@ describe('BasePage native input routing', () => {
     expect(page.cdp).toHaveBeenCalledWith('Input.dispatchMouseEvent', { type: 'mouseReleased', x: 110, y: 120, button: 'left', clickCount: 1 });
   });
 
-  it('falls back to the synthetic drag sequence and flags native_drag_dropped when the CDP drag was dropped', async () => {
-    const page = new ActionPage();
-    page.cdp = vi.fn().mockResolvedValue({});
-    // The dedicated-window failure shape: every Input.dispatchMouseEvent
-    // resolves, but no trusted mousedown/mousemove/pointerdown reaches the page.
-    page.results = [
-      resolveOk,
-      { x: 10, y: 20, w: 30, h: 20, visible: true },
-      { ok: true, matches_n: 2, match_level: 'stable' },
-      {
-        source: { x: 10, y: 20, w: 30, h: 20, visible: true },
-        target: { x: 110, y: 120, w: 40, h: 30, visible: true },
-      },
-      'probe-token',
-      { status: 'dropped' },
-    ];
-
-    await expect(page.drag('#card', '.lane')).resolves.toEqual({
-      dragged: true,
-      source: '#card',
-      target: '.lane',
-      source_matches_n: 1,
-      target_matches_n: 2,
-      source_match_level: 'exact',
-      target_match_level: 'stable',
-      native_drag_dropped: true,
-    });
-
-    expect(page.scripts).toHaveLength(10);
-    expect(page.scripts[6]).toContain('isTrusted');
-    expect(page.scripts[6]).toContain('pointerdown');
-    // The fallback synthesizes both the mouse chain and the HTML5 DnD chain.
-    const fallback = page.scripts[8];
-    expect(fallback).toContain('DataTransfer');
-    expect(fallback).toContain("'dragstart'");
-    expect(fallback).toContain("'drop'");
-    expect(fallback).toContain("'dragend'");
-    expect(fallback).toContain("'mousedown'");
-    expect(fallback).toContain("'mousemove'");
-  });
-
-  it('keeps the native drag result when the probe observed a trusted event', async () => {
-    const page = new ActionPage();
-    page.cdp = vi.fn().mockResolvedValue({});
-    page.results = [
-      resolveOk,
-      { x: 10, y: 20, w: 30, h: 20, visible: true },
-      { ok: true, matches_n: 2, match_level: 'stable' },
-      {
-        source: { x: 10, y: 20, w: 30, h: 20, visible: true },
-        target: { x: 110, y: 120, w: 40, h: 30, visible: true },
-      },
-      'probe-token',
-      { status: 'observed' },
-    ];
-
-    await expect(page.drag('#card', '.lane')).resolves.toEqual({
-      dragged: true,
-      source: '#card',
-      target: '.lane',
-      source_matches_n: 1,
-      target_matches_n: 2,
-      source_match_level: 'exact',
-      target_match_level: 'stable',
-    });
-
-    expect(page.scripts).toHaveLength(9);
-    expect(page.scripts.at(-2)).toContain("'observed'");
-    expect(page.scripts.join('\n')).not.toContain('DataTransfer');
-  });
-
-  it('keeps the native drag result when the probe is missing (page navigated)', async () => {
-    const page = new ActionPage();
-    page.cdp = vi.fn().mockResolvedValue({});
-    page.results = [
-      resolveOk,
-      { x: 10, y: 20, w: 30, h: 20, visible: true },
-      { ok: true, matches_n: 2, match_level: 'stable' },
-      {
-        source: { x: 10, y: 20, w: 30, h: 20, visible: true },
-        target: { x: 110, y: 120, w: 40, h: 30, visible: true },
-      },
-      'probe-token',
-      { status: 'missing' },
-    ];
-
-    await expect(page.drag('#card', '.lane')).resolves.toEqual({
-      dragged: true,
-      source: '#card',
-      target: '.lane',
-      source_matches_n: 1,
-      target_matches_n: 2,
-      source_match_level: 'exact',
-      target_match_level: 'stable',
-    });
-
-    expect(page.scripts).toHaveLength(9);
-    expect(page.scripts.at(-2)).toContain("'missing'");
-    expect(page.scripts.join('\n')).not.toContain('DataTransfer');
-  });
-
-  it('keeps the native drag result when the probe cannot be armed but the CDP drag succeeds', async () => {
-    const page = new ActionPage();
-    page.cdp = vi.fn().mockResolvedValue({});
-    page.results = [
-      resolveOk,
-      { x: 10, y: 20, w: 30, h: 20, visible: true },
-      { ok: true, matches_n: 2, match_level: 'stable' },
-      {
-        source: { x: 10, y: 20, w: 30, h: 20, visible: true },
-        target: { x: 110, y: 120, w: 40, h: 30, visible: true },
-      },
-      Promise.reject(new Error('transport down')),
-    ];
-
-    await expect(page.drag('#card', '.lane')).resolves.toEqual({
-      dragged: true,
-      source: '#card',
-      target: '.lane',
-      source_matches_n: 1,
-      target_matches_n: 2,
-      source_match_level: 'exact',
-      target_match_level: 'stable',
-    });
-
-    expect(page.cdp).toHaveBeenCalledWith('Input.dispatchMouseEvent', { type: 'mouseReleased', x: 110, y: 120, button: 'left', clickCount: 1 });
-    expect(page.scripts).toHaveLength(8);
-    expect(page.scripts.join('\n')).not.toContain('DataTransfer');
-  });
-
-  it('performs a synthetic drag instead of throwing when CDP Input dispatch is unavailable', async () => {
-    const page = new ActionPage();
-    // No page.cdp at all: tryNativeDrag returns false immediately, and the
-    // drag must complete through the in-page synthetic sequence.
-    page.results = [
-      resolveOk,
-      { x: 10, y: 20, w: 30, h: 20, visible: true },
-      { ok: true, matches_n: 1, match_level: 'exact' },
-      {
-        source: { x: 10, y: 20, w: 30, h: 20, visible: true },
-        target: { x: 110, y: 120, w: 40, h: 30, visible: true },
-      },
-    ];
-
-    await expect(page.drag('#card', '.lane')).resolves.toEqual({
-      dragged: true,
-      source: '#card',
-      target: '.lane',
-      source_matches_n: 1,
-      target_matches_n: 1,
-      source_match_level: 'exact',
-      target_match_level: 'exact',
-      native_drag_dropped: true,
-    });
-
-    expect(page.scripts).toHaveLength(7);
-    const fallback = page.scripts[5];
-    expect(fallback).toContain('DataTransfer');
-    expect(fallback).toContain("'dragstart'");
-    expect(fallback).toContain("'drop'");
-  });
-
   it('presses key chords through native CDP key events when available', async () => {
     const page = new ActionPage();
     page.nativeKeyPress = vi.fn().mockResolvedValue(undefined);
@@ -1480,50 +952,43 @@ describe('BasePage.sleep', () => {
     expect(evalSpy).not.toHaveBeenCalled();
     expect(page.scripts).toHaveLength(0);
   });
-
-  it('always blocks for the full requested duration', async () => {
-    const page = new ActionPage();
-    const seconds = 0.3;
-    const start = Date.now();
-
-    await page.sleep(seconds);
-
-    expect(Date.now() - start).toBeGreaterThanOrEqual(seconds * 1000 - 20);
-  });
 });
 
-// Regression test for the "opencli browser <session> wait time <N>" bug:
-// `wait(n)` for n>=1 is a DOM-stability heuristic — it resolves as soon as
-// `evaluate()` (a MutationObserver-driven page script) settles, which can be
-// almost instantly. That's fine for "wait after this click", but it silently
-// broke the explicit `wait time N` command, whose entire job is a fixed
-// throttle (e.g. spacing out requests to a quota-limited site) that must
-// block for the full N seconds regardless of page activity. The fix in
-// src/cli.ts makes `wait time` call `sleep(n)` instead of `wait(n)` — this
-// test locks in why: `wait()` can return far short of the requested time
-// when the page's evaluate() resolves quickly (e.g. an idle/stable DOM),
-// while `sleep()` cannot.
-describe('BasePage.wait vs sleep (regression: wait time must not return early)', () => {
-  it('wait(n>=1) can resolve much faster than n seconds when evaluate() settles immediately', async () => {
+
+describe('hidden native input failures', () => {
+  it.each(['hover', 'dblClick'] as const)('rejects hidden %s without native events or DOM fallback', async method => {
     const page = new ActionPage();
-    // ActionPage.evaluate() resolves on the next microtask (no real delay),
-    // simulating an extension-driven DOM-stable probe that settles fast.
-    const seconds = 1.2;
-    const start = Date.now();
-
-    await page.wait(seconds);
-
-    // The bug: wait() returns almost immediately instead of blocking ~1200ms.
-    expect(Date.now() - start).toBeLessThan(seconds * 1000 - 200);
+    page.visibility = 'hidden';
+    page.cdp = vi.fn().mockResolvedValue({});
+    page.results = [resolveOk, { x: 20, y: 30, w: 100, h: 20, visible: true }];
+    await expect(page[method]('#target')).rejects.toMatchObject({ code: 'COMMAND_EXEC', message: expect.stringContaining('visible browser page') });
+    expect(vi.mocked(page.cdp).mock.calls.some(([name]) => name.startsWith('Input.'))).toBe(false);
+    expect(page.scripts.some(script => script.includes('new MouseEvent'))).toBe(false);
   });
 
-  it('sleep(n) blocks for the full n seconds regardless of page activity', async () => {
+  it('rejects hidden drag without dispatching input', async () => {
     const page = new ActionPage();
-    const seconds = 1.2;
-    const start = Date.now();
+    page.visibility = 'hidden';
+    page.cdp = vi.fn().mockResolvedValue({});
+    const rect = { x: 10, y: 20, w: 30, h: 20, visible: true };
+    page.results = [resolveOk, rect, resolveOk, { source: rect, target: rect }];
+    await expect(page.drag('#source', '#target')).rejects.toBeInstanceOf(NativeInputVisibilityError);
+    expect(vi.mocked(page.cdp).mock.calls.some(([name]) => name.startsWith('Input.'))).toBe(false);
+  });
 
-    await page.sleep(seconds);
+  it('does not swallow blocked native clicks or replay them as DOM clicks', async () => {
+    const page = new ActionPage();
+    page.nativeClick = vi.fn().mockRejectedValue(new NativeInputVisibilityError());
+    page.results = [resolveOk, { x: 10, y: 20, w: 30, h: 20, visible: true, hit: 'target' }];
+    await expect(page.click('#target')).rejects.toBeInstanceOf(NativeInputVisibilityError);
+    expect(page.nativeClick).toHaveBeenCalledTimes(1);
+    expect(page.scripts.some(script => script.includes('el.click()'))).toBe(false);
+  });
 
-    expect(Date.now() - start).toBeGreaterThanOrEqual(seconds * 1000 - 20);
+  it('does not swallow blocked native keys or synthesize a duplicate event', async () => {
+    const page = new ActionPage();
+    page.nativeKeyPress = vi.fn().mockRejectedValue(new NativeInputVisibilityError());
+    await expect(page.pressKey('Enter')).rejects.toBeInstanceOf(NativeInputVisibilityError);
+    expect(page.scripts).toEqual([]);
   });
 });

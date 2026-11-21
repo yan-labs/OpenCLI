@@ -19,6 +19,10 @@ const WHOAMI_PROBE = `(async () => {
 async function verifyGiteeIdentity(page) {
   await page.goto('https://gitee.com/');
   await page.wait(1);
+  return probeGiteeIdentity(page);
+}
+
+async function probeGiteeIdentity(page) {
   const probe = await page.evaluate(WHOAMI_PROBE);
   if (probe?.kind === 'auth') throw new AuthRequiredError('gitee.com', probe.detail);
   if (probe?.kind === 'http') throw new CommandExecutionError(`HTTP ${probe.httpStatus} from Gitee /api/v5/user`);
@@ -33,9 +37,5 @@ registerSiteAuthCommands({
   loginUrl: 'https://gitee.com/login',
   columns: ['user_id', 'username', 'name'],
   verify: verifyGiteeIdentity,
-  poll: async (page) => {
-    const probe = await page.evaluate(WHOAMI_PROBE);
-    if (!probe?.ok) throw new AuthRequiredError('gitee.com', 'Waiting for Gitee login');
-    return { user_id: probe.user_id, username: probe.username, name: probe.name };
-  },
+  poll: probeGiteeIdentity,
 });

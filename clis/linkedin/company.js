@@ -46,14 +46,24 @@ function normalizeCompanyUrl(value) {
 function buildCompanyExtractionScript() {
     return String.raw`(() => {
     const clean = (s) => String(s || '').replace(/[  ]+/g, ' ').replace(/\s+/g, ' ').trim();
+    const main = document.querySelector('main') || document.body;
+    const read = (node) => clean(node?.innerText || node?.textContent || '');
     const facts = {};
-    for (const dt of Array.from(document.querySelectorAll('dt'))) {
-      const key = clean(dt.innerText || dt.textContent || '').toLowerCase().replace(/:$/, '');
-      const dd = dt.nextElementSibling;
-      const val = dd ? clean(dd.innerText || dd.textContent || '') : '';
-      if (key && val && !(key in facts)) facts[key] = val;
+    const labels = new Set(['website', 'industry', 'company size', 'headquarters', 'founded', 'specialties']);
+    for (const label of main.querySelectorAll('dt, h3, p, span')) {
+      const key = read(label).toLowerCase().replace(/:$/, '');
+      if (!labels.has(key) || key in facts) continue;
+      let value = label.nextElementSibling;
+      // The label may itself be wrapped in a paragraph or heading container.
+      if (!value && read(label.parentElement).toLowerCase().replace(/:$/, '') === key) {
+        value = label.parentElement.nextElementSibling;
+      }
+      const val = read(value);
+      if (val && !labels.has(val.toLowerCase().replace(/:$/, ''))) facts[key] = val;
     }
-    const name = clean((document.querySelector('main h1') || document.querySelector('h1'))?.innerText || '');
+    const nameHeading = main.querySelector('h1') || Array.from(main.querySelectorAll('h2')).find(node =>
+      !/^(about|overview|posts|jobs|people|insights|similar pages|pages people also viewed)$/i.test(read(node)));
+    const name = read(nameHeading);
     const bodyText = clean(document.body ? (document.body.innerText || '') : '');
     const followersMatch = bodyText.match(/([\d,]+)\s+followers/i);
     const aboutHeading = Array.from(document.querySelectorAll('main h2, section h2')).find((el) => /^About$|^Overview$/i.test(clean(el.innerText || '')));

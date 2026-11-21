@@ -1,53 +1,54 @@
 /**
  * opencli browser protocol — shared types between daemon, extension, and CLI.
  *
- * 5 actions: exec, navigate, tabs, cookies, screenshot.
- * Everything else is just JS code sent via 'exec'.
+ * Page actions use leases; chrome-call/chrome-describe manage native browser resources.
  */
 
 export type Action =
+  | 'chrome-call'
+  | 'chrome-describe'
   | 'exec'
   | 'navigate'
   | 'tabs'
   | 'cookies'
   | 'screenshot'
-  | 'viewport'
   | 'close-window'
+  | 'close-owned-tab'
   | 'sessions'
   | 'set-file-input'
   | 'insert-text'
   | 'bind'
   | 'network-capture-start'
   | 'network-capture-read'
-  | 'console-read'
   | 'wait-download'
   | 'cdp'
   | 'frames'
-  | 'contexts'
-  | 'clipboard';
+  | 'sessions';
 
 export interface Command {
   /** Unique request ID */
   id: string;
   /** Action type */
   action: Action;
+  /** Keep in-flight network capture entries for a later completed read. */
+  retainIncomplete?: boolean;
   /** Target page identity (targetId). Cross-layer contract with the daemon. */
   page?: string;
   /** JS code to evaluate in page context (exec action) */
   code?: string;
+  chromeMethod?: string;
+  chromeArgs?: unknown[];
   /** Browser session name for tab/page continuity. */
   session?: string;
+  requireExistingSession?: boolean;
   /** Runtime surface selecting owned container policy. */
   surface?: 'browser' | 'adapter';
   /** Adapter site session lifecycle. Persistent site sessions do not idle-expire. */
   siteSession?: 'ephemeral' | 'persistent';
   /** URL to navigate to (navigate action) */
   url?: string;
-  /**
-   * Sub-operation. tabs: list, new, close, select. sessions: list (default),
-   * cleanup, window-status, window-ensure (dedicated automation windows).
-   */
-  op?: 'list' | 'new' | 'close' | 'select' | 'cleanup' | 'window-status' | 'window-ensure' | 'window-list' | 'window-close' | 'window-relayout' | 'runtime-reload' | 'set' | 'reset';
+  /** Sub-operation for tabs: list, new, close, select */
+  op?: 'list' | 'new' | 'close' | 'select';
   /** Tab index for tabs select/close */
   index?: number;
   /** Cookie domain filter */
@@ -70,63 +71,18 @@ export interface Command {
   text?: string;
   /** URL substring filter pattern for network capture actions */
   pattern?: string;
-  /**
-   * Operation timeout in milliseconds. Used by 'wait-download' (download wait
-   * timeout) and by 'navigate' (how long to wait for the tab to finish loading
-   * before reporting `timedOut: true` — the tab is still usable after that,
-   * see handleNavigate). Missing/undefined on 'navigate' falls back to the
-   * extension's built-in default (15000ms) for compatibility with older CLIs
-   * that predate this field.
-   */
+  /** Download wait timeout in milliseconds */
   timeoutMs?: number;
   /** CDP method name for 'cdp' action (e.g. 'Accessibility.getFullAXTree') */
   cdpMethod?: string;
   /** CDP method params for 'cdp' action */
   cdpParams?: Record<string, unknown>;
   /** Window foreground/background policy for owned Browser Bridge containers. */
-  windowMode?: 'foreground' | 'active' | 'background' | 'isolated' | 'dedicated';
-  /**
-   * `dedicated` only: which OpenCLI-dedicated window (slot) the session lives in.
-   * One window per slot; default 'default'. Also read by sessions window-status/window-ensure.
-   */
-  windowSlot?: string;
-  /** `dedicated` only: screen rectangle for the dedicated window (screen DIPs, same space as chrome.windows). */
-  windowBounds?: { left: number; top: number; width: number; height: number };
-  /** `dedicated` only: display-name pattern ('/re/flags' or case-insensitive substring) to place the window on. */
-  windowDisplay?: string;
-  half?: boolean;
-  avoidDisplayBounds?: { left: number; top: number; width: number; height: number };
-  /** `dedicated` only: make the session tab the active tab of its dedicated window before each command (default true). */
-  autoSelect?: boolean;
-  /** `dedicated` only: what to do with tabs OpenCLI did not open that appear in a dedicated window (default 'evict'). */
-  foreignTabPolicy?: 'evict' | 'tolerate';
-  /**
-   * `dedicated` only: how long an automation window may sit idle before the extension
-   * closes it (milliseconds). Sent with every dedicated command so the current CLI's
-   * OPENCLI_DEDICATED_IDLE_MS wins; omitted leaves the extension default (15 min).
-   */
-  dedicatedIdleMs?: number;
-  /** sessions window-close: close a window even while a live lease still holds it. */
-  force?: boolean;
-  /** Custom idle timeout in seconds; -1 means never expire. Overrides the default. */
+  windowMode?: 'foreground' | 'background' | 'dedicated';
+  /** Custom idle timeout in seconds for this session. Overrides the default. */
   idleTimeout?: number;
-  /** In-flight command budget in milliseconds; extended for a longer command timeout. */
-  inflightMaxMs?: number;
   /** Frame index for cross-frame operations (0-based, from 'frames' action) */
   frameIndex?: number;
-  /**
-   * When true, the 'frames' action returns `{ frames, debug }` instead of a
-   * bare array, where `debug` surfaces OOPIF-discovery diagnostics (event
-   * counts, getTargets/autoAttach errors, DOM frame URLs) instead of
-   * swallowing them — see cdp.ts listIframeTargets.
-   */
-  debug?: boolean;
-  /**
-   * CDP Runtime execution context ID for cross-world evaluation (e.g. a
-   * content script's isolated world), from the 'contexts' action. Distinct
-   * from `contextId` below, which identifies a browser profile/context.
-   */
-  execContextId?: number;
   /** Browser profile/context REQUIRED by the CLI (--profile / env). Used by the daemon for strict routing. */
   contextId?: string;
   /**
@@ -170,7 +126,12 @@ export interface Result {
 
 /** Default daemon port */
 export const DAEMON_PORT = 19825;
-export const DAEMON_HOST = 'localhost';
+/**
+ * Must equal DAEMON_HOST in src/constants.ts (the address the daemon binds).
+ * Never `localhost`: IPv6-preferring hosts (notably Windows) resolve it to
+ * ::1 first, so the ping and WebSocket can miss the daemon (#2690, #2762).
+ */
+export const DAEMON_HOST = '127.0.0.1';
 export const DAEMON_WS_URL = `ws://${DAEMON_HOST}:${DAEMON_PORT}/ext`;
 /** Lightweight health-check endpoint — probed before each WebSocket attempt. */
 export const DAEMON_PING_URL = `http://${DAEMON_HOST}:${DAEMON_PORT}/ping`;

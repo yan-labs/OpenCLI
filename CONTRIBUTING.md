@@ -62,6 +62,12 @@ cli({
 
 See [`hackernews/top.js`](clis/hackernews/top.js) for a real example.
 
+The `fetch` step also supports JSON request bodies and explicit per-item batches.
+Use `method: 'POST'` with `body` for GraphQL or JSON APIs; nested body fields can
+reference `${{ args.query }}`, `${{ data }}`, or `${{ item.id }}` in a batch.
+See [Pipeline JSON requests](./docs/developer/ts-adapter.md#pipeline-json-requests)
+for complete examples, concurrency behavior, and validation rules.
+
 ### func() Adapter (For complex browser interactions)
 
 Create a file like `clis/<site>/<command>.js`:

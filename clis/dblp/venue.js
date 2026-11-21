@@ -1,6 +1,7 @@
+import { dblpFetchSearch } from './browser.js';
 // dblp venue — search dblp's venue (conference / journal) registry.
 //
-// Hits `https://dblp.org/search/venue/api?q=…&format=json&h=…`. Returns a
+// Hits `https://dblp.org/search/venue/api?q=…&format=xml&h=…`. Returns a
 // row per matched venue. Useful for resolving an acronym (e.g. "ICLR" →
 // dblp's canonical venue page) and for browsing venues that match a topic.
 import { cli, Strategy } from '@jackwener/opencli/registry';
@@ -8,7 +9,6 @@ import { EmptyResultError } from '@jackwener/opencli/errors';
 import {
     DBLP_ORIGIN,
     decodeXmlEntities,
-    dblpFetchJson,
     requireBoundedInt,
     requireQuery,
 } from './utils.js';
@@ -43,17 +43,18 @@ cli({
     description: 'Search dblp venue registry (conferences / journals) by name or acronym',
     domain: 'dblp.org',
     strategy: Strategy.PUBLIC,
-    browser: false,
+    browser: true,
+    navigateBefore: false,
     args: [
         { name: 'query', positional: true, required: true, help: 'Venue name or acronym (e.g. "ICLR", "neural networks")' },
         { name: 'limit', type: 'int', default: 20, help: 'Max venues (1-100, single dblp page)' },
     ],
     columns: ['rank', 'acronym', 'venue', 'type', 'url'],
-    func: async (args) => {
+    func: async (page, args) => {
         const query = requireQuery(args.query);
         const limit = requireBoundedInt(args.limit, 20, 100);
-        const path = `/search/venue/api?q=${encodeURIComponent(query)}&format=json&h=${limit}`;
-        const json = await dblpFetchJson(path, 'dblp venue');
+        const path = `/search/venue/api?q=${encodeURIComponent(query)}&format=xml&h=${limit}`;
+        const json = await dblpFetchSearch(page, path, 'dblp venue');
         const hits = json?.result?.hits?.hit;
         const list = Array.isArray(hits) ? hits : [];
         if (list.length === 0) {

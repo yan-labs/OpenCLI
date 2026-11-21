@@ -22,6 +22,9 @@ const GEMINI_RESPONSE_NOISE_PATTERNS = [
     /Google Terms/gi,
     /Google Privacy Policy/gi,
     /Opens in a new window/gi,
+    /Gemini es una IA y puede cometer errores,? incluso sobre personas\.?/gi,
+    /Tu privacidad y Gemini/gi,
+    /Se abre en una ventana nueva/gi,
 ];
 const GEMINI_TRANSCRIPT_CHROME_MARKERS = ['gemini', '我的内容', '对话', 'google terms', 'google privacy policy'];
 const GEMINI_COMPOSER_SELECTORS = [
@@ -305,6 +308,8 @@ function isGeneratingExpression() {
         const aria = (node.getAttribute('aria-label') || '').trim().toLowerCase();
         return text === 'stop response'
           || aria === 'stop response'
+          || text === 'detener respuesta'
+          || aria === 'detener respuesta'
           || text === '停止回答'
           || aria === '停止回答';
       })`;
@@ -399,6 +404,7 @@ function getTranscriptLinesScript() {
         /^Google Terms$/,
         /^Google Privacy Policy$/,
         /^Gemini is AI and can make mistakes\.?$/,
+        /^Gemini es una IA y puede cometer errores/,
         /^and the$/,
         /^apply\.$/,
         /^Opens in a new window$/,
@@ -425,6 +431,73 @@ function getTurnsScript() {
         .replace(/\\n{3,}/g, '\\n\\n')
         .trim();
 
+      // Layout-independent text: Gemini lays out off-screen responses with zero
+      // height, so innerText is empty there even though the text is in the DOM.
+      // Plain textContent would glue paragraphs and list items together, so walk
+      // the tree and re-insert block breaks. The same node always yields the same
+      // text whether or not it is rendered, which keeps turn diffs stable while
+      // the conversation scrolls.
+      const BLOCK_TAGS = new Set(['ADDRESS', 'ARTICLE', 'ASIDE', 'BLOCKQUOTE', 'DD', 'DIV', 'DL', 'DT',
+        'FIGCAPTION', 'FIGURE', 'FOOTER', 'FORM', 'HEADER', 'HR', 'LI', 'MAIN', 'NAV', 'OL', 'SECTION',
+        'TABLE', 'TBODY', 'THEAD', 'TFOOT', 'TR', 'UL']);
+      const PARAGRAPH_TAGS = new Set(['P', 'PRE', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6']);
+      const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'BUTTON', 'MAT-ICON']);
+      const textOf = (root) => {
+        if (!root) return '';
+        let out = '';
+        const walk = (node, inPre) => {
+          if (node.nodeType === Node.TEXT_NODE) {
+            if (inPre) { out += node.nodeValue; return; }
+            const collapsed = node.nodeValue.replace(/\\s+/g, ' ');
+            out += (out === '' || out.endsWith('\\n')) ? collapsed.replace(/^ /, '') : collapsed;
+            return;
+          }
+          if (node.nodeType !== Node.ELEMENT_NODE) return;
+          const tag = node.tagName;
+          if (SKIP_TAGS.has(tag) || node.classList.contains('cdk-visually-hidden')) return;
+          if (tag === 'BR') { out += '\\n'; return; }
+          const pre = inPre || tag === 'PRE';
+          // Like innerText's "required line break count": adjacent block
+          // boundaries merge to the larger break instead of stacking.
+          const breaks = PARAGRAPH_TAGS.has(tag) ? 2 : BLOCK_TAGS.has(tag) ? 1 : 0;
+          const addBreak = () => {
+            if (!breaks || out === '') return;
+            out = out.replace(/ +$/, '');
+            const have = (out.match(/\\n*$/) || [''])[0].length;
+            if (breaks > have) out += '\\n'.repeat(breaks - have);
+          };
+          addBreak();
+          for (const child of node.childNodes) walk(child, pre);
+          addBreak();
+          if (tag === 'TD' || tag === 'TH') out += '\\t';
+        };
+        walk(root, false);
+        return clean(out.replace(/[ \\t]+\\n/g, '\\n'));
+      };
+
+      // Current Gemini web DOM groups each exchange in a conversation-container,
+      // with the prompt under user-query-container (query-text-line per line) and
+      // the answer under response-container (model-response-text). Reading those
+      // directly avoids the duplicate matches a broad message-class sweep produced.
+      const turns = [];
+      const containers = Array.from(document.querySelectorAll('.conversation-container'));
+      for (const container of containers) {
+        const userLines = Array.from(container.querySelectorAll('.query-text-line'))
+          .map(textOf)
+          .filter(Boolean);
+        const userText = userLines.length
+          ? userLines.join('\\n')
+          : textOf(container.querySelector('.query-text'));
+        if (userText) turns.push({ Role: 'User', Text: userText });
+
+        const responses = Array.from(container.querySelectorAll('.model-response-text'))
+          .map(textOf)
+          .filter(Boolean);
+        if (responses.length) turns.push({ Role: 'Assistant', Text: responses[responses.length - 1] });
+      }
+      if (turns.length > 0) return turns;
+
+      // Fallback for older layouts: broad selector sweep with role sniffing.
       const isVisible = (el) => {
         if (!(el instanceof HTMLElement)) return false;
         const style = window.getComputedStyle(el);
@@ -454,7 +527,7 @@ function getTurnsScript() {
           return 0;
         });
 
-      const turns = unique.map((el) => {
+      const legacy = unique.map((el) => {
         const text = clean(el.innerText || el.textContent || '');
         if (!text) return null;
 
@@ -472,11 +545,11 @@ function getTurnsScript() {
         return role ? { Role: role, Text: text } : null;
       }).filter(Boolean);
 
-      return turns;
+      return legacy;
     })()
   `;
 }
-function prepareComposerScript() {
+function prepareComposerScript(native = false) {
     return `
     (() => {
       ${buildGeminiComposerLocatorScript()}
@@ -491,11 +564,13 @@ function prepareComposerScript() {
         const selection = window.getSelection();
         const range = document.createRange();
         range.selectNodeContents(composer);
-        range.collapse(false);
+        // Native insertText replaces the selection without destroying Quill's
+        // paragraph nodes or desynchronizing its internal document state.
+        ${native ? '' : `range.collapse(false);`}
         selection?.removeAllRanges();
         selection?.addRange(range);
-        composer.textContent = '';
-        composer.dispatchEvent(new InputEvent('input', { bubbles: true, data: '', inputType: 'deleteContentBackward' }));
+        ${native ? '' : `composer.textContent = '';
+        composer.dispatchEvent(new InputEvent('input', { bubbles: true, data: '', inputType: 'deleteContentBackward' }));`}
       } catch (error) {
         return {
           ok: false,
@@ -597,8 +672,8 @@ function submitComposerScript() {
         });
       }
 
-      const excludedPattern = /main menu|主菜单|microphone|麦克风|upload|上传|mode|模式|tools|工具|settings|临时对话|new chat|新对话/i;
-      const submitPattern = /send|发送|傳送|submit|提交/i;
+      const excludedPattern = /main menu|主菜单|microphone|麦克风|upload|上传|mode|模式|tools|工具|settings|临时对话|new chat|新对话|dictar|dictate|micrófono|subidas|herramientas|modo|ajustes|conversación temporal|temporary chat|nueva conversación/i;
+      const submitPattern = /send|发送|傳送|submit|提交|enviar/i;
       let bestButton = null;
       let bestScore = -1;
 
@@ -1091,6 +1166,22 @@ export async function ensureGeminiPage(page) {
         await page.goto(GEMINI_APP_URL, { waitUntil: 'load', settleMs: 2500 });
         await page.wait(1);
     }
+    // Reused adapter tabs can be inactive after another site ran. Gemini's
+    // response animation then stays pending even when the model has finished.
+    // tabs() is session-scoped; only activate this session's Gemini target.
+    if (typeof page.tabs === 'function' && typeof page.selectTab === 'function') {
+        const tabs = await page.tabs();
+        const candidates = Array.isArray(tabs) ? tabs.filter((tab) => {
+            try { return new URL(tab.url).hostname === GEMINI_DOMAIN; }
+            catch { return false; }
+        }) : [];
+        const targetId = page.getActivePage?.();
+        const target = candidates.find((tab) => tab.page === targetId)
+            ?? (candidates.length === 1 ? candidates[0] : null);
+        if (target?.active === false && typeof target.page === 'string') {
+            await page.selectTab(target.page);
+        }
+    }
 }
 export async function getCurrentGeminiUrl(page) {
     await ensureGeminiPage(page);
@@ -1250,7 +1341,9 @@ export async function waitForGeminiSubmission(page, before, timeoutSeconds) {
     const preSendAssistantCount = before.turns.filter((turn) => turn.Role === 'Assistant').length;
     const maxPolls = Math.max(1, Math.ceil(timeoutSeconds));
     for (let index = 0; index < maxPolls; index += 1) {
-        await page.wait(index === 0 ? 0.5 : 1);
+        // Numeric wait() settles the DOM and may return after only 500ms.
+        // Explicit time waits preserve the caller's timeout during quiet reasoning.
+        await page.wait({ time: Math.min(1, timeoutSeconds - index) });
         const current = await readGeminiSnapshot(page);
         const structuredAppend = diffTrustedStructuredTurns(before, current);
         const transcriptDelta = diffTranscriptLines(before, current);
@@ -1290,7 +1383,7 @@ export async function sendGeminiMessage(page, text) {
     await ensureGeminiPage(page);
     let prepared;
     for (let attempt = 0; attempt < GEMINI_COMPOSER_PREPARE_ATTEMPTS; attempt += 1) {
-        prepared = await page.evaluate(prepareComposerScript());
+        prepared = await page.evaluate(prepareComposerScript(typeof page.nativeType === 'function'));
         if (prepared?.ok)
             break;
         if (attempt < GEMINI_COMPOSER_PREPARE_ATTEMPTS - 1)
@@ -2552,7 +2645,8 @@ export async function waitForGeminiResponse(page, baseline, promptText, timeoutS
     let transcriptStableCount = 0;
     let transcriptMissCount = 0;
     for (let index = 0; index < maxPolls; index += 1) {
-        await page.wait(index === 0 ? 1 : 2);
+        // Do not count a DOM-stability wait as two seconds of response time.
+        await page.wait({ time: Math.min(2, timeoutSeconds - index * 2) });
         const current = await readGeminiSnapshot(page);
         const structuredCandidate = pickStructuredReplyCandidate(current);
         if (structuredCandidate) {

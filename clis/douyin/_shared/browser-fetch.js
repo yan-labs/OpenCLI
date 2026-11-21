@@ -32,7 +32,9 @@ export async function browserFetch(page, method, url, options = {}) {
         // endpoint (issue #1405 fixed it, #1587 dropped it again).
         if (!text.trim()) return res.ok ? null : { status_code: res.status, status_msg: 'Empty response body' };
         try {
-          return JSON.parse(text);
+          const data = JSON.parse(text);
+          if (!res.ok) return { status_code: res.status, status_msg: data?.status_msg || data?.message || 'HTTP request failed' };
+          return data;
         } catch (error) {
           return { status_code: res.ok ? -2 : res.status, status_msg: \`JSON parse failed: \${text.slice(0, 500) || String(error && error.message || error)}\` };
         }

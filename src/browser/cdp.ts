@@ -1,5 +1,5 @@
 /**
- * CDP client — implements IPage by connecting directly to a Chrome/Electron CDP WebSocket.
+ * CDP client — implements IPage by connecting directly to a Chrome CDP WebSocket.
  *
  * Fixes applied:
  * - send() now has a 30s timeout guard (P0 #4)
@@ -11,13 +11,14 @@
 import { WebSocket, type RawData } from 'ws';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
+import { readFileSync, statSync } from 'node:fs';
 import type { BrowserCookie, BrowserEvaluateFunction, IPage, ScreenshotOptions } from '../types.js';
 import type { IBrowserFactory } from '../runtime.js';
 import { buildEvaluateExpression } from './utils.js';
 import { generateStealthJs } from './stealth.js';
 import { waitForDomStableJs } from './dom-helpers.js';
 import { isRecord, saveBase64ToFile } from '../utils.js';
-import { getAllElectronApps } from '../electron-apps.js';
+import { CommandExecutionError } from '../errors.js';
 import { CDPBasePage } from './base-page.js';
 
 export interface CDPTarget {
@@ -54,11 +55,18 @@ export class CDPBridge implements IBrowserFactory {
   private _pending = new Map<number, { resolve: (val: unknown) => void; reject: (err: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   private _eventListeners = new Map<string, Set<(params: unknown) => void>>();
 
-  async connect(opts?: { timeout?: number; session?: string; cdpEndpoint?: string; contextId?: string; idleTimeout?: number; windowMode?: 'foreground' | 'active' | 'background' | 'isolated' | 'dedicated'; surface?: 'browser' | 'adapter'; siteSession?: 'ephemeral' | 'persistent' }): Promise<IPage> {
+  async connect(opts?: { timeout?: number; session?: string; cdpEndpoint?: string; contextId?: string; idleTimeout?: number; windowMode?: 'foreground' | 'background'; surface?: 'browser' | 'adapter'; siteSession?: 'ephemeral' | 'persistent' }): Promise<IPage> {
     if (this._ws) throw new Error('CDPBridge is already connected. Call close() before reconnecting.');
 
     const endpoint = opts?.cdpEndpoint ?? process.env.OPENCLI_CDP_ENDPOINT;
     if (!endpoint) throw new Error('CDP endpoint not provided (pass cdpEndpoint or set OPENCLI_CDP_ENDPOINT)');
+
+    // Validate before connecting: reading a FIFO synchronously could block forever.
+    const initPath = process.env.OPENCLI_CDP_INIT_SCRIPT;
+    if (initPath && !statSync(initPath).isFile()) {
+      throw new Error('OPENCLI_CDP_INIT_SCRIPT must point to a regular JavaScript file');
+    }
+    const initSource = initPath ? readFileSync(initPath, 'utf8') : undefined;
 
     let wsUrl = endpoint;
     if (endpoint.startsWith('http')) {
@@ -85,6 +93,8 @@ export class CDPBridge implements IBrowserFactory {
         try {
           await this.send('Page.enable');
           await this.send('Page.addScriptToEvaluateOnNewDocument', { source: generateStealthJs() });
+          // Optional caller script for every new document, e.g. state a headless peer cannot share across connections.
+          if (initSource !== undefined) await this.send('Page.addScriptToEvaluateOnNewDocument', { source: initSource });
         } catch (err) {
           ws.close();
           reject(err instanceof Error ? err : new Error(String(err)));
@@ -191,7 +201,7 @@ class CDPPage extends CDPBasePage {
   private _networkCapturing = false;
   private _networkCapturePattern = '';
   private _networkEntries: Array<{
-    url: string; method: string; responseStatus?: number;
+    requestId: string; url: string; method: string; responseStatus?: number;
     requestHeaders?: Record<string, string>;
     requestBodyKind?: string;
     requestBodyPreview?: string;
@@ -201,9 +211,9 @@ class CDPPage extends CDPBasePage {
     responsePreview?: string;
     responseBodyFullSize?: number;
     responseBodyTruncated?: boolean;
-    /** Set with responseBodyError when the body could not be fetched; responsePreview stays absent. */
-    responseBodyUnavailable?: boolean;
-    responseBodyError?: string;
+    requestBodyPending?: boolean;
+    responseFinished?: boolean;
+    captureComplete?: boolean;
     timestamp: number;
   }> = [];
   private _pendingRequests = new Map<string, number>(); // requestId → index in _networkEntries
@@ -215,12 +225,12 @@ class CDPPage extends CDPBasePage {
     super();
   }
 
-  async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: number; allowBoundNavigation?: boolean; timeoutMs?: number }): Promise<void> {
+  async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: number; allowBoundNavigation?: boolean }): Promise<void> {
     if (!this._pageEnabled) {
       await this.bridge.send('Page.enable');
       this._pageEnabled = true;
     }
-    const loadPromise = this.bridge.waitForEvent('Page.loadEventFired', options?.timeoutMs ?? 30_000).catch(() => {});
+    const loadPromise = this.bridge.waitForEvent('Page.loadEventFired', 30_000).catch(() => {});
     await this.bridge.send('Page.navigate', { url });
     await loadPromise;
     this._lastUrl = url;
@@ -245,9 +255,21 @@ class CDPPage extends CDPBasePage {
     return result.result?.value;
   }
 
+  /** Direct CDP evaluation has no replay/retry path. */
+  async evaluateOnce<T = unknown>(js: string): Promise<T> {
+    return this.evaluate<T>(js);
+  }
+
   async getCookies(opts: { domain?: string; url?: string } = {}): Promise<BrowserCookie[]> {
-    const result = await this.bridge.send('Network.getCookies', opts.url ? { urls: [opts.url] } : {});
-    const cookies = isRecord(result) && Array.isArray(result.cookies) ? result.cookies : [];
+    // Network.getCookies without URLs is scoped to the current page, which may
+    // be on another site during a no-navigation auth check.
+    const result = opts.url
+      ? await this.bridge.send('Network.getCookies', { urls: [opts.url] })
+      : await this.bridge.send('Storage.getCookies', {});
+    if (!isRecord(result) || !Array.isArray(result.cookies) || !result.cookies.every(isCookie)) {
+      throw new CommandExecutionError('CDP returned an invalid cookies response');
+    }
+    const cookies = result.cookies;
     const domain = opts.domain;
     return domain
       ? cookies.filter((cookie): cookie is BrowserCookie => isCookie(cookie) && matchesCookieDomain(cookie.domain, domain))
@@ -333,10 +355,14 @@ class CDPPage extends CDPBasePage {
           };
           timestamp: number;
         };
+        // Redirect hops reuse the request ID. Keep the original request/body
+        // and settle it from the final response instead of retaining an orphan.
+        if (this._pendingRequests.has(p.requestId)) return;
         if (!this._networkCapturePattern || p.request.url.includes(this._networkCapturePattern)) {
           const rawBody = typeof p.request.postData === 'string' ? p.request.postData : '';
           const bodyTruncated = rawBody.length > CDP_REQUEST_BODY_CAPTURE_LIMIT;
-          const idx = this._networkEntries.push({
+          const entry: (typeof this._networkEntries)[number] = {
+            requestId: p.requestId,
             url: p.request.url,
             method: p.request.method,
             requestHeaders: Object.fromEntries(
@@ -347,22 +373,32 @@ class CDPPage extends CDPBasePage {
             requestBodyFullSize: rawBody.length,
             requestBodyTruncated: bodyTruncated,
             timestamp: Date.now(),
-          }) - 1;
+          };
+          const idx = this._networkEntries.push(entry) - 1;
           this._pendingRequests.set(p.requestId, idx);
 
           if (p.request.hasPostData && p.request.postData === undefined) {
+            // Complete only when BOTH bodies are settled; a response body that
+            // finishes first must not let a retaining read drop the entry
+            // before its late request body lands.
+            entry.requestBodyPending = true;
+            const settleComplete = () => {
+              entry.captureComplete = entry.responseFinished === true && entry.requestBodyPending !== true;
+            };
             const requestBodyFetch = this.bridge.send('Network.getRequestPostData', { requestId: p.requestId }).then((result: unknown) => {
               const postData = (result as { postData?: string } | undefined)?.postData;
               if (typeof postData !== 'string') return;
               const truncated = postData.length > CDP_REQUEST_BODY_CAPTURE_LIMIT;
-              this._networkEntries[idx].requestBodyPreview = truncated
+              entry.requestBodyPreview = truncated
                 ? postData.slice(0, CDP_REQUEST_BODY_CAPTURE_LIMIT)
                 : postData;
-              this._networkEntries[idx].requestBodyFullSize = postData.length;
-              this._networkEntries[idx].requestBodyTruncated = truncated;
+              entry.requestBodyFullSize = postData.length;
+              entry.requestBodyTruncated = truncated;
             }).catch(() => {
               // Some request types do not expose post data.
             }).finally(() => {
+              entry.requestBodyPending = false;
+              settleComplete();
               this._pendingBodyFetches.delete(requestBodyFetch);
             });
             this._pendingBodyFetches.add(requestBodyFetch);
@@ -384,8 +420,8 @@ class CDPPage extends CDPBasePage {
       this.bridge.on('Network.loadingFinished', (params: unknown) => {
         const p = params as { requestId: string };
         const idx = this._pendingRequests.get(p.requestId);
-        const entry = idx !== undefined ? this._networkEntries[idx] : undefined;
-        if (idx !== undefined && entry) {
+        if (idx !== undefined) {
+          const entry = this._networkEntries[idx];
           const bodyFetch = this.bridge.send('Network.getResponseBody', { requestId: p.requestId }).then((result: unknown) => {
             const r = result as { body?: string; base64Encoded?: boolean } | undefined;
             if (typeof r?.body === 'string') {
@@ -395,23 +431,31 @@ class CDPPage extends CDPBasePage {
               entry.responsePreview = r.base64Encoded ? `base64:${body}` : body;
               entry.responseBodyFullSize = fullSize;
               entry.responseBodyTruncated = truncated;
-            } else {
-              entry.responseBodyUnavailable = true;
-              entry.responseBodyError = 'Network.getResponseBody returned no body';
             }
           }).catch((err) => {
-            // Non-fatal (e.g. uploads have no body), but never silent: flag the
-            // entry so callers cannot mistake a missing body for an empty one.
-            entry.responseBodyUnavailable = true;
-            entry.responseBodyError = `Network.getResponseBody failed: ${err instanceof Error ? err.message : String(err)}`;
+            // Body unavailable for some requests (e.g. uploads) — non-fatal
             if (process.env.OPENCLI_VERBOSE) {
               // eslint-disable-next-line no-console
               console.error(`[cdp] getResponseBody failed for ${p.requestId}:`, err instanceof Error ? err.message : err);
             }
           }).finally(() => {
+            entry.responseFinished = true;
+            entry.captureComplete = entry.requestBodyPending !== true;
             this._pendingBodyFetches.delete(bodyFetch);
           });
           this._pendingBodyFetches.add(bodyFetch);
+          this._pendingRequests.delete(p.requestId);
+        }
+      });
+
+      this.bridge.on('Network.loadingFailed', (params: unknown) => {
+        const p = params as { requestId: string };
+        const idx = this._pendingRequests.get(p.requestId);
+        if (idx !== undefined) {
+          const entry = this._networkEntries[idx];
+          entry.responseFinished = true;
+          // Mirror the extension: a pending request body still completes later.
+          entry.captureComplete = entry.requestBodyPending !== true;
           this._pendingRequests.delete(p.requestId);
         }
       });
@@ -421,13 +465,31 @@ class CDPPage extends CDPBasePage {
     return true;
   }
 
-  async readNetworkCapture(): Promise<unknown[]> {
-    // Await all in-flight body fetches so entries have responsePreview populated
-    if (this._pendingBodyFetches.size > 0) {
+  async readNetworkCapture(options: { retainIncomplete?: boolean } = {}): Promise<unknown[]> {
+    // A draining read awaits all in-flight body fetches so entries are fully
+    // populated. A retaining read must not block on them: a slow or stalled
+    // fetch would hold the caller past its deadline instead of returning the
+    // current snapshot while the entry stays retained for a later read.
+    if (!options.retainIncomplete && this._pendingBodyFetches.size > 0) {
       await Promise.all([...this._pendingBodyFetches]);
     }
-    const entries = [...this._networkEntries];
-    this._networkEntries = [];
+    const entries = this._networkEntries.map(entry => ({ ...entry }));
+    if (!options.retainIncomplete) {
+      this._networkEntries = [];
+      this._pendingRequests.clear();
+      return entries;
+    }
+    const retained: typeof this._networkEntries = [];
+    const reindexed = new Map<number, number>();
+    this._networkEntries.forEach((entry, index) => {
+      if (!entry.captureComplete) {
+        reindexed.set(index, retained.length);
+        retained.push(entry);
+      }
+    });
+    this._networkEntries = retained;
+    this._pendingRequests = new Map([...this._pendingRequests].flatMap(([id, index]) =>
+      reindexed.has(index) ? [[id, reindexed.get(index)!]] : []));
     return entries;
   }
 
@@ -483,41 +545,15 @@ function matchesCookieDomain(cookieDomain: string, targetDomain: string): boolea
   const normalizedCookieDomain = cookieDomain.replace(/^\./, '').toLowerCase();
   const normalizedTargetDomain = targetDomain.replace(/^\./, '').toLowerCase();
   return normalizedTargetDomain === normalizedCookieDomain
-    || normalizedTargetDomain.endsWith(`.${normalizedCookieDomain}`);
+    || normalizedCookieDomain.endsWith(`.${normalizedTargetDomain}`);
 }
 
 function selectCDPTarget(targets: CDPTarget[]): CDPTarget | undefined {
   const preferredPattern = compilePreferredPattern(process.env.OPENCLI_CDP_TARGET);
-
-  const candidates = targets
+  return targets
     .map((target, index) => ({ target, index, score: scoreCDPTarget(target, preferredPattern) }))
-    .filter(({ score }) => Number.isFinite(score));
-
-  // Electron apps route auxiliary windows onto the main document through a
-  // query: Codex ships its avatar overlay as
-  // `app://-/index.html?initialRoute=%2Favatar-overlay`, which answers `/json`
-  // first and scores exactly like the main window, so document order used to
-  // send every command to a surface with no app UI (#2242). Only break that
-  // tie; a routed window that outscores its plain sibling is still the better
-  // target, and on http(s) a query is ordinary page state.
-  const plainDocuments = new Set<string>();
-  for (const { target } of candidates) {
-    const url = parseLocalDocumentUrl(target.url);
-    if (url && !url.search) plainDocuments.add(toDocumentKey(url));
-  }
-
-  const ranked = candidates
-    .map((entry) => {
-      const url = parseLocalDocumentUrl(entry.target.url);
-      return { ...entry, routed: !!url && !!url.search && plainDocuments.has(toDocumentKey(url)) };
-    })
-    .sort((a, b) => {
-      if (b.score !== a.score) return b.score - a.score;
-      if (a.routed !== b.routed) return a.routed ? 1 : -1;
-      return a.index - b.index;
-    });
-
-  return ranked[0]?.target;
+    .filter(({ score }) => Number.isFinite(score))
+    .sort((a, b) => b.score - a.score || a.index - b.index)[0]?.target;
 }
 
 function scoreCDPTarget(target: CDPTarget, preferredPattern?: RegExp): number {
@@ -530,61 +566,24 @@ function scoreCDPTarget(target: CDPTarget, preferredPattern?: RegExp): number {
 
   if (!haystack.trim() && !type) return Number.NEGATIVE_INFINITY;
   if (haystack.includes('devtools')) return Number.NEGATIVE_INFINITY;
+  // Chrome exposes browser UI targets (e.g. the toolbar) alongside real tabs.
+  // They cannot be navigated and must never outrank an about:blank page.
+  if (/^chrome(?:-untrusted)?:\/\/[^/]*\.top-chrome(?:\/|$)/.test(url)) return Number.NEGATIVE_INFINITY;
   if (type === 'background_page' || type === 'service_worker') return Number.NEGATIVE_INFINITY;
 
   let score = 0;
 
   if (preferredPattern && preferredPattern.test(haystack)) score += 1000;
 
-  if (type === 'app') score += 120;
-  else if (type === 'webview') score += 100;
-  else if (type === 'page') score += 80;
+  if (type === 'page') score += 80;
   else if (type === 'iframe') score += 20;
 
-  if (url.startsWith('http://localhost') || url.startsWith('https://localhost')) score += 90;
-  if (url.startsWith('file://')) score += 60;
-  if (url.startsWith('http://127.0.0.1') || url.startsWith('https://127.0.0.1')) score += 50;
   if (url.startsWith('about:blank')) score -= 120;
   if (url === '' || url === 'about:blank') score -= 40;
 
   if (title && title !== 'devtools') score += 25;
 
-  // Boost score for known Electron app names from the registry (builtin + user-defined)
-  const appNames = Object.values(getAllElectronApps()).map(a => (a.displayName ?? a.processName).toLowerCase());
-  for (const name of appNames) {
-    if (title.includes(name)) { score += 120; break; }
-  }
-  for (const name of appNames) {
-    if (url.includes(name)) { score += 100; break; }
-  }
-
   return score;
-}
-
-// Keep this explicit: these are the schemes Electron serves a shared local
-// document over, where a query is a window route (#2242). A "not http(s)"
-// check would also sweep in schemes we know nothing about.
-const LOCAL_DOCUMENT_SCHEMES = new Set(['app:', 'file:']);
-
-/**
- * Parse a URL that names a local app document eligible for routed-window
- * demotion (#2242).
- *
- * Only allowlisted schemes qualify: on http(s), and on any scheme we cannot
- * vouch for, a query is ordinary page state, so returning null there keeps
- * plain document-order selection.
- */
-function parseLocalDocumentUrl(raw: string | undefined): URL | null {
-  try {
-    const url = new URL(raw ?? '');
-    return LOCAL_DOCUMENT_SCHEMES.has(url.protocol) ? url : null;
-  } catch {
-    return null;
-  }
-}
-
-function toDocumentKey(url: URL): string {
-  return `${url.protocol}//${url.host}${url.pathname}`;
 }
 
 function compilePreferredPattern(raw: string | undefined): RegExp | undefined {

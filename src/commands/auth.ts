@@ -1,9 +1,10 @@
+import { normalizeOutputFormat } from '../output-format.js';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { Command, InvalidArgumentError, Option } from 'commander';
-import { AuthRequiredError, CliError, getErrorMessage } from '../errors.js';
+import { AuthRequiredError, CommandExecutionError, CliError, getErrorMessage } from '../errors.js';
 import { executeCommand } from '../execution.js';
 import {
   type BrowserCliCommand,
@@ -29,6 +30,8 @@ export interface AuthStatusRow {
   identity: string;
   checked: AuthStatusMode | 'skipped';
   error: string;
+  /** Command that recovers a not_logged_in row, when the site registers a login command. */
+  recovery?: string;
 }
 
 interface AuthStatusOptions {
@@ -46,6 +49,8 @@ export interface AuthRefreshRow {
   last_touched_at: string;
   next_refresh_at: string;
   error: string;
+  /** Command that recovers a not_logged_in row, when the site registers a login command. */
+  recovery?: string;
 }
 
 interface AuthRefreshOptions {
@@ -196,9 +201,25 @@ function identitySummary(result: unknown): string {
   return '';
 }
 
-function rowForError(site: string, checked: AuthStatusMode, error: unknown): AuthStatusRow {
+function shellArg(value: string): string {
+  return /^[A-Za-z0-9._@%+=:,/-]+$/.test(value) ? value : `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * Suggest the site's own login command for a not_logged_in row. Only emitted
+ * when `<site> login` is registered, and scoped to the same --profile the
+ * check ran against so the hint targets the same browser session.
+ */
+function loginRecovery(site: string, profile?: string): { recovery?: string } {
+  const login = getRegistry().get(fullName({ site, name: 'login' }));
+  if (!login || login.browser !== true) return {};
+  const profileArg = profile ? `--profile ${shellArg(profile)} ` : '';
+  return { recovery: `opencli ${profileArg}${site} login` };
+}
+
+function rowForError(site: string, checked: AuthStatusMode, error: unknown, profile?: string): AuthStatusRow {
   if (error instanceof AuthRequiredError) {
-    return { site, status: 'not_logged_in', logged_in: false, identity: '', checked, error: '' };
+    return { site, status: 'not_logged_in', logged_in: false, identity: '', checked, error: '', ...loginRecovery(site, profile) };
   }
   const code = error instanceof CliError ? error.code : '';
   const message = getErrorMessage(error);
@@ -225,9 +246,10 @@ function refreshCommand(cmd: CliCommand, timeoutSeconds: number): BrowserCliComm
       await page.goto(refreshUrl);
       await page.wait(1);
       const loggedIn = normalizeQuickResult(await quickCheck(page, kwargs, debug));
-      if (loggedIn !== true) {
+      if (loggedIn === false) {
         throw new AuthRequiredError(cmd.domain ?? cmd.site, `Auth refresh quickCheck failed for ${cmd.site}`);
       }
+      if (loggedIn === null) throw new CommandExecutionError(`Auth refresh could not determine login status for ${cmd.site}; run whoami`);
       return { status: 'touched' };
     };
   }
@@ -248,7 +270,12 @@ function normalizeRefreshStatus(result: unknown): 'refreshed' | 'touched' {
   return 'touched';
 }
 
-function refreshRowForError(site: string, entry: AuthRefreshSiteState | undefined, error: unknown): AuthRefreshRow {
+function refreshRowForError(
+  site: string,
+  entry: AuthRefreshSiteState | undefined,
+  error: unknown,
+  profile?: string,
+): AuthRefreshRow {
   if (error instanceof AuthRequiredError) {
     return {
       site,
@@ -256,6 +283,7 @@ function refreshRowForError(site: string, entry: AuthRefreshSiteState | undefine
       last_touched_at: entry?.last_touched_at ?? '',
       next_refresh_at: nextRefreshAt(entry),
       error: '',
+      ...loginRecovery(site, profile),
     };
   }
   const code = error instanceof CliError ? error.code : '';
@@ -270,20 +298,20 @@ function refreshRowForError(site: string, entry: AuthRefreshSiteState | undefine
 }
 
 async function runQuick(cmd: CliCommand, opts: { timeoutSeconds: number; profile?: string }): Promise<AuthStatusRow> {
-  const loaded = await loadLazyCommand(cmd);
-  const quickCmd = quickCheckCommand(loaded, opts.timeoutSeconds);
-  if (!quickCmd) {
-    return {
-      site: cmd.site,
-      status: 'unknown',
-      logged_in: '',
-      identity: '',
-      checked: 'skipped',
-      error: 'quickCheck not implemented; use --full to run whoami',
-    };
-  }
-
   try {
+    const loaded = await loadLazyCommand(cmd);
+    const quickCmd = quickCheckCommand(loaded, opts.timeoutSeconds);
+    if (!quickCmd) {
+      return {
+        site: cmd.site,
+        status: 'unknown',
+        logged_in: '',
+        identity: '',
+        checked: 'skipped',
+        error: 'quickCheck not implemented; use --full to run whoami',
+      };
+    }
+
     const result = await executeCommand(quickCmd, { timeout: opts.timeoutSeconds } as CommandArgs, false, {
       siteSession: 'ephemeral',
       keepTab: 'false',
@@ -295,7 +323,15 @@ async function runQuick(cmd: CliCommand, opts: { timeoutSeconds: number; profile
       return { site: cmd.site, status: 'logged_in', logged_in: true, identity: '', checked: 'quick', error: '' };
     }
     if (loggedIn === false) {
-      return { site: cmd.site, status: 'not_logged_in', logged_in: false, identity: '', checked: 'quick', error: '' };
+      return {
+        site: cmd.site,
+        status: 'not_logged_in',
+        logged_in: false,
+        identity: '',
+        checked: 'quick',
+        error: '',
+        ...loginRecovery(cmd.site, opts.profile),
+      };
     }
     return {
       site: cmd.site,
@@ -306,20 +342,28 @@ async function runQuick(cmd: CliCommand, opts: { timeoutSeconds: number; profile
       error: 'quickCheck returned no boolean logged_in signal',
     };
   } catch (error) {
-    return rowForError(cmd.site, 'quick', error);
+    return rowForError(cmd.site, 'quick', error, opts.profile);
   }
 }
 
 async function runFull(cmd: CliCommand, opts: { timeoutSeconds: number; profile?: string }): Promise<AuthStatusRow> {
-  const loaded = await loadLazyCommand(cmd);
-  const fullCmd = withTimeoutArg(loaded, opts.timeoutSeconds);
   try {
+    const loaded = await loadLazyCommand(cmd);
+    const fullCmd = withTimeoutArg(loaded, opts.timeoutSeconds);
     const result = await executeCommand(fullCmd, { timeout: opts.timeoutSeconds } as CommandArgs, false, {
       siteSession: 'ephemeral',
       keepTab: 'false',
       windowMode: 'background',
       ...(opts.profile ? { profile: opts.profile } : {}),
     });
+    const signal = normalizeQuickResult(result);
+    if (signal === false) throw new AuthRequiredError(cmd.domain ?? cmd.site);
+    const rows = Array.isArray(result) ? result : [result];
+    if (!rows.length || rows.some(row => !row || typeof row !== 'object' || Array.isArray(row) ||
+        Object.keys(row).length === 0 || ('logged_in' in row && typeof row.logged_in !== 'boolean'))) {
+      throw new CommandExecutionError(`${cmd.site} whoami returned an invalid account result`);
+    }
+    if (rows.some(row => row.logged_in === false)) throw new AuthRequiredError(cmd.domain ?? cmd.site);
     return {
       site: cmd.site,
       status: 'logged_in',
@@ -329,7 +373,7 @@ async function runFull(cmd: CliCommand, opts: { timeoutSeconds: number; profile?
       error: '',
     };
   } catch (error) {
-    return rowForError(cmd.site, 'full', error);
+    return rowForError(cmd.site, 'full', error, opts.profile);
   }
 }
 
@@ -340,7 +384,9 @@ async function runRefresh(cmd: CliCommand, opts: {
   state: AuthRefreshState;
   force: boolean;
 }): Promise<AuthRefreshRow> {
-  const existing = opts.state.sites[cmd.site];
+  // Keep legacy unprofiled state separate from every explicit browser profile.
+  const stateKey = opts.profile ? JSON.stringify([opts.profile, cmd.site]) : cmd.site;
+  const existing = opts.state.sites[stateKey];
   if (!opts.force && isRefreshThrottled(existing, opts.now)) {
     return {
       site: cmd.site,
@@ -352,20 +398,20 @@ async function runRefresh(cmd: CliCommand, opts: {
   }
 
   const attemptAt = opts.now.toISOString();
-  const loaded = await loadLazyCommand(cmd);
-  const refreshCmd = refreshCommand(loaded, opts.timeoutSeconds);
-  if (!refreshCmd) {
-    opts.state.sites[cmd.site] = { ...existing, last_attempt_at: attemptAt, last_status: 'unsupported' };
-    return {
-      site: cmd.site,
-      status: 'unsupported',
-      last_touched_at: existing?.last_touched_at ?? '',
-      next_refresh_at: nextRefreshAt(existing),
-      error: 'refresh probe is not available for this site',
-    };
-  }
-
   try {
+    const loaded = await loadLazyCommand(cmd);
+    const refreshCmd = refreshCommand(loaded, opts.timeoutSeconds);
+    if (!refreshCmd) {
+      opts.state.sites[stateKey] = { ...existing, last_attempt_at: attemptAt, last_status: 'unsupported' };
+      return {
+        site: cmd.site,
+        status: 'unsupported',
+        last_touched_at: existing?.last_touched_at ?? '',
+        next_refresh_at: nextRefreshAt(existing),
+        error: 'refresh probe is not available for this site',
+      };
+    }
+
     const result = await executeCommand(refreshCmd, { timeout: opts.timeoutSeconds } as CommandArgs, false, {
       siteSession: 'persistent',
       keepTab: 'true',
@@ -373,7 +419,7 @@ async function runRefresh(cmd: CliCommand, opts: {
       ...(opts.profile ? { profile: opts.profile } : {}),
     });
     const status = normalizeRefreshStatus(result);
-    opts.state.sites[cmd.site] = {
+    opts.state.sites[stateKey] = {
       ...existing,
       last_attempt_at: attemptAt,
       last_touched_at: attemptAt,
@@ -388,8 +434,8 @@ async function runRefresh(cmd: CliCommand, opts: {
     };
   } catch (error) {
     const status: AuthRefreshStatus = error instanceof AuthRequiredError ? 'not_logged_in' : 'error';
-    opts.state.sites[cmd.site] = { ...existing, last_attempt_at: attemptAt, last_status: status };
-    return refreshRowForError(cmd.site, existing, error);
+    opts.state.sites[stateKey] = { ...existing, last_attempt_at: attemptAt, last_status: status };
+    return refreshRowForError(cmd.site, existing, error, opts.profile);
   }
 }
 
@@ -466,7 +512,7 @@ export function registerAuthCommands(program: Command): Command {
     .option('--concurrency <n>', 'Maximum sites to check at once')
     .option('--timeout <seconds>', 'Per-site timeout in seconds')
     .addOption(new Option('--only <status>', 'Filter rows by status').choices(['all', 'logged-in', 'not-logged-in', 'unknown', 'error']).default('all'))
-    .option('-f, --format <fmt>', 'Output format: table, plain, json, yaml, md, csv', 'table')
+    .option('-f, --format <fmt>', 'Output format: table, plain, json, yaml, md, csv', normalizeOutputFormat, 'json')
     .action(async (opts) => {
       const globals = typeof status.optsWithGlobals === 'function' ? status.optsWithGlobals() as Record<string, unknown> : {};
       const rows = await collectAuthStatus({
@@ -477,7 +523,7 @@ export function registerAuthCommands(program: Command): Command {
         only: opts.only,
         profile: typeof globals.profile === 'string' && globals.profile.trim() ? globals.profile.trim() : undefined,
       });
-      const fmt = typeof opts.format === 'string' ? opts.format : 'table';
+      const fmt = typeof opts.format === 'string' ? opts.format : 'json';
       renderOutput(rows, {
         fmt,
         fmtExplicit: status.getOptionValueSource('format') === 'cli',
@@ -494,7 +540,7 @@ export function registerAuthCommands(program: Command): Command {
     .option('--all', 'Ignore the 24h refresh throttle and force every selected site', false)
     .option('--concurrency <n>', 'Maximum sites to refresh at once')
     .option('--timeout <seconds>', 'Per-site timeout in seconds')
-    .option('-f, --format <fmt>', 'Output format: table, plain, json, yaml, md, csv', 'table')
+    .option('-f, --format <fmt>', 'Output format: table, plain, json, yaml, md, csv', normalizeOutputFormat, 'json')
     .action(async (opts) => {
       const globals = typeof refresh.optsWithGlobals === 'function' ? refresh.optsWithGlobals() as Record<string, unknown> : {};
       const rows = await collectAuthRefresh({
@@ -504,7 +550,7 @@ export function registerAuthCommands(program: Command): Command {
         timeout: opts.timeout,
         profile: typeof globals.profile === 'string' && globals.profile.trim() ? globals.profile.trim() : undefined,
       });
-      const fmt = typeof opts.format === 'string' ? opts.format : 'table';
+      const fmt = typeof opts.format === 'string' ? opts.format : 'json';
       renderOutput(rows, {
         fmt,
         fmtExplicit: refresh.getOptionValueSource('format') === 'cli',

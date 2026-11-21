@@ -257,8 +257,17 @@ function buildRenderAwareExtractorJs(options) {
             if (len > maxLen) { maxLen = len; contentEl = a; }
           });
         }
-        if (!contentEl) contentEl = document.querySelector('[role="main"]');
-        if (!contentEl) contentEl = document.querySelector('main');
+        const mainCandidates = Array.from(document.querySelectorAll('main, [role="main"]'));
+        for (const main of mainCandidates) {
+          if (main === contentEl || contentEl?.contains(main)) continue;
+          // Compare the main's own prose, not a sum of cards or sidebar text.
+          // A real article nested in main should remain the narrowest reader root.
+          const prose = main.cloneNode(true);
+          prose.querySelectorAll('article, aside, nav, header, footer, script, style, .related-posts, .comments').forEach(node => node.remove());
+          if (contentEl && textLen(prose) <= Math.max(200, textLen(contentEl) * 2)) continue;
+          if (!contentEl || textLen(prose) > textLen(contentEl)) contentEl = main;
+        }
+        if (!contentEl) contentEl = document.querySelector('[role="main"], main');
         if (!contentEl) {
           const candidates = document.querySelectorAll(
             'div[class*="content"], div[class*="article"], div[class*="post"], ' +

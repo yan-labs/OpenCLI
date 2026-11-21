@@ -44,14 +44,6 @@ opencli doctor
 
 > When the CLI detects a stale daemon (version mismatch after `npm install -g @jackwener/opencli@latest`), it first asks the daemon to shut down via `/shutdown`, then falls back to `SIGKILL` if the daemon does not release the port within 3 seconds. Manual `opencli daemon stop` is only needed if SIGKILL itself is rejected (cross-user owner / cross-machine PID file).
 
-### Desktop adapter connection issues
-
-For Electron/CDP-based adapters (Cursor, Codex, etc.):
-
-1. Make sure the app is launched with `--remote-debugging-port=XXXX`
-2. Verify the endpoint is set: `echo $OPENCLI_CDP_ENDPOINT`
-3. Test the endpoint: `curl http://127.0.0.1:XXXX/json/version`
-
 ### Build errors
 
 ```bash

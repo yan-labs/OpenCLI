@@ -116,9 +116,7 @@ Current problems:
 - The directory structure block says `src/clis/`, but adapters live at top-level `clis/`.
 - The architecture diagram is too simplified for the current system and omits important pieces such as:
   - `daemon.ts`
-  - `external.ts`
   - `plugin.ts`
-  - `electron-apps.ts`
   - update check / diagnostics / runtime detection paths
 - It says “3-tier authentication strategy” but lists `5` strategies.
 
@@ -133,9 +131,8 @@ Recommended fix:
   - command discovery and registry
   - execution
   - browser / daemon bridge
-  - external CLI integration
   - plugin system
-  - desktop / CDP path
+  - direct browser CDP path
   - pipeline engine
 - Replace the static tree with a curated module map that matches current filenames.
 - Change “3-tier” to a neutral label like `authentication strategies`.

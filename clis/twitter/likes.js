@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { cli, Strategy } from '@jackwener/opencli/registry';
 import { ArgumentError, AuthRequiredError, CommandExecutionError, EmptyResultError } from '@jackwener/opencli/errors';
-import { buildUserByScreenNameQueryUrl, looksLikePrivateTwitterTimeline, normalizeTwitterScreenName, resolveTwitterQueryId, sanitizeQueryId, extractMedia, unwrapBrowserResult, describeTwitterApiError } from './shared.js';
+import { buildUserByScreenNameQueryUrl, looksLikePrivateTwitterTimeline, normalizeTwitterScreenName, resolveLoggedInTwitterUser, resolveTwitterQueryId, sanitizeQueryId, extractMedia, unwrapBrowserResult, describeTwitterApiError } from './shared.js';
 import { DEFAULT_MAX_PAGINATION_PAGES, appendJsonlRows, ensureParentDir, loadJsonlArchiveState, removeResumeFile, resolveMaxPages, resolveOptionalFilePath } from './archive.js';
 import { TWITTER_BEARER_TOKEN, applyTopByEngagement } from './utils.js';
 const LIKES_QUERY_ID = 'CDWHmpZeSdIJ3HGeRbNm0w';
@@ -88,6 +88,7 @@ function extractLikedTweet(result, seen) {
 function parseLikes(data, seen) {
     const tweets = [];
     let nextCursor = null;
+    let hasTimelineItems = false;
     const instructions = data?.data?.user?.result?.timeline_v2?.timeline?.instructions
         || data?.data?.user?.result?.timeline?.timeline?.instructions
         || [];
@@ -103,6 +104,9 @@ function parseLikes(data, seen) {
                 nextCursor = content?.value || content?.itemContent?.value || nextCursor;
                 continue;
             }
+            // Deduplication or unsupported item shapes must not turn a repeated
+            // non-empty page into proof that the archive is complete.
+            hasTimelineItems = true;
             const direct = extractLikedTweet(content?.itemContent?.tweet_results?.result, seen);
             if (direct) {
                 tweets.push(direct);
@@ -115,7 +119,7 @@ function parseLikes(data, seen) {
             }
         }
     }
-    return { tweets, nextCursor };
+    return { tweets, nextCursor, hasTimelineItems };
 }
 function readResumeFile(filePath, expected = null) {
     if (!filePath || !fs.existsSync(filePath))
@@ -199,7 +203,7 @@ cli({
         { name: 'max-pages', type: 'int', help: `Optional pagination safety cap (default ${DEFAULT_MAX_PAGINATION_PAGES}; raised automatically with --all).` },
         { name: 'top-by-engagement', type: 'int', default: 0, help: 'When set to N>0, re-rank the liked tweets by weighted engagement (likes×1 + retweets×3 + replies×2 + bookmarks×5 + log10(views+1)×0.5) and return the top N. Default 0 keeps the API\'s native (recency) ordering. Incompatible with --output-file.' },
     ],
-    columns: ['id', 'author', 'name', 'text', 'likes', 'retweets', 'created_at', 'url', 'has_media', 'media_urls', 'media_posters'],
+    columns: ['id', 'author', 'name', 'text', 'likes', 'retweets', 'created_at', 'url', 'has_media', 'media_urls', 'media_posters', 'media_durations'],
     func: async (page, kwargs) => {
         const fetchAll = Boolean(kwargs.all);
         const limit = fetchAll ? Number.POSITIVE_INFINITY : (kwargs.limit || 20);
@@ -230,23 +234,8 @@ cli({
         if (!ct0)
             throw new AuthRequiredError('x.com', 'Not logged into x.com (no ct0 cookie)');
         // If no username provided, detect the logged-in user.
-        // Bridge wraps primitive page.evaluate returns as { session, data:<value> };
-        // unwrap so the href string is usable downstream.
         if (!username) {
-            // Force a navigation to the home surface so the AppTabBar sidebar
-            // is rendered; the framework pre-nav lands on bare x.com which
-            // does not always expose AppTabBar_Profile_Link.
-            await page.goto('https://x.com/home');
-            await page.wait({ selector: '[data-testid="primaryColumn"]' });
-            const href = unwrapBrowserResult(await page.evaluate(`() => {
-        const link = document.querySelector('a[data-testid="AppTabBar_Profile_Link"]');
-        return link ? link.getAttribute('href') : null;
-      }`));
-            if (!href || typeof href !== 'string')
-                throw new AuthRequiredError('x.com', 'Could not detect logged-in user. Are you logged in?');
-            username = normalizeTwitterScreenName(href);
-            if (!username)
-                throw new AuthRequiredError('x.com', 'Could not detect logged-in user. Are you logged in?');
+            username = (await resolveLoggedInTwitterUser(page)).screenName;
         }
         const likesQueryId = await resolveTwitterQueryId(page, 'Likes', LIKES_QUERY_ID);
         const userByScreenNameQueryId = await resolveTwitterQueryId(page, 'UserByScreenName', USER_BY_SCREEN_NAME_QUERY_ID);
@@ -300,8 +289,15 @@ cli({
             const fetchCount = Math.min(100, remaining);
             const apiUrl = buildLikesUrl(likesQueryId, userId, fetchCount, cursor);
             const data = unwrapBrowserResult(await page.evaluate(`async () => {
-        const r = await fetch(${JSON.stringify(apiUrl)}, { headers: ${headers}, credentials: 'include' });
-        return r.ok ? await r.json() : { error: r.status };
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            const r = await fetch(${JSON.stringify(apiUrl)}, { headers: ${headers}, credentials: 'include' });
+            return r.ok ? await r.json() : { error: r.status };
+          } catch (e) {
+            if (attempt === 2) throw e;
+            await new Promise(res => setTimeout(res, 1000 * (attempt + 1)));
+          }
+        }
       }`));
             if (data?.error) {
                 if ((useOutputFile ? outputCount : allTweets.length) === 0)
@@ -317,7 +313,7 @@ cli({
                 }
                 throw new CommandExecutionError('twitter_likes_protocol_error: missing Likes timeline instructions');
             }
-            const { tweets, nextCursor } = parseLikes(data, seen);
+            const { tweets, nextCursor, hasTimelineItems } = parseLikes(data, seen);
             if (useOutputFile) {
                 appendJsonlRows(outputFile, tweets);
                 outputCount += tweets.length;
@@ -325,7 +321,7 @@ cli({
             else {
                 allTweets.push(...tweets);
             }
-            const pageComplete = !nextCursor;
+            const pageComplete = !nextCursor || (nextCursor === cursor && !hasTimelineItems);
             writeResumeFile(resumeFile, {
                 cursor: pageComplete ? null : nextCursor,
                 count: useOutputFile ? outputCount : allTweets.length,

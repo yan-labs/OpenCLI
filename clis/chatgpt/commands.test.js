@@ -75,29 +75,6 @@ describe('chatgpt browser command registration', () => {
         }
     });
 
-    it('keeps ask timeout as the runtime-visible integer timeout arg', () => {
-        const ask = getRegistry().get('chatgpt/ask');
-        expect(ask.args).toEqual(expect.arrayContaining([
-            expect.objectContaining({ name: 'timeout', type: 'int', default: 120 }),
-            expect.objectContaining({ name: 'new', type: 'boolean', default: false }),
-            expect.objectContaining({ name: 'conversation', valueRequired: true }),
-            expect.objectContaining({ name: 'project', valueRequired: true }),
-            expect.objectContaining({ name: 'wait', type: 'boolean', default: true }),
-            expect.objectContaining({ name: 'deep-research', type: 'boolean', default: false }),
-            expect.objectContaining({ name: 'web-search', type: 'boolean', default: false }),
-        ]));
-        expect(ask.columns).toEqual(['conversationId', 'conversationUrl', 'tool', 'response', 'sources', 'searchedCount']);
-    });
-
-    it('registers send conversation and project routing options', () => {
-        const send = getRegistry().get('chatgpt/send');
-        expect(send.args).toEqual(expect.arrayContaining([
-            expect.objectContaining({ name: 'new', type: 'boolean', default: false }),
-            expect.objectContaining({ name: 'conversation', valueRequired: true }),
-            expect.objectContaining({ name: 'project', valueRequired: true }),
-        ]));
-    });
-
     it('rejects using project and conversation routing together', async () => {
         const ask = getRegistry().get('chatgpt/ask');
         const send = getRegistry().get('chatgpt/send');
@@ -111,44 +88,6 @@ describe('chatgpt browser command registration', () => {
             .rejects.toMatchObject({ code: 'ARGUMENT' });
         await expect(send.func(page, { prompt: 'hello', project: '12345678', conversation: 'abcdefghi' }))
             .rejects.toMatchObject({ code: 'ARGUMENT' });
-    });
-
-    it('registers detail wait options and generation state columns', () => {
-        const detail = getRegistry().get('chatgpt/detail');
-        expect(detail.args).toEqual(expect.arrayContaining([
-            expect.objectContaining({ name: 'wait', type: 'boolean', default: false }),
-            expect.objectContaining({ name: 'timeout', type: 'int', default: 120 }),
-            expect.objectContaining({ name: 'stable', type: 'int', default: 6 }),
-        ]));
-        expect(detail.columns).toEqual(['Index', 'Role', 'Text', 'Generating', 'StableSeconds']);
-    });
-
-    it('registers deep research result command with wait options', () => {
-        const command = getRegistry().get('chatgpt/deep-research-result');
-        expect(command.args).toEqual(expect.arrayContaining([
-            expect.objectContaining({ name: 'id', positional: true, required: true }),
-            expect.objectContaining({ name: 'wait', type: 'boolean', default: false }),
-            expect.objectContaining({ name: 'timeout', type: 'int', default: 120 }),
-            expect.objectContaining({ name: 'stable', type: 'int', default: 6 }),
-        ]));
-        expect(command.columns).toEqual([
-            'conversationId',
-            'status',
-            'report',
-            'sources',
-            'progress',
-            'asyncTaskConversationId',
-            'widgetSessionId',
-            'asyncStatus',
-            'venusMessageType',
-            'venusStatus',
-            'waitingForUserUntil',
-            'planTitle',
-            'planId',
-            'url',
-            'method',
-            'diagnostics',
-        ]);
     });
 
     it('does not return a success row when no completed deep research report exists', async () => {
@@ -357,15 +296,6 @@ describe('chatgpt browser command registration', () => {
             .rejects.toBeInstanceOf(CommandExecutionError);
     });
 
-    it('registers project routing on chat-starting commands', () => {
-        for (const name of ['new', 'image', 'model']) {
-            const cmd = getRegistry().get(`chatgpt/${name}`);
-            expect(cmd.args).toEqual(expect.arrayContaining([
-                expect.objectContaining({ name: 'project', valueRequired: true }),
-            ]));
-        }
-    });
-
     it('starts a new chat inside a project when new receives project routing', async () => {
         const cmd = getRegistry().get('chatgpt/new');
         const page = createProjectUploadPageMock();
@@ -373,20 +303,6 @@ describe('chatgpt browser command registration', () => {
         await expect(cmd.func(page, { project: '12345678' }))
             .resolves.toEqual([{ Status: 'New chat started' }]);
         expect(page.goto).toHaveBeenCalledWith('https://chatgpt.com/g/g-p-12345678', { settleMs: 2000 });
-    });
-
-    it('registers chatgpt model with web model choices', () => {
-        const model = getRegistry().get('chatgpt/model');
-        expect(model.args).toEqual(expect.arrayContaining([
-            expect.objectContaining({
-                name: 'model',
-                positional: true,
-                required: true,
-                choices: expect.arrayContaining(['fast', 'speed', 'instant', 'balanced', 'balance', 'advanced', 'high', 'thinking', 'very-high', 'ultra', 'xhigh', 'x-high', 'pro', 'professional']),
-            }),
-            expect.objectContaining({ name: 'project', valueRequired: true }),
-        ]));
-        expect(model.columns).toEqual(['Status', 'Model']);
     });
 
     it('rejects off-domain conversation URLs before ask/send can navigate', async () => {
@@ -402,11 +318,6 @@ describe('chatgpt browser command registration', () => {
             .rejects.toMatchObject({ code: 'ARGUMENT' });
         await expect(send.func(page, { prompt: 'hello', conversation: 'https://evil.test/c/abc_123-def' }))
             .rejects.toMatchObject({ code: 'ARGUMENT' });
-    });
-
-    it('does not expose command-level system proxy mutation for project-file-add', () => {
-        const cmd = getRegistry().get('chatgpt/project-file-add');
-        expect(cmd.args.map(arg => arg.name)).toEqual(['file', 'id']);
     });
 
     it('rejects empty project-file-add file input', async () => {

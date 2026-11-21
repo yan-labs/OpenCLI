@@ -103,24 +103,6 @@ function withDocument(html, callback) {
 }
 
 describe('huodongxing events adapter', () => {
-  it('registers a public browser read command', () => {
-    const command = getRegistry().get('huodongxing/events');
-
-    expect(command).toBeDefined();
-    expect(command.browser).toBe(true);
-    expect(command.strategy).toBe('public');
-    expect(command.columns).toEqual([
-      'rank',
-      'id',
-      'title',
-      'time',
-      'eventType',
-      'city',
-      'location',
-      'organizer',
-      'url',
-    ]);
-  });
 
   it('builds the official events URL with supported filters', () => {
     const url = buildEventsUrl({

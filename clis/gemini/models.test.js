@@ -185,33 +185,6 @@ describe('gemini models', () => {
     });
 });
 
-describe('gemini models command registration', () => {
-    it('is registered with site=gemini and name=models', () => {
-        expect(modelsCommand.site).toBe('gemini');
-        expect(modelsCommand.name).toBe('models');
-    });
-
-    it('is access=read (not write)', () => {
-        expect(modelsCommand.access).toBe('read');
-    });
-
-    it('declares model and thinkingValues as its output columns', () => {
-        expect(modelsCommand.columns).toEqual(['model', 'thinkingValues']);
-    });
-
-    it('has no CLI arguments', () => {
-        expect(modelsCommand.args).toEqual([]);
-    });
-
-    it('is a browser command', () => {
-        expect(modelsCommand.browser).toBe(true);
-    });
-
-    it('targets gemini.google.com', () => {
-        expect(modelsCommand.domain).toBe('gemini.google.com');
-    });
-});
-
 // ── DOM fixture tests (jsdom) ──────────────────────────────────────────────
 // These tests run the actual discoverModelsScript() against pre-built DOM
 // fixtures that simulate the Gemini web UI model picker and menu.

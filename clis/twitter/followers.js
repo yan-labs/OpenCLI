@@ -1,6 +1,6 @@
 import { ArgumentError, AuthRequiredError, EmptyResultError, CommandExecutionError, TimeoutError } from '@jackwener/opencli/errors';
 import { cli, Strategy } from '@jackwener/opencli/registry';
-import { looksLikePrivateTwitterTimeline, normalizeTwitterGraphqlPayload, normalizeTwitterScreenName, unwrapBrowserResult } from './shared.js';
+import { looksLikePrivateTwitterTimeline, normalizeTwitterGraphqlPayload, normalizeTwitterScreenName, resolveLoggedInTwitterUser, unwrapBrowserResult } from './shared.js';
 
 const MAX_PAGINATION_PAGES = 100;
 const CAPTURE_TIMEOUT_SECONDS = 10;
@@ -18,6 +18,7 @@ function extractFollower(result) {
         screen_name: screenName,
         name: core.name || legacy.name || '',
         bio: result.profile_bio?.description || legacy.description || '',
+        verified: Boolean(result.is_blue_verified || legacy.verified),
     };
 }
 
@@ -86,10 +87,10 @@ cli({
         },
         { name: 'limit', type: 'int', default: 50, help: 'Maximum number of follower rows to return (default 50). Must be a positive integer.' },
     ],
-    // Preserve the historical three-column contract even though the GraphQL
-    // payload also contains per-user relationship counts. Use `twitter profile`
-    // when a dedicated follower count is needed.
-    columns: ['screen_name', 'name', 'bio'],
+    // The GraphQL payload also carries per-user relationship counts; use
+    // `twitter profile` when a dedicated follower count is needed. `verified`
+    // is true for X Premium or legacy verification.
+    columns: ['screen_name', 'name', 'bio', 'verified'],
     func: async (page, kwargs) => {
         const limit = kwargs.limit;
         if (!Number.isInteger(limit) || limit <= 0) {
@@ -110,19 +111,7 @@ cli({
         }
 
         if (!targetUser) {
-            // Bridge wraps primitive page.evaluate returns as { session, data:<value> };
-            // unwrap so the href string is usable downstream.
-            const href = unwrapBrowserResult(await page.evaluate(`() => {
-                const link = document.querySelector('a[data-testid="AppTabBar_Profile_Link"]');
-                return link ? link.getAttribute('href') : null;
-            }`));
-            if (!href || typeof href !== 'string') {
-                throw new AuthRequiredError('x.com', 'Could not find logged-in user profile link. Are you logged in?');
-            }
-            targetUser = normalizeScreenName(href);
-            if (!targetUser) {
-                throw new AuthRequiredError('x.com', 'Could not find logged-in user profile link. Are you logged in?');
-            }
+            targetUser = (await resolveLoggedInTwitterUser(page)).screenName;
         }
         if (!targetUser) {
             throw new ArgumentError('twitter followers user cannot be empty', 'Example: opencli twitter followers @elonmusk --limit 100');

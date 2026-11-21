@@ -5,8 +5,8 @@
  */
 
 import { sleep } from '../utils.js';
-import { BrowserConnectError, SessionBusyError, SessionQueueTimeoutError } from '../errors.js';
-import { log } from '../logger.js';
+import type { SlotGrantData, SlotPolicy } from '../site-slots.js';
+import { BrowserConnectError, SessionBusyError } from '../errors.js';
 import { COMMAND_RESULT_UNKNOWN_CODE, COMMAND_RESULT_UNKNOWN_HINT } from '../daemon-utils.js';
 import { classifyBrowserError } from './errors.js';
 import { profileRouteParams, resolveProfileSelection } from './profile.js';
@@ -22,11 +22,6 @@ import {
   type DaemonHealth,
   type DaemonStatus,
 } from './daemon-transport.js';
-import {
-  resolveDedicatedPlacement,
-  activeDisplayBounds,
-  type DedicatedWindowPlacementOverride,
-} from './window-placement.js';
 
 let _idCounter = 0;
 
@@ -71,29 +66,14 @@ export function clearDaemonRunContext(runId: string): void {
 }
 
 /**
- * In-process override for dedicated-window placement, set once per CLI
- * invocation from the `opencli browser` group options (--window-slot /
- * --window-bounds / --window-display) in browserAction(). Sits between the
- * per-call `params` passed to sendCommandRaw (highest precedence) and the
- * OPENCLI_WINDOW_* environment variables (lowest). Null when unset — callers
- * must clear it in a `finally` (mirroring setDaemonRunContext) so it never
- * leaks into a later command in the same process (notably across test cases).
- */
-let _windowPlacementOverride: DedicatedWindowPlacementOverride | null = null;
-
-export function setDaemonWindowPlacement(override: DedicatedWindowPlacementOverride | null): void {
-  _windowPlacementOverride = override;
-}
-
-/**
- * Best-effort release of a session lease on command completion.
+ * Best-effort release of a persistent site-session lease on command completion.
  * A direct one-shot POST (no bridge ensure / retry): if it never lands, the
  * daemon's TTL reclaims the lease anyway, so this must never block the caller.
  */
 export async function releaseSiteSessionLease(params: {
   runId: string;
   session: string;
-  surface: 'adapter' | 'browser';
+  surface: 'adapter';
 }): Promise<void> {
   try {
     await requestDaemon('/command', {
@@ -111,6 +91,21 @@ export async function releaseSiteSessionLease(params: {
   } catch {
     // Best-effort: TTL expiry reclaims the lease if the daemon is unreachable.
   }
+}
+
+/**
+ * Borrow one slot of a pooled site for this run. Resolves to the slot's
+ * persistent session name once the daemon's admission queue grants it. The
+ * caller must have set the run context so later execs heartbeat the slot.
+ */
+export async function acquireSiteSlot(params: SlotPolicy & {
+  site: string;
+  waitMs: number;
+  contextId?: string;
+  preferredContextId?: string;
+}): Promise<SlotGrantData> {
+  // timeoutMs lifts the client HTTP deadline past the daemon's own wait timer.
+  return await sendCommand('slot-acquire', { ...params, timeoutMs: params.waitMs }) as SlotGrantData;
 }
 
 /**
@@ -151,7 +146,7 @@ function effectiveCommandTimeoutSeconds(params: Omit<DaemonCommand, 'id' | 'acti
  * journal.ts). From this version on, re-sending the SAME command id is safe:
  * the executor replays the recorded result instead of re-executing.
  */
-const MIN_JOURNAL_EXTENSION_VERSION = '1.0.22';
+export const MIN_JOURNAL_EXTENSION_VERSION = '1.0.22';
 
 function versionAtLeast(version: string | null | undefined, min: string): boolean {
   if (!version) return false;
@@ -165,6 +160,11 @@ function versionAtLeast(version: string | null | undefined, min: string): boolea
   return true;
 }
 
+export function supportsCommandJournal(version: string | null | undefined, compatRange: string | null | undefined): boolean {
+  // compatRange marks the independently versioned extension line.
+  return !!compatRange && versionAtLeast(version, MIN_JOURNAL_EXTENSION_VERSION);
+}
+
 /** Error codes meaning the executor's outcome is genuinely unknown — never auto-retry. */
 const UNKNOWN_OUTCOME_CODES = new Set(['command_result_unknown', 'command_lost', 'result_evicted']);
 
@@ -173,8 +173,7 @@ const UNKNOWN_OUTCOME_CODES = new Set(['command_result_unknown', 'command_lost',
  * command may still be running even though the client gave up. Callers use this
  * to decide whether it is safe to release a persistent site-session lease: it is
  * not, because the still-running command keeps mutating the tab. Walks the cause
- * chain so a wrapped `BrowserCommandError` is still recognized. Browser CLI
- * calls currently follow their explicit finally-release contract.
+ * chain so a wrapped `BrowserCommandError` is still recognized.
  */
 export function isUnknownOutcomeError(err: unknown): boolean {
   const seen = new Set<unknown>();
@@ -190,8 +189,6 @@ export function isUnknownOutcomeError(err: unknown): boolean {
 
 /** Max transport attempts for one logical command (same id throughout). */
 const TRANSPORT_MAX_ATTEMPTS = 4;
-const SESSION_QUEUE_RETRY_MS = 2_000;
-const SESSION_QUEUE_MAX_WAIT_MS = 10 * 60_000;
 
 /**
  * undici surfaces network failures as `TypeError: fetch failed` with the real
@@ -223,13 +220,20 @@ function isPreConnectFetchError(err: unknown): boolean {
   return false;
 }
 
-export interface DaemonCommand {
+export interface DaemonCommand extends Partial<SlotPolicy> {
   id: string;
-  action: 'exec' | 'navigate' | 'tabs' | 'cookies' | 'screenshot' | 'viewport' | 'close-window' | 'sessions' | 'set-file-input' | 'insert-text' | 'bind' | 'network-capture-start' | 'network-capture-read' | 'console-read' | 'wait-download' | 'cdp' | 'frames' | 'contexts' | 'clipboard' | 'lease-release';
+  action: 'chrome-call' | 'chrome-describe' | 'exec' | 'navigate' | 'tabs' | 'cookies' | 'screenshot' | 'close-window' | 'close-owned-tab' | 'set-file-input' | 'insert-text' | 'bind' | 'network-capture-start' | 'network-capture-read' | 'wait-download' | 'cdp' | 'frames' | 'lease-release' | 'slot-acquire' | 'sessions';
+  retainIncomplete?: boolean;
+  /** slot-acquire: pooled site and queue wait budget (policy fields via SlotPolicy). */
+  site?: string;
+  waitMs?: number;
   /** Target page identity (targetId). Cross-layer contract with the extension. */
   page?: string;
   code?: string;
+  chromeMethod?: string;
+  chromeArgs?: unknown[];
   session?: string;
+  requireExistingSession?: boolean;
   surface?: 'browser' | 'adapter';
   /** Adapter site session lifecycle. Persistent site sessions do not idle-expire. */
   siteSession?: 'ephemeral' | 'persistent';
@@ -258,35 +262,11 @@ export interface DaemonCommand {
   cdpMethod?: string;
   cdpParams?: Record<string, unknown>;
   /** Window foreground/background policy for owned Browser Bridge containers. */
-  windowMode?: 'foreground' | 'active' | 'background' | 'isolated' | 'dedicated';
-  /** Dedicated-window slot name (default 'default'). Only meaningful when windowMode is 'dedicated', or for the sessions op window-status/window-ensure. */
-  windowSlot?: string;
-  /** Explicit dedicated-window placement. Takes precedence over windowDisplay. */
-  windowBounds?: { left: number; top: number; width: number; height: number };
-  /** Dedicated-window display-name pattern ('/re/flags' or case-insensitive substring). Used when windowBounds is absent. */
-  windowDisplay?: string;
-  half?: boolean;
-  avoidDisplayBounds?: { left: number; top: number; width: number; height: number };
-  /** Auto-select the session's tab in its dedicated window before every page-scoped command. Default true when dedicated (applied by the extension when omitted). */
-  autoSelect?: boolean;
-  /** Policy for tabs that appear in a dedicated window without being opened by OpenCLI. Default 'evict' (applied by the extension when omitted). */
-  foreignTabPolicy?: 'evict' | 'tolerate';
-  /** Idle TTL (ms) for the dedicated window pool, from OPENCLI_DEDICATED_IDLE_MS. Overrides the extension's default when set; omitted otherwise. */
-  dedicatedIdleMs?: number;
-  /** Custom idle timeout in seconds; -1 means never expire. Overrides the default. */
+  windowMode?: 'foreground' | 'background' | 'dedicated';
+  /** Custom idle timeout in seconds for this session. Overrides the default. */
   idleTimeout?: number;
-  /** In-flight command budget in milliseconds; extended for a longer command timeout. */
-  inflightMaxMs?: number;
   /** Frame index for cross-frame operations (0-based, from 'frames' action) */
   frameIndex?: number;
-  /** When true, the 'frames' action returns `{ frames, debug }` diagnostics instead of a bare array. */
-  debug?: boolean;
-  /**
-   * CDP Runtime execution context ID for cross-world evaluation (e.g. a
-   * content script's isolated world), from the 'contexts' action. Distinct
-   * from `contextId` below, which identifies a browser profile/context.
-   */
-  execContextId?: number;
   /** Browser profile/context REQUIRED for this command (--profile / OPENCLI_PROFILE). Fails loud when offline. */
   contextId?: string;
   /**
@@ -328,8 +308,6 @@ export interface DaemonResult {
   error?: string;
   errorCode?: string;
   errorHint?: string;
-  /** Local-daemon queue poll delay. No browser/site request was dispatched. */
-  retryAfterMs?: number;
   /** Page identity (targetId) — present on page-scoped command responses */
   page?: string;
 }
@@ -349,21 +327,6 @@ export {
   type DaemonHealth,
   type DaemonStatus,
 };
-
-const VALID_ENV_WINDOW_MODES = new Set(['foreground', 'active', 'background', 'isolated', 'dedicated']);
-
-/**
- * Parse the OPENCLI_WINDOW env fallback used when a caller of sendCommand/
- * browserSession does not pass an explicit `windowMode` (e.g. a direct
- * library consumer, bypassing the CLI's own OPENCLI_WINDOW validation in
- * cli.ts/execution.ts). Recognizes all five modes and throws naming the
- * variable on an invalid non-empty value, matching those two layers.
- */
-function parseEnvWindowMode(raw: string | undefined): DaemonCommand['windowMode'] {
-  if (raw === undefined || raw === '') return undefined;
-  if (VALID_ENV_WINDOW_MODES.has(raw)) return raw as DaemonCommand['windowMode'];
-  throw new Error(`OPENCLI_WINDOW must be one of: foreground, active, background, isolated, dedicated. Received: "${raw}"`);
-}
 
 /**
  * Internal: send a command to the daemon and return the raw `DaemonResult`.
@@ -392,9 +355,11 @@ async function sendCommandRaw(
   params: Omit<DaemonCommand, 'id' | 'action'>,
 ): Promise<DaemonResult> {
   const timeoutSeconds = effectiveCommandTimeoutSeconds(params);
-  let deadlineAt = Date.now() + timeoutSeconds * 1000;
+  const deadlineAt = Date.now() + timeoutSeconds * 1000;
   const rawWindowMode = process.env.OPENCLI_WINDOW;
-  const envWindowMode = parseEnvWindowMode(rawWindowMode);
+  const envWindowMode = rawWindowMode === 'foreground' || rawWindowMode === 'background' || rawWindowMode === 'dedicated'
+    ? rawWindowMode
+    : undefined;
   // Requirement vs preference: an explicit contextId routes strictly; a
   // preferred one is arbitrated by the daemon against live connections.
   const routing = params.contextId || params.preferredContextId
@@ -403,36 +368,20 @@ async function sendCommandRaw(
   const contextId = routing.contextId;
   const preferredContextId = routing.preferredContextId;
   const windowMode = params.windowMode ?? envWindowMode;
-
-  // The four session-independent window ops always carry placement (that IS
-  // their payload); every other command carries it only in dedicated mode.
-  // Env parsing (and its "invalid value" errors) only runs when the fields
-  // are actually going to be used, so an unrelated command never fails
-  // because of a stale/malformed OPENCLI_WINDOW_BOUNDS left in the shell.
-  const isWindowOp = action === 'sessions' && (
-    params.op === 'window-status' || params.op === 'window-ensure'
-    || params.op === 'window-list' || params.op === 'window-close'
-  );
-  const placement = windowMode === 'dedicated' || isWindowOp
-    ? resolveDedicatedPlacement(process.env, _windowPlacementOverride)
-    : {};
-  const windowSlot = params.windowSlot ?? placement.windowSlot;
-  const windowBounds = params.windowBounds ?? placement.windowBounds;
-  const windowDisplay = params.windowDisplay ?? placement.windowDisplay;
-  const avoidDisplayBounds = windowMode === 'dedicated'
-    ? params.avoidDisplayBounds ?? await activeDisplayBounds()
+  // Override the owned session idle timeout, not the container window lifetime.
+  // Explicit close still releases ephemeral sessions; persistent adapter sessions
+  // and borrowed bound tabs ignore idle timeouts. Per-command values take priority.
+  // The extension ignores 0, so only positive integers are forwarded.
+  const rawIdleTimeout = process.env.OPENCLI_BROWSER_IDLE_TIMEOUT;
+  const envIdleTimeout = rawIdleTimeout && (rawIdleTimeout === '-1' || (/^\d+$/.test(rawIdleTimeout) && Number(rawIdleTimeout) > 0))
+    ? Number(rawIdleTimeout)
     : undefined;
-  const half = windowMode === 'dedicated' ? params.half ?? placement.half : undefined;
-  const autoSelect = params.autoSelect ?? placement.autoSelect;
-  const foreignTabPolicy = params.foreignTabPolicy ?? placement.foreignTabPolicy;
-  const dedicatedIdleMs = params.dedicatedIdleMs ?? placement.dedicatedIdleMs;
+  const idleTimeout = params.idleTimeout ?? envIdleTimeout;
 
   let id = generateId();
   let ensureUsed = false;
   let semanticRetryUsed = false;
   let executorJournaled: boolean | null = null;
-  let queuedAt: number | null = null;
-  let queueNoticeShown = false;
 
   const ensureBridge = async (): Promise<void> => {
     // Bound the connect wait by the command's remaining budget so repeated
@@ -448,7 +397,7 @@ async function sendCommandRaw(
       preferredContextId,
       verbose: false,
     });
-    executorJournaled = versionAtLeast(health.status?.extensionVersion, MIN_JOURNAL_EXTENSION_VERSION);
+    executorJournaled = supportsCommandJournal(health.status?.extensionVersion, health.status?.extensionCompatRange);
   };
 
   for (let attempt = 1; attempt <= TRANSPORT_MAX_ATTEMPTS; attempt++) {
@@ -465,23 +414,14 @@ async function sendCommandRaw(
       action,
       ...params,
       timeout: timeoutSeconds,
-      ...(Number.isSafeInteger(Number(process.env.OPENCLI_INFLIGHT_MAX_MS)) && Number(process.env.OPENCLI_INFLIGHT_MAX_MS) > 0
-        ? { inflightMaxMs: Number(process.env.OPENCLI_INFLIGHT_MAX_MS) } : {}),
       deadlineAt,
       ...(contextId && { contextId }),
       ...(preferredContextId && { preferredContextId }),
       ...(windowMode && { windowMode }),
-      ...(windowSlot !== undefined && { windowSlot }),
-      ...(windowBounds !== undefined && { windowBounds }),
-      ...(windowDisplay !== undefined && { windowDisplay }),
-      ...(avoidDisplayBounds !== undefined && { avoidDisplayBounds }),
-      ...(half !== undefined && { half }),
-      ...(autoSelect !== undefined && { autoSelect }),
-      ...(foreignTabPolicy !== undefined && { foreignTabPolicy }),
-      ...(dedicatedIdleMs !== undefined && { dedicatedIdleMs }),
-      // Carry the run identity so the daemon can acquire/refresh a write lease.
-      // The same runId across every daemon command in one CLI invocation is the
-      // heartbeat that keeps a long-running holder alive.
+      ...(idleTimeout !== undefined && { idleTimeout }),
+      // Carry the run identity so the daemon can acquire/refresh the write
+      // lease on the persistent site session. The same runId across every exec
+      // of one command is the heartbeat that keeps a long-running holder alive.
       ...(_runContext && {
         runId: _runContext.runId,
         command: _runContext.command,
@@ -500,33 +440,11 @@ async function sendCommandRaw(
 
       if (result.ok) return result;
 
-      // A second concurrent write has not reached Chrome or the target site.
-      // Keep this CLI invocation alive and retry only the local daemon until
-      // the holder releases the lease, instead of making the outer agent guess
-      // whether it should retry (and usually creating a retry storm).
-      if (result.errorCode === 'session_busy') {
-        const now = Date.now();
-        queuedAt ??= now;
-        const waitedMs = now - queuedAt;
-        if (waitedMs >= SESSION_QUEUE_MAX_WAIT_MS) {
-          throw new SessionQueueTimeoutError(
-            `${result.error ?? 'The previous command still holds the session.'} Waited ${Math.round(waitedMs / 1000)}s in the local queue. This command was not sent to Chrome or the target site.`,
-            'Do not retry immediately. Use a unique session name, or inspect and stop the previous holder if it is stuck.',
-          );
-        }
-        const suggestedMs = typeof result.retryAfterMs === 'number' && Number.isFinite(result.retryAfterMs)
-          ? result.retryAfterMs
-          : SESSION_QUEUE_RETRY_MS;
-        const retryMs = Math.min(Math.max(250, suggestedMs), SESSION_QUEUE_MAX_WAIT_MS - waitedMs);
-        if (!queueNoticeShown) {
-          log.status(`${result.error ?? 'The session is in use.'} Queued locally; checking again in ${Math.ceil(retryMs / 1000)}s. No request has been sent to the target site.`);
-          queueNoticeShown = true;
-        }
-        const sleepStartedAt = Date.now();
-        await sleep(retryMs);
-        deadlineAt += Date.now() - sleepStartedAt;
-        attempt--;
-        continue;
+      // A second concurrent write on the same persistent site session is
+      // rejected before the daemon dispatches anything — terminal, never
+      // retried, and surfaced as a CliError so the busy message is the output.
+      if (result.errorCode === 'session_busy' || result.errorCode === 'slot_wait_timeout' || result.errorCode === 'slot_conflict') {
+        throw new SessionBusyError(result.error ?? 'The site session is busy.', result.errorHint);
       }
 
       if (result.errorCode && UNKNOWN_OUTCOME_CODES.has(result.errorCode)) {
@@ -564,7 +482,7 @@ async function sendCommandRaw(
 
       throw new BrowserCommandError(result.error ?? 'Daemon command failed', result.errorCode, result.errorHint);
     } catch (err) {
-      if (err instanceof BrowserCommandError || err instanceof BrowserConnectError || err instanceof SessionBusyError || err instanceof SessionQueueTimeoutError) throw err;
+      if (err instanceof BrowserCommandError || err instanceof BrowserConnectError || err instanceof SessionBusyError) throw err;
 
       if (err instanceof Error && err.name === 'AbortError') {
         throw new BrowserCommandError(

@@ -1,6 +1,6 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { getRegistry } from '@jackwener/opencli/registry';
-import { AuthRequiredError, CommandExecutionError, EmptyResultError } from '@jackwener/opencli/errors';
+import { ArgumentError, AuthRequiredError, CommandExecutionError, EmptyResultError } from '@jackwener/opencli/errors';
 import { createPageMock } from '../test-utils.js';
 // Mock download dependencies before importing the adapter
 const { mockHttpDownload, mockMkdirSync } = vi.hoisted(() => ({
@@ -26,9 +26,11 @@ describe('pixiv download', () => {
         mockHttpDownload.mockReset();
         mockMkdirSync.mockReset();
     });
-    it('throws CommandExecutionError on invalid illust ID', async () => {
+    it.each(['abc', 'https://evil.example/artworks/12345', 'https://pixiv.net.evil.example/artworks/12345', 'https://user:pass@www.pixiv.net/artworks/12345'])('rejects invalid artwork reference %s before I/O', async (reference) => {
         const page = createPageMock([]);
-        await expect(cmd.func(page, { 'illust-id': 'abc', output: '/tmp/test' })).rejects.toThrow(CommandExecutionError);
+        await expect(cmd.func(page, { 'illust-id': reference, output: '/tmp/test' })).rejects.toThrow(ArgumentError);
+        expect(page.goto).not.toHaveBeenCalled();
+        expect(mockMkdirSync).not.toHaveBeenCalled();
     });
     it('throws AuthRequiredError on 403', async () => {
         const page = createPageMock([{ __httpError: 403 }]);
@@ -57,7 +59,7 @@ describe('pixiv download', () => {
         await expect(cmd.func(page, { 'illust-id': '12345', output: '/tmp/test' }))
             .rejects.toThrow(CommandExecutionError);
     });
-    it('downloads images with Referer header', async () => {
+    it.each(['12345', 'https://www.pixiv.net/artworks/12345', 'https://www.pixiv.net/en/artworks/12345?from=search'])('downloads %s with normalized paths and Referer', async (reference) => {
         mockHttpDownload.mockResolvedValue({ success: true, size: 1024000 });
         const page = createPageMock([
             {
@@ -67,10 +69,12 @@ describe('pixiv download', () => {
                 ],
             },
         ]);
-        const result = (await cmd.func(page, { 'illust-id': '12345', output: '/tmp/test' }));
+        const result = (await cmd.func(page, { 'illust-id': reference, output: '/tmp/test' }));
+        expect(page.evaluate.mock.calls[0][0]).toContain('/ajax/illust/12345/pages');
         expect(result).toHaveLength(2);
         expect(result[0]).toMatchObject({ index: 1, type: 'image', status: 'success' });
         expect(result[1]).toMatchObject({ index: 2, type: 'image', status: 'success' });
+        expect(mockMkdirSync).toHaveBeenCalledWith(expect.stringMatching(/12345$/), { recursive: true });
         // Verify Referer header was passed
         expect(mockHttpDownload).toHaveBeenCalledTimes(2);
         const firstCallOpts = mockHttpDownload.mock.calls[0][2];

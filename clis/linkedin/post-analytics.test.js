@@ -8,14 +8,6 @@ const { summarize } = await import('./post-analytics.js').then((m) => m.__test__
 describe('linkedin post-analytics adapter', () => {
   const command = getRegistry().get('linkedin/post-analytics');
 
-  it('registers command shape', () => {
-    expect(command).toBeDefined();
-    expect(command.strategy).toBe('cookie');
-    expect(command.browser).toBe(true);
-    expect(command.columns).toContain('total_reactions');
-    expect(command.columns).not.toContain('total_engagement_score');
-  });
-
   it('summarizes raw counters without custom scoring', () => {
     const out = summarize([
       { body: 'Latest post', reactions: 10, comments: 3, reposts: 1, impressions: 50, media: 'image', url: 'u1', posted_at: '1d' },

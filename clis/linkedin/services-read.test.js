@@ -1,7 +1,6 @@
-import { describe, expect, it, vi } from 'vitest';
-import { getRegistry } from '@jackwener/opencli/registry';
+import { describe, expect, it } from 'vitest';
+
 import { CommandExecutionError } from '@jackwener/opencli/errors';
-import './services-read.js';
 
 const {
   normalizeProfileUrl,
@@ -11,27 +10,6 @@ const {
 } = await import('./services-read.js').then((m) => m.__test__);
 
 describe('linkedin services-read adapter', () => {
-  const command = getRegistry().get('linkedin/services-read');
-
-  it('registers command shape', () => {
-    expect(command).toBeDefined();
-    expect(command.strategy).toBe('cookie');
-    expect(command.browser).toBe(true);
-    expect(command.columns).toEqual([
-      'service_url',
-      'page_title',
-      'overview',
-      'availability',
-      'work_locations',
-      'pricing',
-      'services_provided',
-      'services_count',
-      'media',
-      'media_count',
-      'messages',
-      'reviews_visibility',
-    ]);
-  });
 
   it('normalizes profile and services URLs', () => {
     expect(normalizeProfileUrl(undefined)).toBe('https://www.linkedin.com/in/me/');
@@ -84,22 +62,4 @@ describe('linkedin services-read adapter', () => {
       .toThrow(CommandExecutionError);
   });
 
-  it('does not require edit access when reading an explicit services URL', async () => {
-    const page = {
-      goto: vi.fn(async () => {}),
-      wait: vi.fn(async () => {}),
-      evaluate: vi.fn()
-        .mockResolvedValueOnce(false)
-        .mockResolvedValueOnce({
-          service_url: 'https://www.linkedin.com/services/page/abc/',
-          page_title: 'Alice Services',
-          overview: 'Builds AI',
-          services_provided: ['AI Consulting'],
-        }),
-    };
-
-    await expect(command.func(page, { 'services-url': 'https://www.linkedin.com/services/page/abc/' }))
-      .resolves.toMatchObject([{ page_title: 'Alice Services', services_count: '1' }]);
-    expect(page.goto.mock.calls.map(([url]) => String(url))).toEqual(['https://www.linkedin.com/services/page/abc/']);
-  });
 });

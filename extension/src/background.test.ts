@@ -9,6 +9,7 @@ type MockTab = {
   id: number;
   windowId: number;
   url?: string;
+  pendingUrl?: string;
   title?: string;
   active?: boolean;
   status?: string;
@@ -167,7 +168,7 @@ function createChromeMock() {
       TAB_GROUP_ID_NONE: -1,
       get: vi.fn(async (groupId: number) => {
         const group = groups.find((entry) => entry.id === groupId);
-        if (!group) throw new Error(`Unknown group ${groupId}`);
+        if (!group) throw new Error(`No group with id: ${groupId}`);
         return group;
       }),
       query: vi.fn(async (queryInfo: { windowId?: number; title?: string; color?: chrome.tabGroups.ColorEnum } = {}) => groups.filter((group) => {
@@ -199,12 +200,8 @@ function createChromeMock() {
       onEvent: { addListener: vi.fn() } as Listener<(source: any, method: string, params: any) => void>,
     },
     windows: {
-      // Default: no reusable user window, so the container falls back to creating one.
-      // Tests that exercise host-window reuse override this.
-      getAll: vi.fn(async () => [] as any[]),
-      getLastFocused: vi.fn(async () => undefined as any),
-      get: vi.fn(async (windowId: number) => ({ id: windowId, focused: windowId === lastFocusedWindowId })),
-      create: vi.fn(async ({ url, focused, width, height, type }: any): Promise<{ id: number; url?: string; focused?: boolean; width?: number; height?: number; type?: string }> => ({ id: 1, url, focused, width, height, type })),
+      get: vi.fn(async (windowId: number): Promise<{ id: number; type?: string; focused: boolean }> => ({ id: windowId, type: 'normal', focused: windowId === lastFocusedWindowId })),
+      create: vi.fn(async ({ url, focused, width, height, type }: any) => ({ id: 1, url, focused, width, height, type })),
       remove: vi.fn(async (_windowId: number) => {}),
       onRemoved: { addListener: vi.fn() } as Listener<(windowId: number) => void>,
     },
@@ -235,6 +232,7 @@ function createChromeMock() {
       onStartup: { addListener: vi.fn() } as Listener<() => void>,
       onMessage: { addListener: vi.fn() } as Listener<(msg: unknown, sender: unknown, sendResponse: (value: unknown) => void) => void>,
       getManifest: vi.fn(() => ({ version: 'test-version' })),
+      getURL: vi.fn((path: string) => `chrome-extension://opencli/${path}`),
     },
     cookies: {
       getAll: vi.fn(async () => []),
@@ -254,6 +252,7 @@ function createChromeMock() {
 
 describe('background tab isolation', () => {
   beforeEach(() => {
+    vi.doUnmock('./cdp');
     vi.resetModules();
     vi.useRealTimers();
     MockWebSocket.instances = [];
@@ -276,28 +275,40 @@ describe('background tab isolation', () => {
     vi.unstubAllGlobals();
   });
 
-  it('stores viewport before open, applies it across tab operations, and clears it on reset and close', async () => {
-    const { chrome } = createChromeMock();
-    chrome.debugger.sendCommand = vi.fn(async () => ({}));
+  it('reports a dedicated keep-alive lease and releases only its tab', async () => {
+    const { chrome, tabs } = createChromeMock();
+    const tab: MockTab = { id: 42, windowId: 9, url: 'about:blank', groupId: -1 };
+    chrome.windows.create.mockImplementationOnce(async () => {
+      tabs.push(tab);
+      return { id: 9, tabs: [tab], url: tab.url, focused: false, width: 1280, height: 900, type: "normal" };
+    });
     vi.stubGlobal('chrome', chrome);
-    const mod = await import('./background');
-    mod.__test__.setDefaultWindowMode('background');
-    const command = { id: 'viewport', action: 'viewport' as const, session: 'viewport', surface: 'browser' as const };
-    const set = await mod.__test__.handleCommand({ ...command, op: 'set', width: 390, height: 844 });
-    expect(set).toMatchObject({ ok: true, data: { supported: true, viewport: { width: 390, height: 844, deviceScaleFactor: 1 } } });
-    expect(chrome.tabs.create).not.toHaveBeenCalled();
-    const tabId = await mod.__test__.resolveTabId(undefined, browserKey('viewport'), 'https://automation.example');
-    expect(chrome.debugger.sendCommand).toHaveBeenCalledWith({ tabId }, 'Emulation.setDeviceMetricsOverride', { width: 390, height: 844, mobile: false, deviceScaleFactor: 1 });
-    await mod.__test__.resolveTabId(undefined, browserKey('viewport'));
-    const reset = await mod.__test__.handleCommand({ ...command, op: 'reset' });
-    expect(reset).toMatchObject({ ok: true, data: { supported: true, viewport: null } });
-    expect(chrome.debugger.sendCommand).toHaveBeenCalledWith({ tabId }, 'Emulation.clearDeviceMetricsOverride');
-    await mod.__test__.handleCommand({ ...command, op: 'set', width: 1440, height: 900 });
-    await mod.__test__.handleCommand({ ...command, action: 'close-window' });
-    chrome.debugger.sendCommand.mockClear();
-    await mod.__test__.resolveTabId(undefined, browserKey('viewport'), 'https://automation.example');
-    expect(chrome.debugger.sendCommand.mock.calls.some((call: any[]) => call[1] === 'Emulation.setDeviceMetricsOverride')).toBe(false);
-    await mod.__test__.handleCommand({ ...command, action: 'close-window' });
+    const { __test__: runtime } = await import('./background');
+    const session = { session: 'fork-test', surface: 'browser' } as const;
+
+    const opened = await runtime.handleCommand({
+      id: 'open', action: 'tabs', op: 'new', windowMode: 'dedicated', idleTimeout: -1, ...session,
+    });
+    expect(opened).toMatchObject({ ok: true });
+    expect(chrome.windows.create).toHaveBeenCalledWith(expect.objectContaining({ focused: false }));
+    const leases = await runtime.handleCommand({ id: 'list', action: 'sessions' });
+    expect(leases.data).toEqual([{ ...session, windowId: 9, dedicated: true, keepAlive: true }]);
+
+    expect((await runtime.handleCommand({ id: 'close', action: 'close-window', ...session })).ok).toBe(true);
+    expect(chrome.tabs.remove).toHaveBeenCalledWith(42);
+    expect(chrome.windows.remove).not.toHaveBeenCalled();
+    expect((await runtime.handleCommand({ id: 'list-after-close', action: 'sessions' })).data).toEqual([]);
+  });
+
+  it('guards page commands against creating a session for a mistyped name', async () => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    const { __test__: runtime } = await import('./background');
+    const result = await runtime.handleCommand({
+      id: 'state', action: 'exec', code: '1', session: 'missing', surface: 'browser', requireExistingSession: true,
+    });
+    expect(result).toMatchObject({ ok: false, errorCode: 'session_not_found' });
+    expect(chrome.windows.create).not.toHaveBeenCalled();
   });
 
   it('lists only automation-window web tabs', async () => {
@@ -305,9 +316,6 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
 
     const result = await mod.__test__.handleTabs({ id: '1', action: 'tabs', op: 'list', session: adapterKey('twitter') }, adapterKey('twitter'));
@@ -359,9 +367,6 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
 
     const result = await mod.__test__.handleCommand({ id: 'frames', action: 'frames', session: 'twitter', surface: 'adapter' });
@@ -373,56 +378,11 @@ describe('background tab isolation', () => {
     ]);
   });
 
-  it('falls back to chrome.debugger OOPIF targets for a cross-origin iframe missing from the frame tree', async () => {
-    // Under Chrome's site isolation a cross-origin iframe is an out-of-process
-    // target: Page.getFrameTree's childFrames on the parent session can be
-    // empty even though the iframe is really there. enumerateFramesForTab
-    // must recover it from Target.getTargets instead of returning [].
-    const { chrome } = createChromeMock();
-    chrome.debugger.sendCommand = vi.fn(async (_target: unknown, method: string) => {
-      if (method === 'Runtime.enable') return {};
-      if (method === 'Runtime.evaluate') return { result: { value: 1 } };
-      if (method === 'Page.getFrameTree') {
-        return {
-          frameTree: {
-            frame: { id: 'root', url: 'https://main.example/' },
-            // No childFrames — the OOPIF is invisible from here.
-          },
-        };
-      }
-      if (method === 'Target.getTargets') {
-        return {
-          targetInfos: [
-            { targetId: 'oopif-1', type: 'iframe', url: 'https://cross.example/widget', title: 'cross-widget' },
-          ],
-        };
-      }
-      return {};
-    });
-    vi.stubGlobal('chrome', chrome);
-
-    const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
-    mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
-
-    const result = await mod.__test__.handleCommand({ id: 'frames', action: 'frames', session: 'twitter', surface: 'adapter' });
-
-    expect(result.ok).toBe(true);
-    expect(result.data).toEqual([
-      { index: 0, frameId: 'oopif-1', url: 'https://cross.example/widget', name: 'cross-widget' },
-    ]);
-  });
-
   it('does not parse lease-key separators from command session fields', async () => {
     const { chrome } = createChromeMock();
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
 
     expect(mod.__test__.getSessionName(adapterKey('twitter'))).toBe(adapterKey('twitter'));
     expect(mod.__test__.getCommandSurface({ session: adapterKey('twitter') })).toBe('browser');
@@ -435,9 +395,6 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
 
     const result = await mod.__test__.handleCommand({
@@ -463,15 +420,7 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
-    // URL-less commands on the browser surface no longer auto-create a tab — that
-    // guard is what stops a mistyped session name from spawning an orphan blank tab.
-    // Materialize the browser-surface lease first; what this test asserts is the
-    // lease-key namespacing, not the incidental auto-create.
-    await mod.__test__.resolveTabId(undefined, browserKey(adapterKey('twitter')), 'https://example.com');
 
     const result = await mod.__test__.handleCommand({
       id: 'encoded-session',
@@ -498,9 +447,6 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
 
     const result = await mod.__test__.handleCommand({
@@ -541,9 +487,6 @@ describe('background tab isolation', () => {
     }));
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
 
     const result = await mod.__test__.handleCommand({
@@ -588,9 +531,6 @@ describe('background tab isolation', () => {
     }));
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     const result = await mod.__test__.handleCommand({
       id: 'download',
       action: 'wait-download',
@@ -650,9 +590,6 @@ describe('background tab isolation', () => {
     }));
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
 
     const listResult = await mod.__test__.handleCommand({ id: 'frames', action: 'frames', session: 'twitter', surface: 'adapter' });
@@ -697,9 +634,6 @@ describe('background tab isolation', () => {
     }));
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
 
     // 120s transport timeout → 115s CDP deadline
@@ -730,17 +664,12 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
 
     const result = await mod.__test__.handleTabs({ id: '2', action: 'tabs', op: 'new', url: 'https://new.example', session: adapterKey('twitter') }, adapterKey('twitter'));
 
     expect(result.ok).toBe(true);
-    // Background is the default, so a new automation tab must not become the active
-    // tab — that would yank the view away from whatever the person is reading.
-    expect(create).toHaveBeenCalledWith({ windowId: 1, url: 'https://new.example', active: false });
+    expect(create).toHaveBeenCalledWith({ windowId: 1, url: 'https://new.example', active: true });
   });
 
   it('reuses the initial container tab for first tab-new lease instead of leaving a blank tab', async () => {
@@ -748,18 +677,278 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     const result = await mod.__test__.handleTabs(
       { id: 'first-new', action: 'tabs', op: 'new', url: 'https://first.example', session: browserKey('default') },
       browserKey('default'),
     );
 
     expect(result.ok).toBe(true);
-    expect(chrome.windows.create).toHaveBeenCalledWith(expect.objectContaining({ url: 'https://first.example' }));
+    expect(chrome.windows.create).toHaveBeenCalledWith(expect.objectContaining({ url: 'about:blank' }));
     expect(update).toHaveBeenCalledWith(1, { url: 'https://first.example' });
     expect(create).not.toHaveBeenCalled();
+  });
+
+  it('does not adopt a saved OpenCLI group in a user window after the owned window is gone', async () => {
+    const { chrome, tabs, groups } = createChromeMock();
+    tabs.push({ id: 70, windowId: 7, url: 'about:blank', title: 'New Tab', active: true, status: 'complete', groupId: 400 });
+    groups.push({ id: 400, windowId: 7, title: 'OpenCLI Browser', color: 'orange', collapsed: false });
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./background');
+    const targetTabId = await mod.__test__.resolveTabId(undefined, browserKey('restored-group'), 'https://target.example');
+
+    expect(targetTabId).not.toBe(70);
+    expect(tabs.find((tab) => tab.id === 70)).toMatchObject({ url: 'about:blank', groupId: 400 });
+    expect(groups.find((group) => group.id === 400)).toMatchObject({ windowId: 7, title: 'OpenCLI Browser' });
+    expect(chrome.windows.create).toHaveBeenCalled();
+  });
+
+  it('does not reuse a user window tab when a stale container window id survives recovery', async () => {
+    const { chrome, tabs, groups } = createChromeMock();
+    tabs.push({ id: 70, windowId: 7, url: 'about:blank', title: 'New Tab', active: true, status: 'complete', groupId: 400 });
+    groups.push({ id: 400, windowId: 7, title: 'OpenCLI Browser', color: 'orange', collapsed: false });
+    vi.stubGlobal('chrome', chrome);
+    await chrome.storage.session.set({
+      opencli_target_lease_registry_v2: {
+        version: 2,
+        contextId: 'user-default',
+        ownedContainers: {
+          interactive: { windowId: 7, groupIds: [] },
+          automation: { windowId: null },
+        },
+        leases: {},
+      },
+    });
+
+    const mod = await import('./background');
+    await mod.__test__.reconcileTargetLeaseRegistry();
+    const targetTabId = await mod.__test__.resolveTabId(undefined, browserKey('stale-window'), 'https://target.example');
+
+    expect(targetTabId).not.toBe(70);
+    expect(tabs.find((tab) => tab.id === 70)).toMatchObject({ url: 'about:blank', groupId: 400 });
+    expect(groups.find((group) => group.id === 400)).toMatchObject({ windowId: 7, title: 'OpenCLI Browser' });
+    expect(chrome.windows.create).toHaveBeenCalled();
+  });
+
+  it('recovers a marked idle window after session storage is cleared', async () => {
+    const { chrome, tabs, groups, update } = createChromeMock();
+    const token = '00000000-0000-4000-8000-000000000001';
+    const url = `chrome-extension://opencli/idle.html#${token}`;
+    tabs.push({ id: 70, windowId: 7, url, active: true, status: 'complete', groupId: 400 });
+    groups.push({ id: 400, windowId: 7, title: 'Renamed', color: 'blue', collapsed: false });
+    await chrome.storage.local.set({ opencli_idle_interactive_v1: token });
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    await mod.__test__.reconcileTargetLeaseRegistry();
+    expect(mod.__test__.getInteractiveContainer().windowId).toBe(7);
+    expect(await mod.__test__.resolveTabId(undefined, browserKey('restored'), 'https://target.example')).toBe(70);
+    expect(update).toHaveBeenCalledWith(70, { url: 'https://target.example' });
+    expect(chrome.windows.create).not.toHaveBeenCalled();
+    expect((await chrome.storage.local.get('opencli_idle_interactive_v1')).opencli_idle_interactive_v1).toBeUndefined();
+  });
+
+  it.each(['startup', 'update'])('never adopts an unmarked user-only saved group after %s', async (event) => {
+    const { chrome, tabs, groups, update } = createChromeMock();
+    tabs.push({ id: 70, windowId: 7, url: 'https://user.example/unsaved-form', active: true, status: 'complete', groupId: 400 });
+    groups.push({ id: 400, windowId: 7, title: 'OpenCLI Browser', color: 'orange', collapsed: false });
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    if (event === 'startup') chrome.runtime.onStartup.addListener.mock.calls[0][0]();
+    else (chrome.runtime.onInstalled.addListener.mock.calls[0][0] as Function)({ reason: 'update' });
+    await mod.__test__.reconcileTargetLeaseRegistry();
+    await mod.__test__.resolveTabId(undefined, browserKey('review-startup'), 'https://target.example');
+    expect(tabs.find(tab => tab.id === 70)?.url).toBe('https://user.example/unsaved-form');
+    expect(update).not.toHaveBeenCalledWith(70, expect.anything());
+  });
+
+  it('marks the last interactive placeholder and recovers it after worker reload', async () => {
+    const { chrome, tabs, groups } = createChromeMock();
+    tabs.push({ id: 70, windowId: 7, url: 'https://automation.example', active: true, status: 'complete', groupId: 400 });
+    groups.push({ id: 400, windowId: 7, title: 'OpenCLI Browser', color: 'orange', collapsed: false });
+    vi.stubGlobal('chrome', chrome);
+    let mod = await import('./background');
+    await mod.__test__.reconcileTargetLeaseRegistry();
+    mod.__test__.setSession(browserKey('owned'), { windowId: 7, owned: true, preferredTabId: 70 });
+    await mod.__test__.handleCommand({ id: 'close', action: 'close-window', session: 'owned', surface: 'browser' });
+    expect(tabs.find(tab => tab.id === 70)?.url).toMatch(/^chrome-extension:\/\/opencli\/idle.html#/);
+    await chrome.storage.session.set({ opencli_target_lease_registry_v2: undefined });
+    vi.resetModules();
+    mod = await import('./background');
+    await mod.__test__.reconcileTargetLeaseRegistry();
+    expect(await mod.__test__.resolveTabId(undefined, browserKey('again'), 'https://target.example')).toBe(70);
+    expect(chrome.windows.create).not.toHaveBeenCalled();
+  });
+
+  it('propagates owned group recovery errors instead of creating a replacement window', async () => {
+    const { chrome, groups } = createChromeMock();
+    groups.push({ id: 400, windowId: 7, title: 'OpenCLI Browser', color: 'orange', collapsed: false });
+    vi.stubGlobal('chrome', chrome);
+    await chrome.storage.session.set({
+      opencli_target_lease_registry_v2: {
+        version: 2,
+        contextId: 'user-default',
+        ownedContainers: {
+          interactive: { windowId: 7, groupIds: [400] },
+          automation: { windowId: null },
+        },
+        leases: {},
+      },
+    });
+
+    const mod = await import('./background');
+    await mod.__test__.reconcileTargetLeaseRegistry();
+    groups[0].title = '';
+    chrome.tabGroups.update.mockRejectedValueOnce(new Error('group update failed'));
+
+    await expect(mod.__test__.resolveTabId(undefined, browserKey('recovery-error'), 'https://target.example'))
+      .rejects.toThrow('group update failed');
+
+    expect(chrome.windows.create).not.toHaveBeenCalled();
+  });
+
+  it('propagates cached window inspection errors instead of creating a replacement window', async () => {
+    const { chrome, groups } = createChromeMock();
+    groups.push({ id: 400, windowId: 7, title: 'OpenCLI Browser', color: 'orange', collapsed: false });
+    vi.stubGlobal('chrome', chrome);
+    await chrome.storage.session.set({
+      opencli_target_lease_registry_v2: {
+        version: 2,
+        contextId: 'user-default',
+        ownedContainers: {
+          interactive: { windowId: 7, groupIds: [400] },
+          automation: { windowId: null },
+        },
+        leases: {},
+      },
+    });
+
+    const mod = await import('./background');
+    await mod.__test__.reconcileTargetLeaseRegistry();
+    chrome.windows.get.mockRejectedValueOnce(new Error('permission denied'));
+
+    await expect(mod.__test__.resolveTabId(undefined, browserKey('window-inspection-error'), 'https://target.example'))
+      .rejects.toThrow('permission denied');
+
+    expect(chrome.windows.create).not.toHaveBeenCalled();
+  });
+
+  it('propagates owned group candidate inspection errors instead of treating the group as missing', async () => {
+    const { chrome, groups } = createChromeMock();
+    groups.push({ id: 400, windowId: 7, title: 'OpenCLI Browser', color: 'orange', collapsed: false });
+    vi.stubGlobal('chrome', chrome);
+    await chrome.storage.session.set({
+      opencli_target_lease_registry_v2: {
+        version: 2,
+        contextId: 'user-default',
+        ownedContainers: {
+          interactive: { windowId: null, groupIds: [400] },
+          automation: { windowId: null },
+        },
+        leases: {},
+      },
+    });
+
+    const mod = await import('./background');
+    await mod.__test__.reconcileTargetLeaseRegistry();
+    chrome.windows.get
+      .mockResolvedValueOnce({ id: 7, focused: false })
+      .mockRejectedValueOnce(new Error('permission denied'));
+
+    await expect(mod.__test__.resolveTabId(undefined, browserKey('candidate-error'), 'https://target.example'))
+      .rejects.toThrow('permission denied');
+
+    expect(chrome.windows.create).not.toHaveBeenCalled();
+  });
+
+  it('retains owned group ids when group inspection fails unexpectedly', async () => {
+    const { chrome, groups } = createChromeMock();
+    groups.push({ id: 400, windowId: 7, title: 'OpenCLI Browser', color: 'orange', collapsed: false });
+    vi.stubGlobal('chrome', chrome);
+    await chrome.storage.session.set({
+      opencli_target_lease_registry_v2: {
+        version: 2,
+        contextId: 'user-default',
+        ownedContainers: {
+          interactive: { windowId: 7, groupIds: [400] },
+          automation: { windowId: null },
+        },
+        leases: {},
+      },
+    });
+
+    const mod = await import('./background');
+    await mod.__test__.reconcileTargetLeaseRegistry();
+    chrome.tabGroups.get.mockRejectedValueOnce(new Error('permission denied'));
+
+    await expect(mod.__test__.resolveTabId(undefined, browserKey('group-inspection-error'), 'https://target.example'))
+      .rejects.toThrow('permission denied');
+
+    expect(mod.__test__.getInteractiveContainer().groupIds).toContain(400);
+    expect(chrome.windows.create).not.toHaveBeenCalled();
+  });
+
+  it('propagates untitled owned group scan errors before creating a replacement window', async () => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    await chrome.storage.session.set({
+      opencli_target_lease_registry_v2: {
+        version: 2,
+        contextId: 'user-default',
+        ownedContainers: {
+          interactive: { windowId: null, groupIds: [] },
+          automation: { windowId: null },
+        },
+        leases: {
+          [browserKey('scan-error')]: {
+            windowId: 1,
+            owned: true,
+            preferredTabId: 1,
+            contextId: 'user-default',
+            ownership: 'owned',
+            lifecycle: 'ephemeral',
+            windowRole: 'interactive',
+            idleDeadlineAt: Date.now() + 30_000,
+            updatedAt: Date.now(),
+          },
+        },
+      },
+    });
+
+    const mod = await import('./background');
+    await mod.__test__.reconcileTargetLeaseRegistry();
+    chrome.tabGroups.query.mockRejectedValueOnce(new Error('permission denied'));
+
+    await expect(mod.__test__.ensureOwnedContainerGroup('interactive', null, []))
+      .rejects.toThrow('permission denied');
+
+    expect(chrome.windows.create).not.toHaveBeenCalled();
+  });
+
+  it('propagates owned tab inspection errors instead of completing group recovery', async () => {
+    const { chrome, tabs, groups } = createChromeMock();
+    tabs.push({ id: 70, windowId: 7, url: 'about:blank', title: 'blank', active: true, status: 'complete', groupId: -1 });
+    groups.push({ id: 400, windowId: 7, title: 'OpenCLI Browser', color: 'orange', collapsed: false });
+    vi.stubGlobal('chrome', chrome);
+    await chrome.storage.session.set({
+      opencli_target_lease_registry_v2: {
+        version: 2,
+        contextId: 'user-default',
+        ownedContainers: {
+          interactive: { windowId: null, groupIds: [400] },
+          automation: { windowId: null },
+        },
+        leases: {},
+      },
+    });
+
+    const mod = await import('./background');
+    await mod.__test__.reconcileTargetLeaseRegistry();
+    chrome.tabs.get.mockRejectedValueOnce(new Error('permission denied'));
+
+    await expect(mod.__test__.ensureOwnedContainerGroup('interactive', 7, [70]))
+      .rejects.toThrow('permission denied');
+
+    expect(chrome.tabs.group).not.toHaveBeenCalledWith({ groupId: 400, tabIds: [70] });
   });
 
   it('closes a tab by page identity', async () => {
@@ -767,9 +956,6 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
 
     const result = await mod.__test__.handleTabs(
@@ -825,8 +1011,7 @@ describe('background tab isolation', () => {
 
     expect(result).toEqual(expect.objectContaining({ id: 'reject-close', ok: false }));
     expect(chrome.tabs.remove).not.toHaveBeenCalled();
-    // fork: 专用窗口池把回收的页停在 about:blank#opencli-dedicated=<slot>，这里按前缀断言
-    expect(chrome.tabs.update).not.toHaveBeenCalledWith(1, expect.objectContaining({ url: expect.stringMatching(/^about:blank/) }));
+    expect(chrome.tabs.update).not.toHaveBeenCalledWith(1, { url: 'about:blank', active: true });
     expect(mod.__test__.getSession(adapterKey('twitter'))?.preferredTabId).toBe(1);
   });
 
@@ -843,8 +1028,7 @@ describe('background tab isolation', () => {
     );
 
     expect(result).toEqual({ id: 'implicit-close', ok: true, data: { closed: 'target-1' } });
-    // fork: 专用窗口池回收时停在 about:blank#opencli-dedicated=<slot> 且不抢激活，上游是 { url: 'about:blank', active: true }
-    expect(chrome.tabs.update).toHaveBeenCalledWith(1, expect.objectContaining({ url: expect.stringMatching(/^about:blank/) }));
+    expect(chrome.tabs.update).toHaveBeenCalledWith(1, { url: 'about:blank', active: true });
     expect(mod.__test__.getSession(adapterKey('twitter'))).toBeNull();
   });
 
@@ -866,6 +1050,66 @@ describe('background tab isolation', () => {
     expect(mod.__test__.getSession(adapterKey('twitter'))?.preferredTabId).toBe(1);
   });
 
+  it.each([
+    ['navigate', 'new-window'], ['navigate', 'placeholder'], ['navigate', 'new-tab'], ['navigate', 'existing-tab'],
+    ['tabs', 'new-window'], ['tabs', 'placeholder'], ['tabs', 'new-tab'],
+  ] as const)('starts one slow navigation for %s with a %s lease', async (action, mode) => {
+    vi.useFakeTimers();
+    const { chrome, tabs } = createChromeMock();
+    tabs[0].url = 'about:blank';
+    const target = 'https://slow.example/start';
+    const redirected = 'https://slow.example/done';
+    const requests: string[] = [];
+    const listeners = new Set<(id: number, info: chrome.tabs.TabChangeInfo, tab: chrome.tabs.Tab) => void>();
+    chrome.tabs.onUpdated.addListener = vi.fn(fn => { listeners.add(fn); });
+    chrome.tabs.onUpdated.removeListener = vi.fn(fn => { listeners.delete(fn); });
+    const navigate = (tab: MockTab, url: string) => {
+      if (url === target) {
+        requests.push(url);
+        if (tab.pendingUrl === url) throw new Error('Navigation rejected.');
+        tab.pendingUrl = url;
+        tab.status = 'loading';
+        setTimeout(() => {
+          tab.url = redirected;
+          tab.pendingUrl = undefined;
+          tab.title = 'Done';
+          tab.status = 'complete';
+          for (const listener of listeners) listener(tab.id, { status: 'complete' }, tab as chrome.tabs.Tab);
+        }, 1200);
+      } else {
+        tab.url = url;
+        tab.status = 'complete';
+      }
+      return { ...tab };
+    };
+    chrome.tabs.update = vi.fn(async (id: number, updates: { url?: string; active?: boolean }) => {
+      const tab = tabs.find(t => t.id === id)!;
+      return updates.url ? navigate(tab, updates.url) : { ...tab };
+    });
+    chrome.tabs.create = vi.fn(async ({ windowId, url, active }) => {
+      const tab: MockTab = { id: 10, windowId: windowId!, url: 'about:blank', active, groupId: -1 };
+      tabs.push(tab);
+      return navigate(tab, url!);
+    });
+    chrome.windows.create = vi.fn(async ({ url, focused, width, height, type }) => {
+      navigate(tabs[0], url);
+      return { id: 1, url, focused, width, height, type };
+    });
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    const initialListeners = listeners.size;
+    const key = adapterKey('slow');
+    if (mode === 'placeholder') mod.__test__.setAutomationWindowId(key, 1);
+    if (mode === 'new-tab') mod.__test__.setSession(adapterKey('busy'), { windowId: 1, owned: true, preferredTabId: 1 });
+    if (mode === 'existing-tab') mod.__test__.setSession(key, { windowId: 1, owned: true, preferredTabId: 1 });
+    const result = mod.__test__.handleCommand({ id: 'slow-nav', action, op: 'new', url: target, session: 'slow', surface: 'adapter' });
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(await result).toMatchObject({ ok: true });
+    if (action === 'navigate') expect(await result).toMatchObject({ data: { url: redirected, title: 'Done', timedOut: false } });
+    expect(requests).toEqual([target]);
+    expect(listeners.size).toBe(initialListeners);
+  });
+
   it('treats normalized same-url navigate as already complete', async () => {
     const { chrome, tabs, update } = createChromeMock();
     tabs[0].url = 'https://www.bilibili.com/';
@@ -874,9 +1118,6 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setSession(adapterKey('twitter'), { windowId: 1, owned: true, preferredTabId: 1 });
 
     const result = await mod.__test__.handleNavigate(
@@ -895,29 +1136,6 @@ describe('background tab isolation', () => {
       },
     });
     expect(update).not.toHaveBeenCalled();
-  });
-
-  it('allows about:blank and arms Runtime capture before navigating to the target', async () => {
-    const { chrome, tabs, update } = createChromeMock();
-    tabs[0].url = 'about:blank';
-    vi.stubGlobal('chrome', chrome);
-    const ensureAttached = vi.fn(async () => {});
-    vi.doMock('./cdp', () => ({
-      registerListeners: vi.fn(),
-      ensureAttached,
-    }));
-    const mod = await import('./background');
-    const key = adapterKey('blank-start');
-    mod.__test__.setSession(key, { windowId: 1, owned: true, preferredTabId: 1 });
-
-    const blank = await mod.__test__.handleNavigate({ id: 'blank', action: 'navigate', url: 'about:blank' }, key);
-    expect(blank.ok).toBe(true);
-    expect(update).not.toHaveBeenCalled();
-    const target = await mod.__test__.handleNavigate({ id: 'target', action: 'navigate', url: 'https://example.com/' }, key);
-    expect(target.ok).toBe(true);
-    expect(ensureAttached).toHaveBeenCalledWith(1);
-    expect(ensureAttached.mock.invocationCallOrder[1]).toBeLessThan(update.mock.invocationCallOrder[0]);
-    expect(update).toHaveBeenCalledWith(1, { url: 'https://example.com/' });
   });
 
   it('keeps the debugger attached during navigation when network capture is active', async () => {
@@ -944,15 +1162,11 @@ describe('background tab isolation', () => {
     const detachMock = vi.fn(async () => {});
     vi.doMock('./cdp', () => ({
       registerListeners: vi.fn(),
-      ensureAttached: vi.fn(async () => {}),
       hasActiveNetworkCapture: vi.fn(() => true),
       detach: detachMock,
     }));
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
 
     const result = await mod.__test__.handleNavigate(
@@ -964,130 +1178,11 @@ describe('background tab isolation', () => {
     expect(detachMock).not.toHaveBeenCalled();
   });
 
-  /**
-   * Both of these navigate-timeout tests must keep the tab looking permanently
-   * "not yet at the target URL" — otherwise handleNavigate's own fast path
-   * ("tab already at target and complete") returns before ever scheduling its
-   * wait/timeout, and the test would pass for the wrong reason. `chrome.tabs.update`
-   * is therefore a deliberate no-op (never mutates url/status), for BOTH the
-   * pre-navigation update inside createOwnedTabLeaseUnlocked and handleNavigate's
-   * own update call. Once the real wait/timeout is scheduled, the test finishes
-   * it by invoking the captured timeout callback directly (the same code path
-   * `finish()` would take on a real timeout) instead of waiting out the delay
-   * in real time or leaving a live timer dangling into a later test.
-   */
-  it('schedules the navigate timeout fallback at 15000ms when cmd.timeoutMs is absent (old-CLI compatibility)', async () => {
-    const { chrome, tabs } = createChromeMock();
-    chrome.tabs.update = vi.fn(async (tabId: number) => {
-      const tab = tabs.find((entry) => entry.id === tabId);
-      if (!tab) throw new Error(`Unknown tab ${tabId}`);
-      return tab;
-    });
-    vi.stubGlobal('chrome', chrome);
-    vi.doMock('./cdp', () => ({
-      registerListeners: vi.fn(),
-      ensureAttached: vi.fn(async () => {}),
-      hasActiveNetworkCapture: vi.fn(() => false),
-      detach: vi.fn(async () => {}),
-    }));
-
-    const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
-    mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
-
-    const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
-    try {
-      const resultPromise = mod.__test__.handleNavigate(
-        { id: 'nav-default-timeout', action: 'navigate', url: 'https://eos.douyin.com/livesite/default-timeout', session: adapterKey('twitter') },
-        adapterKey('twitter'),
-      );
-
-      // Let the mandatory internal waits (the 300ms pre-navigation settle inside
-      // createOwnedTabLeaseUnlocked, plus microtask chains) elapse for real, so
-      // handleNavigate's own checkTimer/timeoutTimer are definitely scheduled by
-      // the time we inspect the spy below.
-      await new Promise((resolve) => setTimeout(resolve, 500));
-
-      const timeoutCall = setTimeoutSpy.mock.calls.find(([, delay]) => delay === 15000);
-      expect(timeoutCall).toBeTruthy();
-
-      // Fire the captured callback directly instead of waiting out 15s of real
-      // time or leaving the timer dangling into a later test.
-      (timeoutCall![0] as () => void)();
-      const result = await resultPromise;
-
-      expect(result.ok).toBe(true);
-      expect((result as { data?: { timedOut?: boolean } }).data?.timedOut).toBe(true);
-    } finally {
-      // handleNavigate's success path arms a real idle timer (30s default for
-      // adapter sessions) on the lease. Release it here — while `chrome` is
-      // still stubbed — so it doesn't fire after this test (and its stub)
-      // have torn down, which would surface as an unhandled rejection later
-      // in the run instead of a clean pass/fail here.
-      await mod.__test__.releaseLease(adapterKey('twitter'), 'test cleanup');
-      setTimeoutSpy.mockRestore();
-    }
-  });
-
-  it('schedules the navigate timeout fallback at cmd.timeoutMs (not the 15000ms default) when the CLI passes --timeout / OPENCLI_NAV_TIMEOUT_MS', async () => {
-    const { chrome, tabs } = createChromeMock();
-    chrome.tabs.update = vi.fn(async (tabId: number) => {
-      const tab = tabs.find((entry) => entry.id === tabId);
-      if (!tab) throw new Error(`Unknown tab ${tabId}`);
-      return tab;
-    });
-    vi.stubGlobal('chrome', chrome);
-    vi.doMock('./cdp', () => ({
-      registerListeners: vi.fn(),
-      ensureAttached: vi.fn(async () => {}),
-      hasActiveNetworkCapture: vi.fn(() => false),
-      detach: vi.fn(async () => {}),
-    }));
-
-    const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
-    mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
-
-    const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
-    try {
-      const resultPromise = mod.__test__.handleNavigate(
-        { id: 'nav-custom-timeout', action: 'navigate', url: 'https://eos.douyin.com/livesite/custom-timeout', session: adapterKey('twitter'), timeoutMs: 45000 },
-        adapterKey('twitter'),
-      );
-
-      await new Promise((resolve) => setTimeout(resolve, 500));
-
-      const delays = setTimeoutSpy.mock.calls.map(([, delay]) => delay);
-      const timeoutCall = setTimeoutSpy.mock.calls.find(([, delay]) => delay === 45000);
-      expect(timeoutCall).toBeTruthy();
-      expect(delays).not.toContain(15000);
-
-      (timeoutCall![0] as () => void)();
-      const result = await resultPromise;
-
-      expect(result.ok).toBe(true);
-      expect((result as { data?: { timedOut?: boolean } }).data?.timedOut).toBe(true);
-    } finally {
-      // See the identical comment in the previous test: release the lease
-      // while `chrome` is still stubbed so its real idle timer doesn't fire
-      // later in the run against an already-torn-down stub.
-      await mod.__test__.releaseLease(adapterKey('twitter'), 'test cleanup');
-      setTimeoutSpy.mockRestore();
-    }
-  });
-
   it('keeps hash routes distinct when comparing target URLs', async () => {
     const { chrome } = createChromeMock();
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
 
     expect(mod.__test__.isTargetUrl('https://example.com/', 'https://example.com')).toBe(true);
     expect(mod.__test__.isTargetUrl('https://example.com/#feed', 'https://example.com/#settings')).toBe(false);
@@ -1184,33 +1279,12 @@ describe('background tab isolation', () => {
     expect(chrome.alarms.create).toHaveBeenCalledWith('keepalive', { periodInMinutes: 0.5 });
   });
 
-  it('retries a WebSocket handshake that never opens or closes', async () => {
-    vi.useFakeTimers();
-    const { chrome } = createChromeMock();
-    vi.stubGlobal('chrome', chrome);
-    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true })));
-    const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
-    await mod.__test__.connectForTest();
-    const socket = MockWebSocket.instances[0];
-    expect(socket.readyState).toBe(MockWebSocket.CONNECTING);
-    await vi.advanceTimersByTimeAsync(12_000);
-    expect(socket.readyState).toBe(MockWebSocket.CLOSED);
-    expect(MockWebSocket.instances.length).toBeGreaterThan(1);
-    mod.__test__.resetReconnectState();
-  });
-
   it('reconnect delay backs off exponentially with a 15s cap and resets on success', async () => {
     const { chrome } = createChromeMock();
     vi.stubGlobal('chrome', chrome);
     vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false })));
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.resetReconnectState();
 
     mod.__test__.setReconnectAttempts(0);
@@ -1235,9 +1309,6 @@ describe('background tab isolation', () => {
     vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true })));
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.resetReconnectState();
     mod.__test__.setReconnectAttempts(5);
 
@@ -1251,7 +1322,7 @@ describe('background tab isolation', () => {
     const { chrome } = createChromeMock();
     vi.stubGlobal('chrome', chrome);
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const fetchMock = vi.fn(async (_url: string, _options?: RequestInit) => ({ ok: false, status: 431 }));
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => ({ ok: false, status: 431 }));
     vi.stubGlobal('fetch', fetchMock);
 
     await import('./background');
@@ -1330,9 +1401,6 @@ describe('background tab isolation', () => {
     }));
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
 
     const [first, second] = await Promise.all([
@@ -1371,9 +1439,6 @@ describe('background tab isolation', () => {
     }));
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
     mod.__test__.setAutomationWindowId(adapterKey('zhihu'), 2);
 
@@ -1394,7 +1459,7 @@ describe('background tab isolation', () => {
     }));
     expect(maxInFlight).toBe(2);
     expect(chrome.windows.create).toHaveBeenCalledTimes(1);
-    expect(create).toHaveBeenCalledWith({ windowId: 1, url: 'about:blank', active: false });
+    expect(create).toHaveBeenCalledWith({ windowId: 1, url: 'about:blank', active: true });
   });
 
   it('releases owned sessions without closing the shared container', async () => {
@@ -1402,9 +1467,6 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     await mod.__test__.resolveTabId(undefined, adapterKey('first'));
     await mod.__test__.resolveTabId(undefined, adapterKey('second'));
     expect(mod.__test__.getSession(adapterKey('second'))).toEqual(expect.objectContaining({ preferredTabId: 10 }));
@@ -1412,7 +1474,7 @@ describe('background tab isolation', () => {
     const closeSecond = await mod.__test__.handleCommand({ id: 'close-second', action: 'close-window', session: 'second', surface: 'adapter' });
     expect(closeSecond).toEqual(expect.objectContaining({ ok: true }));
     expect(chrome.tabs.remove).toHaveBeenCalledWith(10);
-    expect(chrome.tabs.update).not.toHaveBeenCalledWith(10, { url: 'about:blank' });
+    expect(chrome.tabs.update).not.toHaveBeenCalledWith(10, { url: 'about:blank', active: true });
     expect(chrome.windows.remove).not.toHaveBeenCalled();
     expect(mod.__test__.getSession(adapterKey('first'))).not.toBeNull();
     expect(mod.__test__.getSession(adapterKey('second'))).toBeNull();
@@ -1422,14 +1484,180 @@ describe('background tab isolation', () => {
     expect(chrome.windows.remove).not.toHaveBeenCalled();
   });
 
+  it('opts into closing only the owned tab, preserving user pages and other sessions', async () => {
+    const { chrome, tabs } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    chrome.tabs.remove.mockImplementation(async (id: number) => {
+      const index = tabs.findIndex(tab => tab.id === id);
+      if (index >= 0) tabs.splice(index, 1);
+    });
+    const mod = await import('./background');
+    await mod.__test__.resolveTabId(undefined, browserKey('first'));
+    await mod.__test__.resolveTabId(undefined, browserKey('second'));
+    const firstTab = mod.__test__.getSession(browserKey('first'))!.preferredTabId!;
+    const secondTab = mod.__test__.getSession(browserKey('second'))!.preferredTabId!;
+    const result = await mod.__test__.handleCommand({
+      id: 'close-owned', action: 'close-owned-tab', session: 'first',
+    });
+    expect(result).toMatchObject({ ok: true, data: { tabCleanup: 'closed-owned-tab' } });
+    expect(chrome.tabs.ungroup).toHaveBeenCalledWith(firstTab);
+    expect(chrome.tabs.ungroup.mock.invocationCallOrder[0]).toBeLessThan(chrome.tabs.remove.mock.invocationCallOrder[0]);
+    expect(chrome.tabs.remove).toHaveBeenCalledExactlyOnceWith(firstTab);
+    expect(tabs.some(tab => tab.id === firstTab)).toBe(false);
+    expect(tabs.some(tab => tab.id === secondTab)).toBe(true);
+    expect(tabs.some(tab => tab.url === 'https://user.example')).toBe(true);
+    expect(mod.__test__.getSession(browserKey('first'))).toBeNull();
+    expect(mod.__test__.getSession(browserKey('second'))).not.toBeNull();
+    expect(chrome.windows.remove).not.toHaveBeenCalled();
+    const again = await mod.__test__.handleCommand({
+      id: 'close-again', action: 'close-owned-tab', session: 'first',
+    });
+    expect(again).toMatchObject({ ok: true, data: { tabCleanup: 'no-owned-tab' } });
+    expect(chrome.tabs.remove).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['ungroup', 'remove'] as const)('keeps ownership and reports failure when tabs.%s rejects', async (operation) => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    await mod.__test__.resolveTabId(undefined, browserKey('retry'));
+    const session = mod.__test__.getSession(browserKey('retry'))!;
+    chrome.tabs[operation].mockRejectedValueOnce(new Error('Chrome refused cleanup'));
+    const result = await mod.__test__.handleCommand({
+      id: 'failed-close', action: 'close-owned-tab', session: 'retry',
+    });
+    expect(result).toMatchObject({ ok: false, error: 'Chrome refused cleanup' });
+    expect(mod.__test__.getSession(browserKey('retry'))).toMatchObject({ preferredTabId: session.preferredTabId });
+    if (operation === 'ungroup') expect(chrome.tabs.remove).not.toHaveBeenCalled();
+    const retry = await mod.__test__.handleCommand({
+      id: 'retry-close', action: 'close-owned-tab', session: 'retry',
+    });
+    expect(retry).toMatchObject({ ok: true, data: { tabCleanup: 'closed-owned-tab' } });
+    expect(mod.__test__.getSession(browserKey('retry'))).toBeNull();
+  });
+
+  it('closes a one-shot adapter lease without parking its final tab', async () => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    await mod.__test__.resolveTabId(undefined, adapterKey('once'));
+    const tabId = mod.__test__.getSession(adapterKey('once'))!.preferredTabId!;
+    const result = await mod.__test__.handleCommand({
+      id: 'close-adapter', action: 'close-owned-tab', session: 'once', surface: 'adapter',
+    });
+    expect(result).toMatchObject({ ok: true, data: { tabCleanup: 'closed-owned-tab' } });
+    expect(chrome.tabs.remove).toHaveBeenCalledExactlyOnceWith(tabId);
+    expect(chrome.tabs.update).not.toHaveBeenCalledWith(tabId, { url: 'about:blank', active: true });
+    expect(mod.__test__.getSession(adapterKey('once'))).toBeNull();
+  });
+
+  it('rejects cleanup while another command is using the same session', async () => {
+    const { chrome, tabs } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    await mod.__test__.resolveTabId(undefined, browserKey('busy'));
+    const started = deferred<void>();
+    const finish = deferred<void>();
+    chrome.tabs.get.mockImplementationOnce(async (id: number) => {
+      started.resolve();
+      await finish.promise;
+      return tabs.find(tab => tab.id === id)!;
+    });
+    const running = mod.__test__.handleCommand({ id: 'running', action: 'tabs', op: 'list', session: 'busy' });
+    await started.promise;
+    try {
+      const close = await mod.__test__.handleCommand({
+        id: 'busy-close', action: 'close-owned-tab', session: 'busy',
+      });
+      expect(close).toMatchObject({ ok: false, errorCode: 'session_busy' });
+      expect(chrome.tabs.remove).not.toHaveBeenCalled();
+      expect(mod.__test__.getSession(browserKey('busy'))).not.toBeNull();
+    } finally {
+      finish.resolve();
+      await running;
+    }
+  });
+
+  it('rejects commands arriving after owned-tab cleanup starts and unlocks after failure', async () => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    await mod.__test__.resolveTabId(undefined, browserKey('closing'));
+    const started = deferred<void>();
+    const finish = deferred<void>();
+    chrome.tabs.remove.mockImplementationOnce(async () => {
+      started.resolve();
+      await finish.promise;
+      throw new Error('remove failed');
+    });
+    const closing = mod.__test__.handleCommand({ id: 'close', action: 'close-owned-tab', session: 'closing' });
+    await started.promise;
+    const owned = mod.__test__.getSession(browserKey('closing'))!;
+    expect(() => mod.__test__.setSession(browserKey('new-borrower'), {
+      windowId: owned.windowId, owned: false, preferredTabId: owned.preferredTabId,
+    })).toThrow('This tab is closing');
+    try {
+      for (const action of ['tabs', 'bind', 'navigate', 'close-window', 'close-owned-tab'] as const) {
+        const result = await mod.__test__.handleCommand({ id: action, action, session: 'closing', op: 'list', url: 'https://example.com' });
+        expect(result).toMatchObject({ ok: false, errorCode: 'session_busy' });
+      }
+    } finally {
+      finish.resolve();
+      expect(await closing).toMatchObject({ ok: false, error: 'remove failed' });
+    }
+    expect(await mod.__test__.handleCommand({ id: 'retry', action: 'close-owned-tab', session: 'closing' }))
+      .toMatchObject({ ok: true, data: { tabCleanup: 'closed-owned-tab' } });
+  });
+
+  it('preserves an owned tab when a different session is also bound to it', async () => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    await mod.__test__.resolveTabId(undefined, browserKey('owner'));
+    const owned = mod.__test__.getSession(browserKey('owner'))!;
+    mod.__test__.setSession(browserKey('borrower'), {
+      windowId: owned.windowId, owned: false, preferredTabId: owned.preferredTabId,
+    });
+    expect(await mod.__test__.handleCommand({ id: 'close', action: 'close-owned-tab', session: 'owner' }))
+      .toMatchObject({ ok: false, errorCode: 'session_busy' });
+    expect(chrome.tabs.remove).not.toHaveBeenCalled();
+    expect(mod.__test__.getSession(browserKey('borrower'))).not.toBeNull();
+  });
+
+  it('retains legacy owned leases without guessing which tab to close', async () => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    mod.__test__.setAutomationWindowId(browserKey('legacy'), 1);
+    const result = await mod.__test__.handleCommand({
+      id: 'legacy-close', action: 'close-owned-tab', session: 'legacy',
+    });
+    expect(result).toMatchObject({ ok: false, errorCode: 'owned_tab_identity_missing' });
+    expect(mod.__test__.getSession(browserKey('legacy'))).not.toBeNull();
+    expect(chrome.tabs.remove).not.toHaveBeenCalled();
+    expect(chrome.windows.remove).not.toHaveBeenCalled();
+  });
+
+  it('does not remove a bound user tab when owned-tab cleanup is requested', async () => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    const bound = await mod.__test__.handleCommand({ id: 'bind', action: 'bind', session: 'bound' });
+    expect(bound.ok).toBe(true);
+    const result = await mod.__test__.handleCommand({
+      id: 'close-bound', action: 'close-owned-tab', session: 'bound',
+    });
+    expect(result).toMatchObject({ ok: true, data: { tabCleanup: 'no-owned-tab' } });
+    expect(chrome.tabs.remove).not.toHaveBeenCalled();
+    expect(chrome.tabs.ungroup).not.toHaveBeenCalled();
+    expect(chrome.windows.remove).not.toHaveBeenCalled();
+  });
+
   it('releases the current owned tab lease when tabs close targets it', async () => {
     const { chrome } = createChromeMock();
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     await mod.__test__.resolveTabId(undefined, adapterKey('twitter'));
 
     const result = await mod.__test__.handleTabs(
@@ -1442,14 +1670,12 @@ describe('background tab isolation', () => {
       ok: true,
       data: { closed: 'target-1' },
     }));
-    // Releasing a lease resets the tab but must never select it: this fires on idle
-    // timeout and cleanup, long after the person stopped watching.
-    expect(chrome.tabs.update).toHaveBeenCalledWith(1, { url: 'about:blank' });
+    expect(chrome.tabs.update).toHaveBeenCalledWith(1, { url: 'about:blank', active: true });
     expect(chrome.windows.remove).not.toHaveBeenCalled();
     expect(mod.__test__.getSession(adapterKey('twitter'))).toBeNull();
   });
 
-  it('reconciles an owned adapter container with no stored leases without closing it or touching its tabs', async () => {
+  it('reconciles an owned adapter container with no stored leases without closing it or grouping new tabs', async () => {
     const { chrome, tabs, groups } = createChromeMock();
     vi.stubGlobal('chrome', chrome);
     await chrome.storage.session.set({
@@ -1462,9 +1688,6 @@ describe('background tab isolation', () => {
     });
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     await mod.__test__.reconcileTargetLeaseRegistry();
 
     expect(chrome.windows.remove).not.toHaveBeenCalled();
@@ -1473,16 +1696,13 @@ describe('background tab isolation', () => {
 
     const tabId = await mod.__test__.resolveTabId(undefined, adapterKey('twitter'), 'https://after.example');
 
-    // The http tab already in the window carries no ownership signal, so it is
-    // the person's: untouched and left outside any group. The new lease gets a
-    // fresh tab in its own session-named group.
     expect(tabId).not.toBe(1);
     expect(chrome.windows.create).not.toHaveBeenCalled();
     expect(tabs.find((tab) => tab.id === 1)?.url).toBe('https://automation.example');
     expect(tabs.find((tab) => tab.id === 1)?.groupId).toBe(-1);
     expect(tabs.find((tab) => tab.id === tabId)?.url).toBe('https://after.example');
-    expect(tabs.find((tab) => tab.id === tabId)?.groupId).not.toBe(-1);
-    expect(groups).toEqual([expect.objectContaining({ windowId: 1, title: 'OpenCLI: twitter' })]);
+    expect(tabs.find((tab) => tab.id === tabId)?.groupId).toBe(-1);
+    expect(groups).toEqual([]);
   });
 
   it('restores owned and borrowed leases from the registry', async () => {
@@ -1522,9 +1742,6 @@ describe('background tab isolation', () => {
     });
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     await mod.__test__.reconcileTargetLeaseRegistry();
 
     expect(mod.__test__.getSession(adapterKey('twitter'))).toEqual(expect.objectContaining({
@@ -1578,9 +1795,6 @@ describe('background tab isolation', () => {
     });
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     await mod.__test__.reconcileTargetLeaseRegistry();
 
     const alarmName = `opencli:lease-idle:${encodeURIComponent(adapterKey('twitter'))}`;
@@ -1593,8 +1807,7 @@ describe('background tab isolation', () => {
     // SW restart and can dodge idle expiry indefinitely.
     expect(scheduledWhen).toBeLessThan(now + 15_000);
     expect(scheduledWhen).toBeGreaterThan(now + 1_000);
-    expect(mod.__test__.getSession(adapterKey('twitter'))).not.toBeNull();
-    expect(mod.__test__.getSession(adapterKey('twitter'))!.idleDeadlineAt).toBeLessThan(now + 15_000);
+    expect(mod.__test__.getSession(adapterKey('twitter'))?.idleDeadlineAt).toBeLessThan(now + 15_000);
   });
 
   it('releases owned leases from the idle alarm path', async () => {
@@ -1602,9 +1815,6 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     await mod.__test__.resolveTabId(undefined, adapterKey('alarm'));
 
     const onAlarmListener = chrome.alarms.onAlarm.addListener.mock.calls[0][0];
@@ -1620,9 +1830,6 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     await mod.__test__.resolveTabId(undefined, adapterKey('first'));
 
     const onAlarmListener = chrome.alarms.onAlarm.addListener.mock.calls[0][0];
@@ -1648,9 +1855,6 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setSession(adapterKey('stale-a'), { windowId: 90, owned: true, preferredTabId: null });
     mod.__test__.setSession(adapterKey('stale-b'), { windowId: 91, owned: true, preferredTabId: null });
 
@@ -1664,544 +1868,21 @@ describe('background tab isolation', () => {
     expect(chrome.windows.create).toHaveBeenCalledTimes(1);
   });
 
-  it('groups adapter automation tabs under the site name', async () => {
+  it('does not create a visible tab group for adapter automation windows', async () => {
     const { chrome, tabs, groups } = createChromeMock();
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     const tabId = await mod.__test__.resolveTabId(undefined, adapterKey('twitter'));
 
-    // Adapter tabs used to sit ungrouped in a window of their own. Now they live
-    // in the person's window like everything else, so the label is what tells
-    // them apart from the person's own tabs.
     expect(tabId).toBe(1);
-    expect(tabs[0].groupId).not.toBe(-1);
-    expect(groups).toEqual([expect.objectContaining({ id: tabs[0].groupId, title: 'OpenCLI: twitter', color: 'orange' })]);
+    expect(tabs[0].groupId).toBe(-1);
+    expect(groups).toEqual([]);
+    expect(chrome.tabs.group).not.toHaveBeenCalled();
+    expect(chrome.tabGroups.update).not.toHaveBeenCalled();
   });
 
-  it('gives every session its own group titled after it, on both surfaces', async () => {
-    const { chrome, tabs, groups } = createChromeMock();
-    chrome.windows.getAll = vi.fn(async () => [{ id: 7, focused: true, incognito: false, type: 'normal' }]);
-    vi.stubGlobal('chrome', chrome);
-
-    const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
-    const a = await mod.__test__.resolveTabId(undefined, browserKey('recon'), 'https://a.example');
-    const b = await mod.__test__.resolveTabId(undefined, browserKey('checkout'), 'https://b.example');
-    const c = await mod.__test__.resolveTabId(undefined, adapterKey('reddit'), 'https://c.example');
-
-    const groupOf = (id: number) => tabs.find((tab) => tab.id === id)?.groupId;
-    // Three sessions, three groups, one window — never the pooled
-    // "OpenCLI: recon, checkout" group of before.
-    expect(new Set([groupOf(a), groupOf(b), groupOf(c)]).size).toBe(3);
-    expect(tabs.filter((tab) => [a, b, c].includes(tab.id)).every((tab) => tab.windowId === 7)).toBe(true);
-    expect(groups.map((group) => group.title).sort()).toEqual(['OpenCLI: checkout', 'OpenCLI: recon', 'OpenCLI: reddit']);
-    expect(chrome.windows.create).not.toHaveBeenCalled();
-
-    // A second tab opened on a session joins that session's group, not a new one.
-    await mod.__test__.handleTabs(
-      { id: 'more', action: 'tabs', op: 'new', url: 'https://a2.example', session: browserKey('recon') } as never,
-      browserKey('recon'),
-    );
-    expect(tabs.at(-1)?.groupId).toBe(groupOf(a));
-    expect(groups).toHaveLength(3);
-  });
-
-  it('titles adapter groups after the site, not the runtime session name', async () => {
-    const { chrome, tabs, groups } = createChromeMock();
-    chrome.windows.getAll = vi.fn(async () => [{ id: 7, focused: true, incognito: false, type: 'normal' }]);
-    vi.stubGlobal('chrome', chrome);
-
-    const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
-    // What the CLI actually sends: `site:<site>` for a persistent site session,
-    // `site:<site>:<uuid>` for a one-shot run.
-    const persistent = await mod.__test__.resolveTabId(undefined, adapterKey('site:reddit'), 'https://reddit.example/p');
-    const oneShot = await mod.__test__.resolveTabId(undefined, adapterKey('site:reddit:0b08261e-d0f4-420c-9baa-3029d7e51a7d'), 'https://reddit.example/o');
-
-    expect(groups.map((group) => group.title)).toEqual(['OpenCLI: reddit', 'OpenCLI: reddit']);
-    // Same title, still two sessions, still two groups.
-    expect(tabs.find((tab) => tab.id === persistent)?.groupId).not.toBe(tabs.find((tab) => tab.id === oneShot)?.groupId);
-  });
-
-  it('keeps a browser session and an adapter session apart even when they share a name', async () => {
-    const { chrome, tabs, groups } = createChromeMock();
-    chrome.windows.getAll = vi.fn(async () => [{ id: 7, focused: true, incognito: false, type: 'normal' }]);
-    vi.stubGlobal('chrome', chrome);
-
-    const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
-    const viaBrowser = await mod.__test__.resolveTabId(undefined, browserKey('reddit'), 'https://reddit.example/a');
-    const viaAdapter = await mod.__test__.resolveTabId(undefined, adapterKey('reddit'), 'https://reddit.example/b');
-
-    // Same title, different lease keys: the title layer alone would have merged
-    // them, and then releasing one session would have taken the other's tab.
-    const browserGroup = tabs.find((tab) => tab.id === viaBrowser)?.groupId;
-    const adapterGroup = tabs.find((tab) => tab.id === viaAdapter)?.groupId;
-    expect(browserGroup).not.toBe(-1);
-    expect(adapterGroup).not.toBe(-1);
-    expect(browserGroup).not.toBe(adapterGroup);
-    expect(groups.map((group) => group.title)).toEqual(['OpenCLI: reddit', 'OpenCLI: reddit']);
-  });
-
-  it('opens interactive automation in the window the person is already using', async () => {
-    const { chrome, tabs } = createChromeMock();
-    // The person has one ordinary Chrome window open, with their own tabs in it.
-    chrome.windows.getAll = vi.fn(async () => [{ id: 7, focused: true, incognito: false, type: 'normal' }]);
-    vi.stubGlobal('chrome', chrome);
-
-    const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
-    const tabId = await mod.__test__.resolveTabId(undefined, browserKey('recon'), 'https://example.com');
-
-    // A second Chrome window landing on top of their layout is a worse interruption
-    // than the tab itself, so the container borrows the window they already have.
-    expect(chrome.windows.create).not.toHaveBeenCalled();
-    expect(tabs.find((tab) => tab.id === tabId)?.windowId).toBe(7);
-    // And borrowing their window makes activation dangerous, so the tab stays inactive.
-    expect(chrome.tabs.create).toHaveBeenCalledWith(expect.objectContaining({ windowId: 7, active: false }));
-  });
-
-  it('opens adapter automation in the window the person is already using too', async () => {
-    const { chrome, tabs } = createChromeMock();
-    chrome.windows.getAll = vi.fn(async () => [{ id: 7, focused: true, incognito: false, type: 'normal' }]);
-    vi.stubGlobal('chrome', chrome);
-
-    const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
-    const tabId = await mod.__test__.resolveTabId(undefined, adapterKey('twitter'));
-
-    // Adapter runs used to get a window of their own "because nobody watches
-    // them" — but the window itself is what the person sees. Same rule as the
-    // browser surface: borrow, stay inactive, group under the session name.
-    expect(chrome.windows.create).not.toHaveBeenCalled();
-    expect(tabs.find((tab) => tab.id === tabId)?.windowId).toBe(7);
-    expect(chrome.tabs.create).toHaveBeenCalledWith(expect.objectContaining({ windowId: 7, active: false }));
-
-    const listed = await mod.__test__.handleSessions({ id: 'ls', action: 'sessions', op: 'list' } as never);
-    expect(listed.data).toEqual([expect.objectContaining({
-      session: 'twitter',
-      surface: 'adapter',
-      windowId: 7,
-      groupTitle: 'OpenCLI: twitter',
-      windowFallbackReason: null,
-    })]);
-  });
-
-  it('records why a window had to be created when none of the person\'s can be borrowed', async () => {
-    const cases: Array<{ name: string; setup: (chrome: any) => void; reason: string }> = [
-      {
-        name: 'no window at all',
-        setup: (chrome) => { chrome.windows.getAll = vi.fn(async () => []); },
-        reason: 'no-normal-window',
-      },
-      {
-        name: 'only incognito windows',
-        setup: (chrome) => { chrome.windows.getAll = vi.fn(async () => [{ id: 7, focused: true, incognito: true, type: 'normal' }]); },
-        reason: 'all-incognito',
-      },
-      {
-        name: 'the query itself fails',
-        setup: (chrome) => {
-          chrome.windows.getLastFocused = vi.fn(async () => { throw new Error('no window manager'); });
-          chrome.windows.getAll = vi.fn(async () => { throw new Error('no window manager'); });
-        },
-        reason: 'query-failed',
-      },
-    ];
-    for (const { name, setup, reason } of cases) {
-      vi.resetModules();
-      const { chrome } = createChromeMock();
-      setup(chrome);
-      vi.stubGlobal('chrome', chrome);
-
-      const mod = await import('./background');
-      // This block is about what `background` mode does — the mode the person's own
-      // window is borrowed for. The shipped default is `dedicated`; pin it here.
-      mod.__test__.setDefaultWindowMode('background');
-      await mod.__test__.resolveTabId(undefined, adapterKey('twitter'), 'https://x.example');
-
-      expect(chrome.windows.create, name).toHaveBeenCalled();
-      const listed = await mod.__test__.handleSessions({ id: 'ls', action: 'sessions', op: 'list' } as never);
-      expect(listed.data, name).toEqual([expect.objectContaining({ session: 'twitter', windowFallbackReason: reason })]);
-    }
-  });
-
-  it('shares one stand-in window between both roles instead of opening two', async () => {
-    const { chrome, tabs } = createChromeMock();
-    let nextWindowId = 20;
-    let nextTabId = 200;
-    const created: number[] = [];
-    chrome.windows.create = vi.fn(async ({ url, focused, width, height, type }: any) => {
-      const windowId = nextWindowId++;
-      created.push(windowId);
-      tabs.push({ id: nextTabId++, windowId, url, title: url ?? 'blank', active: true, status: 'complete', groupId: -1 });
-      return { id: windowId, url, focused, width, height, type };
-    });
-    // Once created, the stand-in is a normal window Chrome reports back.
-    chrome.windows.getAll = vi.fn(async () => created.map((id) => ({ id, focused: false, incognito: false, type: 'normal' })));
-    vi.stubGlobal('chrome', chrome);
-
-    const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
-    const browserTab = await mod.__test__.resolveTabId(undefined, browserKey('recon'), 'https://a.example');
-    const adapterTab = await mod.__test__.resolveTabId(undefined, adapterKey('twitter'), 'https://b.example');
-
-    // No window of the person's existed, so one was created for the first
-    // session; the second session of the other role must join it, not add a
-    // second empty window to the pile.
-    expect(chrome.windows.create).toHaveBeenCalledTimes(1);
-    expect(tabs.find((tab) => tab.id === browserTab)?.windowId).toBe(20);
-    expect(tabs.find((tab) => tab.id === adapterTab)?.windowId).toBe(20);
-    const listed = await mod.__test__.handleSessions({ id: 'ls', action: 'sessions', op: 'list' } as never);
-    expect(listed.data).toEqual(expect.arrayContaining([
-      expect.objectContaining({ session: 'recon', windowFallbackReason: 'no-normal-window' }),
-      expect.objectContaining({ session: 'twitter', windowFallbackReason: 'no-normal-window' }),
-    ]));
-  });
-
-  it('reports no fallback reason for a window the person asked for with --window isolated', async () => {
-    const { chrome, tabs } = createChromeMock();
-    chrome.windows.getAll = vi.fn(async () => [{ id: 7, focused: true, incognito: false, type: 'normal' }]);
-    chrome.windows.getLastFocused = vi.fn(async () => ({ id: 7, focused: true, incognito: false, type: 'normal' }));
-    chrome.windows.create = vi.fn(async ({ url, focused, width, height, type }: any) => {
-      tabs.push({ id: 600, windowId: 60, url, title: url ?? 'blank', active: false, status: 'complete', groupId: -1 });
-      return { id: 60, url, focused, width, height, type };
-    });
-    vi.stubGlobal('chrome', chrome);
-
-    const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
-    mod.__test__.sessionOverrides.set(browserKey('iso'), { windowMode: 'isolated' });
-    await mod.__test__.resolveTabId(undefined, browserKey('iso'), 'https://iso.example');
-
-    expect(chrome.windows.create).toHaveBeenCalled();
-    const listed = await mod.__test__.handleSessions({ id: 'ls', action: 'sessions', op: 'list' } as never);
-    expect(listed.data).toEqual([expect.objectContaining({ session: 'iso', windowId: 60, windowFallbackReason: null })]);
-  });
-
-  it('escapes to its own window even when the borrowed flag was never recorded', async () => {
-    const { chrome, tabs } = createChromeMock();
-    chrome.windows.getAll = vi.fn(async () => [{ id: 7, focused: true, incognito: false, type: 'normal' }]);
-    vi.stubGlobal('chrome', chrome);
-
-    const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
-    // Simulate a container adopted by an older build: it points at the person's
-    // window but carries no `borrowed` flag, so the flag alone would call it ours.
-    // Window 2 holds one of the person's own pages in the mock fixture.
-    mod.__test__.setAutomationWindowId(browserKey('recon'), 2);
-    mod.__test__.sessionOverrides.set(browserKey('recon'), { windowMode: 'isolated' });
-
-    const tabId = await mod.__test__.resolveTabId(undefined, browserKey('recon'), 'https://example.com');
-
-    // A window holding the person's pages cannot be the dedicated container
-    // `isolated` asked for, flag or no flag.
-    expect(chrome.windows.create).toHaveBeenCalled();
-    expect(tabs.find((tab) => tab.id === tabId)?.windowId).not.toBe(2);
-  });
-
-  it('treats a window full of new tabs as the person\'s, not as our container', async () => {
-    const { chrome, tabs } = createChromeMock();
-    // A window someone just opened: two blank new tabs, no group of ours.
-    tabs.length = 0;
-    tabs.push({ id: 30, windowId: 3, url: 'chrome://newtab/', title: 'New Tab', active: true, status: 'complete', groupId: -1 });
-    tabs.push({ id: 31, windowId: 3, url: 'chrome://newtab/', title: 'New Tab', active: false, status: 'complete', groupId: -1 });
-    chrome.windows.getAll = vi.fn(async () => [{ id: 3, focused: true, incognito: false, type: 'normal' }]);
-    vi.stubGlobal('chrome', chrome);
-
-    const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
-    mod.__test__.setAutomationWindowId(browserKey('recon'), 3);
-    mod.__test__.sessionOverrides.set(browserKey('recon'), { windowMode: 'isolated' });
-
-    await mod.__test__.resolveTabId(undefined, browserKey('recon'), 'https://example.com');
-
-    // Guessing ownership from tab URLs said "only non-http tabs, must be ours" and
-    // quietly swallowed every `isolated` request into the person's window.
-    expect(chrome.windows.create).toHaveBeenCalled();
-  });
-
-  it('does not let group convergence drag an isolated tab back to the shared window', async () => {
-    const { chrome, tabs, groups } = createChromeMock();
-    // The person's window already holds an OpenCLI group from earlier work.
-    tabs.length = 0;
-    tabs.push({ id: 40, windowId: 4, url: 'https://user.example', title: 'user', active: true, status: 'complete', groupId: -1 });
-    tabs.push({ id: 41, windowId: 4, url: 'https://example.com', title: 'prev', active: false, status: 'complete', groupId: 900 });
-    groups.push({ id: 900, windowId: 4, title: 'OpenCLI: earlier', color: 'orange', collapsed: false });
-    chrome.windows.getAll = vi.fn(async () => [{ id: 4, focused: true, incognito: false, type: 'normal' }]);
-    let nextWindowId = 60;
-    let nextTabId = 600;
-    chrome.windows.create = vi.fn(async ({ url, focused, width, height, type }: any) => {
-      const windowId = nextWindowId++;
-      tabs.push({ id: nextTabId++, windowId, url, title: url ?? 'blank', active: false, status: 'complete', groupId: -1 });
-      return { id: windowId, url, focused, width, height, type };
-    });
-    vi.stubGlobal('chrome', chrome);
-
-    const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
-    mod.__test__.sessionOverrides.set(browserKey('iso'), { windowMode: 'isolated' });
-    const tabId = await mod.__test__.resolveTabId(undefined, browserKey('iso'), 'https://example.org');
-
-    // The dedicated window was created correctly before; what undid `isolated` was
-    // convergence adopting the group in window 4 and moving the tab into it.
-    expect(tabs.find((tab) => tab.id === tabId)?.windowId).not.toBe(4);
-  });
-
-  it('follows the person when they move to a different window', async () => {
-    const { chrome, tabs } = createChromeMock();
-    tabs.length = 0;
-    tabs.push({ id: 80, windowId: 8, url: 'https://old.example', title: 'old', active: false, status: 'complete', groupId: -1 });
-    tabs.push({ id: 90, windowId: 9, url: 'https://now.example', title: 'now', active: true, status: 'complete', groupId: -1 });
-    // Chrome is not the frontmost app, so `focused` is false on every window —
-    // the state an agent driving from a terminal always sees.
-    chrome.windows.getAll = vi.fn(async () => [
-      { id: 8, focused: false, incognito: false, type: 'normal' },
-      { id: 9, focused: false, incognito: false, type: 'normal' },
-    ]);
-    chrome.windows.getLastFocused = vi.fn(async () => ({ id: 9, focused: false, incognito: false, type: 'normal' }));
-    vi.stubGlobal('chrome', chrome);
-
-    const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
-    // An earlier session borrowed window 8. The person has since moved to window 9.
-    mod.__test__.setAutomationWindowId(browserKey('earlier'), 8);
-
-    const tabId = await mod.__test__.resolveTabId(undefined, browserKey('later'), 'https://example.com');
-
-    // Piling into the window they left an hour ago is the same complaint as opening
-    // a new one, just quieter.
-    expect(tabs.find((tab) => tab.id === tabId)?.windowId).toBe(9);
-  });
-
-  it('keeps a second isolated session in the dedicated window instead of killing the first', async () => {
-    const { chrome, tabs, groups } = createChromeMock();
-    // The person's window already carries an OpenCLI group from earlier work —
-    // the convergence target that used to swallow the second isolated session.
-    tabs.length = 0;
-    tabs.push({ id: 40, windowId: 4, url: 'https://user.example', title: 'user', active: true, status: 'complete', groupId: -1 });
-    tabs.push({ id: 41, windowId: 4, url: 'https://earlier.example', title: 'earlier', active: false, status: 'complete', groupId: 900 });
-    groups.push({ id: 900, windowId: 4, title: 'OpenCLI: earlier', color: 'orange', collapsed: false });
-    chrome.windows.getAll = vi.fn(async () => [{ id: 4, focused: true, incognito: false, type: 'normal' }]);
-    chrome.windows.getLastFocused = vi.fn(async () => ({ id: 4, focused: true, incognito: false, type: 'normal' }));
-    let nextWindowId = 60;
-    let nextTabId = 600;
-    chrome.windows.create = vi.fn(async ({ url, focused, width, height, type }: any) => {
-      const windowId = nextWindowId++;
-      tabs.push({ id: nextTabId++, windowId, url, title: url ?? 'blank', active: false, status: 'complete', groupId: -1 });
-      return { id: windowId, url, focused, width, height, type };
-    });
-    vi.stubGlobal('chrome', chrome);
-
-    const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
-    mod.__test__.sessionOverrides.set(browserKey('isoA'), { windowMode: 'isolated' });
-    mod.__test__.sessionOverrides.set(browserKey('isoB'), { windowMode: 'isolated' });
-
-    const tabA = await mod.__test__.resolveTabId(undefined, browserKey('isoA'), 'https://a.example');
-    const windowA = tabs.find((tab) => tab.id === tabA)?.windowId;
-    const tabB = await mod.__test__.resolveTabId(undefined, browserKey('isoB'), 'https://b.example');
-    const windowB = tabs.find((tab) => tab.id === tabB)?.windowId;
-
-    // Neither may fall back into window 4, and the first session must survive the
-    // second: previously B took the reuse branch, convergence pulled it into the
-    // person's window, and A silently lost its container.
-    expect(windowA).not.toBe(4);
-    expect(windowB).not.toBe(4);
-    expect(mod.__test__.getSession(browserKey('isoA'))).toBeTruthy();
-    expect(mod.__test__.getSession(browserKey('isoB'))).toBeTruthy();
-  });
-
-  it('does not let an isolated window capture later default-mode sessions', async () => {
-    const { chrome, tabs } = createChromeMock();
-    tabs.length = 0;
-    tabs.push({ id: 40, windowId: 4, url: 'https://user.example', title: 'user', active: true, status: 'complete', groupId: -1 });
-    chrome.windows.getAll = vi.fn(async () => [{ id: 4, focused: true, incognito: false, type: 'normal' }]);
-    chrome.windows.getLastFocused = vi.fn(async () => ({ id: 4, focused: true, incognito: false, type: 'normal' }));
-    let nextWindowId = 60;
-    let nextTabId = 600;
-    chrome.windows.create = vi.fn(async ({ url, focused, width, height, type }: any) => {
-      const windowId = nextWindowId++;
-      tabs.push({ id: nextTabId++, windowId, url, title: url ?? 'blank', active: false, status: 'complete', groupId: -1 });
-      return { id: windowId, url, focused, width, height, type };
-    });
-    vi.stubGlobal('chrome', chrome);
-
-    const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
-    mod.__test__.sessionOverrides.set(browserKey('iso'), { windowMode: 'isolated' });
-    const isoTab = await mod.__test__.resolveTabId(undefined, browserKey('iso'), 'https://iso.example');
-    const isoWindow = tabs.find((tab) => tab.id === isoTab)?.windowId;
-
-    // Default mode after that must still land where the person is. The role has
-    // one container slot, so without re-asking, the isolated window it now holds
-    // would silently swallow work the person explicitly asked to watch.
-    const defTab = await mod.__test__.resolveTabId(undefined, browserKey('later'), 'https://later.example');
-    expect(tabs.find((tab) => tab.id === defTab)?.windowId).toBe(4);
-    expect(isoWindow).not.toBe(4);
-  });
-
-  it('never relocates another window\'s tabs when a call names its own window', async () => {
-    const { chrome, tabs, groups } = createChromeMock();
-    // Two OpenCLI groups in two windows: the isolated container (win 8) and one
-    // in the person's window (win 4). This is the state that killed sessions —
-    // convergence merged them and emptied win 8, so Chrome closed it.
-    tabs.length = 0;
-    tabs.push({ id: 40, windowId: 4, url: 'https://user.example', title: 'user', active: true, status: 'complete', groupId: -1 });
-    tabs.push({ id: 41, windowId: 4, url: 'https://prev.example', title: 'prev', active: false, status: 'complete', groupId: 700 });
-    tabs.push({ id: 80, windowId: 8, url: 'https://iso.example', title: 'iso', active: false, status: 'complete', groupId: 800 });
-    groups.push({ id: 700, windowId: 4, title: 'OpenCLI: prev', color: 'orange', collapsed: false });
-    groups.push({ id: 800, windowId: 8, title: 'OpenCLI: iso', color: 'orange', collapsed: false });
-    chrome.windows.getAll = vi.fn(async () => [{ id: 4, focused: true, incognito: false, type: 'normal' }]);
-    chrome.windows.getLastFocused = vi.fn(async () => ({ id: 4, focused: true, incognito: false, type: 'normal' }));
-    vi.stubGlobal('chrome', chrome);
-
-    const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
-    // A call that names window 4 must confine itself to window 4.
-    await mod.__test__.ensureOwnedContainerGroup('interactive', browserKey('prev'), 4, [40]);
-
-    // The isolated window's tab has to stay put. Moving it empties window 8.
-    expect(tabs.find((tab) => tab.id === 80)?.windowId).toBe(8);
-    expect(tabs.find((tab) => tab.id === 80)?.groupId).toBe(800);
-    expect(chrome.tabs.move).not.toHaveBeenCalled();
-  });
-
-  it('never folds another session\'s group into its own, even on an unpinned discovery call', async () => {
-    const { chrome, tabs, groups } = createChromeMock();
-    // Two sessions, two groups, two windows. The discovery call (no window
-    // named) may walk across windows — but only ever to ITS OWN group.
-    tabs.length = 0;
-    tabs.push({ id: 40, windowId: 4, url: 'https://user.example', title: 'user', active: true, status: 'complete', groupId: -1 });
-    tabs.push({ id: 41, windowId: 4, url: 'https://prev.example', title: 'prev', active: false, status: 'complete', groupId: 700 });
-    tabs.push({ id: 80, windowId: 8, url: 'https://iso.example', title: 'iso', active: false, status: 'complete', groupId: 800 });
-    groups.push({ id: 700, windowId: 4, title: 'OpenCLI: prev', color: 'orange', collapsed: false });
-    groups.push({ id: 800, windowId: 8, title: 'OpenCLI: iso', color: 'orange', collapsed: false });
-    vi.stubGlobal('chrome', chrome);
-
-    const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
-    mod.__test__.setSession(browserKey('iso'), { windowId: 8, owned: true, preferredTabId: 80 });
-    const found = await mod.__test__.ensureOwnedContainerGroup('interactive', browserKey('prev'), null, []);
-
-    expect(found).toEqual(expect.objectContaining({ id: 700, windowId: 4 }));
-    expect(tabs.find((tab) => tab.id === 80)?.windowId).toBe(8);
-    expect(tabs.find((tab) => tab.id === 80)?.groupId).toBe(800);
-    expect(chrome.tabs.move).not.toHaveBeenCalled();
-    expect(groups).toHaveLength(2);
-  });
-
-  it('carries every window mode through to the session override', async () => {
-    const { chrome } = createChromeMock();
-    vi.stubGlobal('chrome', chrome);
-    const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
-
-    // A mode the command handler forgets is dropped silently — the flag parses, the
-    // command succeeds, and the behaviour is just the default. Assert every mode
-    // survives the trip so the guard cannot fall behind the union again.
-    for (const mode of ['foreground', 'background', 'isolated'] as const) {
-      const leaseKey = browserKey(`mode-${mode}`);
-      await mod.__test__.handleCommand({
-        id: `m-${mode}`,
-        action: 'tabs',
-        op: 'list',
-        session: `mode-${mode}`,
-        windowMode: mode,
-      } as never);
-      expect(mod.__test__.sessionOverrides.get(leaseKey)?.windowMode).toBe(mode);
-    }
-  });
-
-  it('lets --window isolated opt back into a separate window', async () => {
-    const { chrome, tabs } = createChromeMock();
-    chrome.windows.getAll = vi.fn(async () => [{ id: 7, focused: true, incognito: false, type: 'normal' }]);
-    vi.stubGlobal('chrome', chrome);
-
-    const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
-    mod.__test__.sessionOverrides.set(browserKey('recon'), { windowMode: 'isolated' });
-    const tabId = await mod.__test__.resolveTabId(undefined, browserKey('recon'), 'https://example.com');
-
-    expect(chrome.windows.create).toHaveBeenCalled();
-    expect(tabs.find((tab) => tab.id === tabId)?.windowId).not.toBe(7);
-  });
-
-  it('never borrows an incognito window for the container', async () => {
-    const { chrome, tabs } = createChromeMock();
-    // Incognito is a different context — its cookies are not the person's session.
-    chrome.windows.getAll = vi.fn(async () => [{ id: 9, focused: true, incognito: true, type: 'normal' }]);
-    vi.stubGlobal('chrome', chrome);
-
-    const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
-    const tabId = await mod.__test__.resolveTabId(undefined, browserKey('recon'), 'https://example.com');
-
-    expect(chrome.windows.create).toHaveBeenCalled();
-    expect(tabs.find((tab) => tab.id === tabId)?.windowId).not.toBe(9);
-  });
-
-  it('does not leave a blank placeholder tab behind in a borrowed window', async () => {
-    const { chrome, tabs } = createChromeMock();
-    chrome.windows.getAll = vi.fn(async () => [{ id: 7, focused: true, incognito: false, type: 'normal' }]);
-    vi.stubGlobal('chrome', chrome);
-
-    const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
-    const tabId = await mod.__test__.resolveTabId(undefined, browserKey('recon'), 'https://example.com');
-    const before = tabs.length;
-    await mod.__test__.releaseLease(browserKey('recon'), 'test');
-
-    // Inside a container window the blank placeholder is free to keep; inside the
-    // person's own tab strip it is litter, so the tab goes away instead.
-    expect(chrome.tabs.remove).toHaveBeenCalledWith(tabId);
-    expect(chrome.tabs.update).not.toHaveBeenCalledWith(tabId, { url: 'about:blank' });
-    expect(tabs.length).toBeLessThan(before + 1);
-  });
-
-  it('puts browser and adapter sessions in one window, each in its own labelled group', async () => {
+  it('keeps browser groups while adapter sessions stay ungrouped in separate owned windows', async () => {
     const { chrome, tabs, groups } = createChromeMock();
     let nextWindowId = 20;
     let nextTabId = 200;
@@ -2222,33 +1903,17 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
-    // URL-less commands on the browser surface are refused so a mistyped session
-    // cannot spawn an orphan blank tab; `tabs op:new` is the explicit way to open
-    // one. The adapter surface still creates its automation tab without a URL.
-    const browserTab = await mod.__test__.handleTabs(
-      { id: 'seed', action: 'tabs', op: 'new' } as never,
-      browserKey('default'),
-    );
-    expect(browserTab.ok).toBe(true);
-    const browserTabId = tabs.at(-1)!.id!;
+    const browserTabId = await mod.__test__.resolveTabId(undefined, browserKey('default'));
     const adapterTabId = await mod.__test__.resolveTabId(undefined, adapterKey('twitter'));
 
-    // No window of the person's exists in this fixture, so ONE stand-in window
-    // is created and both roles use it. Neither role focuses it — background is
-    // the default for both, and foreground is opt-in via `--window foreground`.
-    expect(chrome.windows.create).toHaveBeenCalledTimes(1);
-    expect(chrome.windows.create).toHaveBeenCalledWith(expect.objectContaining({ focused: false }));
     expect(tabs.find((tab) => tab.id === browserTabId)?.windowId).toBe(20);
-    expect(tabs.find((tab) => tab.id === adapterTabId)?.windowId).toBe(20);
+    expect(tabs.find((tab) => tab.id === adapterTabId)?.windowId).toBe(21);
+    expect(chrome.windows.create).toHaveBeenNthCalledWith(1, expect.objectContaining({ focused: true }));
+    expect(chrome.windows.create).toHaveBeenNthCalledWith(2, expect.objectContaining({ focused: false }));
     expect(groups).toEqual([
-      expect.objectContaining({ windowId: 20, title: 'OpenCLI: default' }),
-      expect.objectContaining({ windowId: 20, title: 'OpenCLI: twitter' }),
+      expect.objectContaining({ windowId: 20, title: 'OpenCLI Browser' }),
     ]);
-    expect(tabs.find((tab) => tab.id === browserTabId)?.groupId).toBe(groups[0].id);
-    expect(tabs.find((tab) => tab.id === adapterTabId)?.groupId).toBe(groups[1].id);
+    expect(tabs.find((tab) => tab.id === adapterTabId)?.groupId).toBe(-1);
   });
 
   it('lets adapters explicitly request a foreground automation window', async () => {
@@ -2271,9 +1936,6 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     const result = await mod.__test__.handleCommand({
       id: 'new-foreground',
       action: 'tabs',
@@ -2288,25 +1950,22 @@ describe('background tab isolation', () => {
     expect(chrome.windows.create).toHaveBeenCalledWith(expect.objectContaining({ focused: true }));
   });
 
-  it('creates additional adapter lease tabs in the same window, each in its own group', async () => {
+  it('creates additional adapter lease tabs in the owned window without grouping them', async () => {
     const { chrome, tabs, groups } = createChromeMock();
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
-    const firstTabId = await mod.__test__.resolveTabId(undefined, adapterKey('first'));
+    await mod.__test__.resolveTabId(undefined, adapterKey('first'));
     const secondTabId = await mod.__test__.resolveTabId(undefined, adapterKey('second'));
 
     expect(secondTabId).toBe(10);
     expect(tabs.find((tab) => tab.id === 10)?.windowId).toBe(1);
-    expect(groups.map((group) => group.title)).toEqual(['OpenCLI: first', 'OpenCLI: second']);
-    expect(tabs.find((tab) => tab.id === firstTabId)?.groupId).toBe(groups[0].id);
-    expect(tabs.find((tab) => tab.id === secondTabId)?.groupId).toBe(groups[1].id);
+    expect(tabs.find((tab) => tab.id === 10)?.groupId).toBe(-1);
+    expect(groups).toEqual([]);
+    expect(chrome.tabs.group).not.toHaveBeenCalled();
   });
 
-  it('reuses a persisted adapter window after worker restart, reading the pre-per-session registry shape', async () => {
+  it('reuses a persisted adapter window after worker restart without recreating an adapter group', async () => {
     const { chrome, tabs, groups } = createChromeMock();
     vi.stubGlobal('chrome', chrome);
     await chrome.storage.session.set({
@@ -2314,7 +1973,6 @@ describe('background tab isolation', () => {
         version: 2,
         contextId: 'user-default',
         ownedContainers: {
-          // The shape an older build wrote: a singular groupId, no groups map.
           interactive: { windowId: null, groupId: null },
           automation: { windowId: 1, groupId: null },
         },
@@ -2323,9 +1981,6 @@ describe('background tab isolation', () => {
     });
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     await mod.__test__.reconcileTargetLeaseRegistry();
     chrome.windows.create.mockClear();
 
@@ -2333,11 +1988,11 @@ describe('background tab isolation', () => {
 
     expect(chrome.windows.create).not.toHaveBeenCalled();
     expect(tabs.find((tab) => tab.id === tabId)?.windowId).toBe(1);
-    expect(tabs.find((tab) => tab.id === tabId)?.groupId).not.toBe(-1);
-    expect(groups).toEqual([expect.objectContaining({ windowId: 1, title: 'OpenCLI: twitter' })]);
+    expect(tabs.find((tab) => tab.id === tabId)?.groupId).toBe(-1);
+    expect(groups).toEqual([]);
   });
 
-  it('reuses a restored adapter preferred tab after worker restart and re-groups it', async () => {
+  it('reuses a restored adapter preferred tab when no adapter group exists after worker restart', async () => {
     const { chrome, tabs, groups } = createChromeMock();
     const deadline = Date.now() + 30_000;
     vi.stubGlobal('chrome', chrome);
@@ -2363,23 +2018,20 @@ describe('background tab isolation', () => {
     });
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     await mod.__test__.reconcileTargetLeaseRegistry();
     chrome.windows.create.mockClear();
 
     const tabId = await mod.__test__.resolveTabId(undefined, adapterKey('twitter'));
 
-    // The lease's own tab is the ownership signal, so it is reused — and since
-    // the group did not survive the restart, it is rebuilt around that tab.
     expect(tabId).toBe(1);
     expect(chrome.windows.create).not.toHaveBeenCalled();
-    expect(tabs[0].groupId).not.toBe(-1);
-    expect(groups).toEqual([expect.objectContaining({ id: tabs[0].groupId, windowId: 1, title: 'OpenCLI: twitter' })]);
+    expect(tabs[0].groupId).toBe(-1);
+    expect(groups).toEqual([]);
+    expect(chrome.tabs.group).not.toHaveBeenCalled();
+    expect(chrome.tabGroups.update).not.toHaveBeenCalled();
   });
 
-  it('leaves legacy OpenCLI Adapter groups alone when choosing an adapter container', async () => {
+  it('ignores legacy OpenCLI Adapter groups when choosing an adapter container', async () => {
     const { chrome, tabs, groups } = createChromeMock();
     tabs.push({
       id: 77,
@@ -2400,19 +2052,14 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     const tabId = await mod.__test__.resolveTabId(undefined, adapterKey('twitter'));
 
-    // A group titled by an older build is not ours to adopt: no lease, no
-    // ledger entry, no per-session title. It keeps its tab and its title.
     expect(tabId).not.toBe(77);
     expect(mod.__test__.getAutomationWindowId(adapterKey('twitter'))).not.toBe(7);
     expect(tabs.find((tab) => tab.id === 77)?.groupId).toBe(99);
-    expect(groups.find((group) => group.id === 99)?.title).toBe('OpenCLI Adapter');
-    expect(chrome.tabGroups.update).not.toHaveBeenCalledWith(99, expect.anything());
-    expect(groups.filter((group) => group.title === 'OpenCLI: twitter')).toHaveLength(1);
+    expect(groups).toHaveLength(1);
+    expect(chrome.tabs.group).not.toHaveBeenCalled();
+    expect(chrome.tabGroups.update).not.toHaveBeenCalled();
   });
 
   it('does not reuse a user http tab from an adapter-owned window without an owned lease signal', async () => {
@@ -2428,9 +2075,6 @@ describe('background tab isolation', () => {
     });
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     await mod.__test__.reconcileTargetLeaseRegistry();
     chrome.windows.create.mockClear();
 
@@ -2439,9 +2083,8 @@ describe('background tab isolation', () => {
     expect(tabId).not.toBe(1);
     expect(chrome.windows.create).not.toHaveBeenCalled();
     expect(tabs.find((tab) => tab.id === 1)?.url).toBe('https://automation.example');
-    expect(tabs.find((tab) => tab.id === 1)?.groupId).toBe(-1);
     expect(tabs.find((tab) => tab.id === tabId)?.url).toBe('https://after.example');
-    expect(tabs.find((tab) => tab.id === tabId)?.groupId).not.toBe(-1);
+    expect(tabs.find((tab) => tab.id === tabId)?.groupId).toBe(-1);
   });
 
   it('does not group borrowed user tabs for bound sessions', async () => {
@@ -2449,9 +2092,6 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     const result = await mod.__test__.handleBind(
       { id: 'bind', action: 'bind', session: browserKey('default') },
       browserKey('default'),
@@ -2471,9 +2111,6 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
 
     const tabId = await mod.__test__.resolveTabId(undefined, adapterKey('twitter'));
@@ -2492,9 +2129,6 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
 
     const tabId = await mod.__test__.resolveTabId(1, adapterKey('twitter'));
@@ -2513,9 +2147,6 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
 
     // Should still resolve (by finding/creating a tab in the correct window)
@@ -2528,9 +2159,6 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setSession(adapterKey('twitter'), { windowId: 1, owned: true, preferredTabId: 3 });
 
     const tabId = await mod.__test__.resolveTabId(undefined, adapterKey('twitter'));
@@ -2539,7 +2167,7 @@ describe('background tab isolation', () => {
     expect(tabs.find((tab) => tab.id === 1)?.url).toBe('https://automation.example');
     expect(tabs.find((tab) => tab.id === 1)?.groupId).toBe(-1);
     expect(tabs.find((tab) => tab.id === tabId)?.url).toBe('about:blank');
-    expect(tabs.find((tab) => tab.id === tabId)?.groupId).not.toBe(-1);
+    expect(tabs.find((tab) => tab.id === tabId)?.groupId).toBe(-1);
   });
 
   it('idle timeout releases the automation lease for adapter:notebooklm', async () => {
@@ -2552,9 +2180,6 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
 
     mod.__test__.resetWindowIdleTimer(adapterKey('twitter'));
@@ -2572,13 +2197,10 @@ describe('background tab isolation', () => {
 
     vi.useFakeTimers();
     vi.stubGlobal('chrome', chrome);
-    vi.doUnmock('./cdp');
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
-    const firstPending = mod.__test__.handleCommand({
+
+    const firstNavigation = mod.__test__.handleCommand({
       id: 'persistent-nav-1',
       action: 'navigate',
       session: 'chatgpt',
@@ -2586,9 +2208,9 @@ describe('background tab isolation', () => {
       siteSession: 'persistent',
       url: 'https://chatgpt.com/',
     });
-    await vi.advanceTimersByTimeAsync(500);
-    const first = await firstPending;
-    expect(first.ok).toBe(true);
+    await vi.advanceTimersByTimeAsync(1000);
+    const first = await firstNavigation;
+    expect(first.ok, first.error).toBe(true);
     const page = first.page;
 
     const session = mod.__test__.getSession(adapterKey('chatgpt'));
@@ -2615,163 +2237,12 @@ describe('background tab isolation', () => {
     expect(mod.__test__.getSession(adapterKey('chatgpt'))).not.toBeNull();
   });
 
-  it.each(['timer', 'alarm'])('reclaims a stuck in-flight command via %s without waiting for finally', async (path) => {
-    const { chrome } = createChromeMock();
-    vi.useFakeTimers();
-    vi.stubGlobal('chrome', chrome);
-    const mod = await import('./background');
-    mod.__test__.setDefaultWindowMode('background');
-    const key = browserKey('stuck');
-    mod.__test__.setAutomationWindowId(key, 1);
-    const blocked = deferred<never[]>();
-    chrome.cookies.getAll.mockReturnValueOnce(blocked.promise);
-    const pending = mod.__test__.handleCommand({
-      id: 'stuck', action: 'cookies', session: 'stuck', domain: 'example.com',
-      idleTimeout: 1, inflightMaxMs: 2000,
-    });
-    await vi.advanceTimersByTimeAsync(1000);
-    expect(mod.__test__.getSession(key)).not.toBeNull();
-    if (path === 'timer') await vi.advanceTimersByTimeAsync(1001);
-    else {
-      vi.setSystemTime(Date.now() + 1001);
-      await chrome.alarms.onAlarm.addListener.mock.calls[0][0]({
-        name: `opencli:lease-idle:${encodeURIComponent(key)}`,
-      });
-    }
-    expect(mod.__test__.getSession(key)).toBeNull();
-    expect(mod.__test__.activeCommands.has(key)).toBe(false);
-    // A late completion must not reset the idle clock of a replacement lease.
-    mod.__test__.setAutomationWindowId(key, 1);
-    const replacement = mod.__test__.getSession(key);
-    blocked.resolve([]);
-    await pending;
-    expect(mod.__test__.getSession(key)).toEqual(replacement);
-  });
-
-  it.each([
-    ['tabs', false], ['tabs', true], ['navigate', false], ['navigate', true],
-  ] as const)('discards late %s tab creation after reclaim (replacement=%s)', async (action, replace) => {
-    const { chrome, tabs } = createChromeMock();
-    vi.useFakeTimers();
-    vi.stubGlobal('chrome', chrome);
-    const mod = await import('./background');
-    mod.__test__.setDefaultWindowMode('background');
-    const key = browserKey('late-create');
-    mod.__test__.setAutomationWindowId(key, 1);
-    if (action === 'navigate') chrome.windows.create.mockResolvedValueOnce({ id: 4 });
-    const blocked = deferred<MockTab>();
-    chrome.tabs.create.mockReturnValueOnce(blocked.promise);
-    const pending = mod.__test__.handleCommand({
-      id: 'late-create', action, op: 'new', session: 'late-create',
-      url: 'https://late.example', idleTimeout: 1, inflightMaxMs: 2000,
-    });
-    await vi.advanceTimersByTimeAsync(2001);
-    expect(chrome.tabs.create).toHaveBeenCalledTimes(1);
-    expect(mod.__test__.getSession(key)).toBeNull();
-    if (replace) mod.__test__.setAutomationWindowId(key, 2);
-    const replacement = mod.__test__.getSession(key);
-    const lateTab = { id: 99, windowId: 1, url: 'https://late.example', groupId: -1 };
-    tabs.push(lateTab);
-    blocked.resolve(lateTab);
-    const result = await pending;
-    expect(mod.__test__.getSession(key)).toEqual(replacement);
-    expect(chrome.tabs.remove).toHaveBeenCalledWith(99);
-    expect(result.ok).toBe(false);
-    expect(result.errorCode).toBe('command_reclaimed');
-  });
-
-  it('respects a command timeout longer than the configured in-flight budget', async () => {
-    const { chrome } = createChromeMock();
-    vi.useFakeTimers();
-    vi.stubGlobal('chrome', chrome);
-    const mod = await import('./background');
-    mod.__test__.setDefaultWindowMode('background');
-    const key = browserKey('long');
-    mod.__test__.setAutomationWindowId(key, 1);
-    const blocked = deferred<never[]>();
-    chrome.cookies.getAll.mockReturnValueOnce(blocked.promise);
-    const pending = mod.__test__.handleCommand({
-      id: 'long', action: 'cookies', session: 'long', domain: 'example.com',
-      idleTimeout: 1, inflightMaxMs: 2000, timeout: 4,
-    });
-    await vi.advanceTimersByTimeAsync(3001);
-    expect(mod.__test__.getSession(key)).not.toBeNull();
-    await vi.advanceTimersByTimeAsync(1000);
-    expect(mod.__test__.getSession(key)).toBeNull();
-    blocked.resolve([]);
-    await pending;
-  });
-
-  it('persists idleTimeout -1 across reconcile and releases it on cleanup or close', async () => {
-    const { chrome } = createChromeMock();
-    vi.useFakeTimers();
-    vi.stubGlobal('chrome', chrome);
-    const mod = await import('./background');
-    mod.__test__.setDefaultWindowMode('background');
-    const key = browserKey('never');
-    mod.__test__.setSession(key, { windowId: 1, owned: true, preferredTabId: 1 });
-    await mod.__test__.handleCommand({
-      id: 'never', action: 'cookies', session: 'never', domain: 'example.com', idleTimeout: -1,
-    });
-    expect(mod.__test__.getIdleTimeout(key)).toBe(-1);
-    mod.__test__.sessionOverrides.clear();
-    await mod.__test__.reconcileTargetLeaseRegistry();
-    expect(mod.__test__.getIdleTimeout(key)).toBe(-1);
-    await vi.advanceTimersByTimeAsync(1_200_001);
-    await chrome.alarms.onAlarm.addListener.mock.calls[0][0]({
-      name: `opencli:lease-idle:${encodeURIComponent(key)}`,
-    });
-    expect(mod.__test__.getSession(key)).not.toBeNull();
-    const listed = await mod.__test__.handleSessions({ id: 'list', action: 'sessions' });
-    expect(listed.data).toEqual(expect.arrayContaining([expect.objectContaining({
-      session: 'never', keepAlive: true, idleDeadlineAt: 0,
-    })]));
-    await mod.__test__.handleCommand({ id: 'close', action: 'close-window', session: 'never' });
-    expect(mod.__test__.getSession(key)).toBeNull();
-    mod.__test__.setSession(key, { windowId: 1, owned: true, preferredTabId: 1 });
-    await mod.__test__.handleCommand({
-      id: 'again', action: 'cookies', session: 'never', domain: 'example.com', idleTimeout: -1,
-    });
-    await mod.__test__.handleSessions({ id: 'cleanup', action: 'sessions', op: 'cleanup' });
-    expect(mod.__test__.getSession(key)).toBeNull();
-  });
-
-  it('restores the original in-flight start and custom idle timeout on reconcile', async () => {
-    const { chrome } = createChromeMock();
-    vi.useFakeTimers();
-    vi.stubGlobal('chrome', chrome);
-    const mod = await import('./background');
-    mod.__test__.setDefaultWindowMode('background');
-    const key = browserKey('restore-stuck');
-    mod.__test__.setSession(key, { windowId: 1, owned: true, preferredTabId: 1 });
-    await mod.__test__.handleCommand({
-      id: 'nav', action: 'cookies', session: 'restore-stuck', domain: 'example.com', idleTimeout: 1,
-    });
-    const blocked = deferred<never[]>();
-    chrome.cookies.getAll.mockReturnValueOnce(blocked.promise);
-    const pending = mod.__test__.handleCommand({
-      id: 'restore', action: 'cookies', session: 'restore-stuck', domain: 'example.com', inflightMaxMs: 2000,
-    });
-    await vi.advanceTimersByTimeAsync(500);
-    mod.__test__.activeCommands.clear();
-    mod.__test__.sessionOverrides.clear();
-    await mod.__test__.reconcileTargetLeaseRegistry();
-    expect(mod.__test__.getIdleTimeout(key)).toBe(1000);
-    await vi.advanceTimersByTimeAsync(1501);
-    expect(mod.__test__.getSession(key)).toBeNull();
-    blocked.resolve([]);
-    await pending;
-  });
-
   it('uses 10-minute timeout for browser:* sessions', async () => {
     const { chrome } = createChromeMock();
     vi.useFakeTimers();
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(browserKey('default'), 1);
 
     mod.__test__.resetWindowIdleTimer(browserKey('default'));
@@ -2791,9 +2262,6 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(browserKey('default'), 1);
 
     // Set a custom timeout override
@@ -2816,9 +2284,6 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(browserKey('default'), 1);
     mod.__test__.sessionOverrides.set(browserKey('default'), { idleTimeoutMs: 300_000 });
 
@@ -2838,9 +2303,6 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(browserKey('default'), 1);
 
     // Default for browser:* is 10 min
@@ -2865,9 +2327,6 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
 
     // Set up a session with window ID 42 and a custom timeout override
     mod.__test__.setAutomationWindowId(browserKey('default'), 42);
@@ -2892,9 +2351,6 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
 
     const result = await mod.__test__.handleBind({
       id: 'bind-current-window-only',
@@ -2915,9 +2371,6 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
 
     const bound = await mod.__test__.handleBind({
       id: 'bind-good',
@@ -2944,9 +2397,6 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setAutomationWindowId(browserKey('default'), 1);
 
     const result = await mod.__test__.handleBind({
@@ -2972,9 +2422,6 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setSession(browserKey('default'), { windowId: 2, owned: false, preferredTabId: 2 });
 
     expect(mod.__test__.getIdleTimeout(browserKey('default'))).toBe(-1);
@@ -2990,9 +2437,6 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setSession(browserKey('default'), { windowId: 2, owned: false, preferredTabId: 2 });
 
     const result = await mod.__test__.handleCommand({
@@ -3014,9 +2458,6 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setSession(browserKey('default'), { windowId: 2, owned: false, preferredTabId: 2 });
 
     const onRemovedListener = chrome.tabs.onRemoved.addListener.mock.calls[0][0];
@@ -3031,9 +2472,6 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setSession(browserKey('default'), { windowId: 2, owned: false, preferredTabId: 999 });
 
     const result = await mod.__test__.handleCommand({
@@ -3057,9 +2495,6 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setSession(browserKey('default'), { windowId: 2, owned: false, preferredTabId: 2 });
 
     const result = await mod.__test__.handleCommand({
@@ -3082,16 +2517,12 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
     vi.doMock('./cdp', () => ({
       registerListeners: vi.fn(),
-      ensureAttached: vi.fn(async () => {}),
       registerFrameTracking: vi.fn(),
       hasActiveNetworkCapture: vi.fn(() => false),
       detach: vi.fn(async () => {}),
     }));
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     mod.__test__.setSession(browserKey('default'), { windowId: 2, owned: false, preferredTabId: 2 });
 
     const nav = await mod.__test__.handleCommand({
@@ -3139,18 +2570,17 @@ describe('background tab isolation', () => {
   }
 
   it('does not wipe the persisted registry when a lease idle alarm fires before recovery', async () => {
-    const { chrome, tabs, groups } = createChromeMock();
+    const { chrome, groups } = createChromeMock();
     const deadline = Date.now() + 30_000;
-    tabs.push({ id: 50, windowId: 5, url: 'about:blank', title: 'blank', active: true, status: 'complete', groupId: 200 });
-    groups.push({ id: 200, windowId: 5, title: '', color: 'orange', collapsed: false });
+    groups.push({ id: 200, windowId: 5, title: 'OpenCLI Browser', color: 'orange', collapsed: false });
     vi.stubGlobal('chrome', chrome);
     await chrome.storage.session.set({
       [REGISTRY_KEY]: {
         version: 2,
         contextId: 'user-default',
         ownedContainers: {
-          interactive: { windowId: null, groups: { '200': browserKey('recon') } },
-          automation: { windowId: 1 },
+          interactive: { windowId: null, groupIds: [200] },
+          automation: { windowId: 1, groupId: null },
         },
         leases: {
           [adapterKey('twitter')]: {
@@ -3170,9 +2600,6 @@ describe('background tab isolation', () => {
     const { gate, readDirect } = gateRegistryRead(chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
 
     // Wake the worker via the idle alarm before recovery has restored state.
     const onAlarmListener = chrome.alarms.onAlarm.addListener.mock.calls[0][0];
@@ -3183,37 +2610,33 @@ describe('background tab isolation', () => {
     // worker must leave storage untouched.
     await new Promise((resolve) => setTimeout(resolve, 0));
     const midFlight = await readDirect(REGISTRY_KEY);
-    expect(midFlight.ownedContainers.interactive.groups).toEqual({ '200': browserKey('recon') });
+    expect(midFlight.ownedContainers.interactive.groupIds).toContain(200);
     expect(midFlight.leases[adapterKey('twitter')]).toBeDefined();
 
     gate.resolve();
     await alarmDone;
 
     const finalRegistry = await readDirect(REGISTRY_KEY);
-    // The session ledger survived recovery and the orphan it named got its title.
-    expect(finalRegistry.ownedContainers.interactive.groups).toEqual({ '200': browserKey('recon') });
-    expect(mod.__test__.getInteractiveContainer().groups).toEqual({ [browserKey('recon')]: 200 });
-    expect(groups.find((group) => group.id === 200)?.title).toBe('OpenCLI: recon');
+    // Group ids are recovered from the browser-session ownership ledger.
+    expect(finalRegistry.ownedContainers.interactive.groupId).toBeUndefined();
+    expect(mod.__test__.getInteractiveContainer().groupId).toBe(200);
     // The lease was released down the proper owned-placeholder path, not wiped.
-    // Releasing a lease resets the tab but must never select it: this fires on idle
-    // timeout and cleanup, long after the person stopped watching.
-    expect(chrome.tabs.update).toHaveBeenCalledWith(1, { url: 'about:blank' });
+    expect(chrome.tabs.update).toHaveBeenCalledWith(1, { url: 'about:blank', active: true });
     expect(mod.__test__.getSession(adapterKey('twitter'))).toBeNull();
   });
 
   it('does not wipe the persisted registry when tabs.onRemoved fires before recovery', async () => {
-    const { chrome, tabs, groups } = createChromeMock();
+    const { chrome, groups } = createChromeMock();
     const deadline = Date.now() + 30_000;
-    tabs.push({ id: 50, windowId: 5, url: 'about:blank', title: 'blank', active: true, status: 'complete', groupId: 200 });
-    groups.push({ id: 200, windowId: 5, title: '', color: 'orange', collapsed: false });
+    groups.push({ id: 200, windowId: 5, title: 'OpenCLI Browser', color: 'orange', collapsed: false });
     vi.stubGlobal('chrome', chrome);
     await chrome.storage.session.set({
       [REGISTRY_KEY]: {
         version: 2,
         contextId: 'user-default',
         ownedContainers: {
-          interactive: { windowId: null, groups: { '200': browserKey('recon') } },
-          automation: { windowId: 1 },
+          interactive: { windowId: null, groupIds: [200] },
+          automation: { windowId: 1, groupId: null },
         },
         leases: {
           [adapterKey('twitter')]: {
@@ -3233,9 +2656,6 @@ describe('background tab isolation', () => {
     const { gate, readDirect } = gateRegistryRead(chrome);
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
 
     // Wake the worker via an unrelated tab-close before recovery.
     const onRemovedListener = chrome.tabs.onRemoved.addListener.mock.calls[0][0];
@@ -3243,15 +2663,16 @@ describe('background tab isolation', () => {
 
     await new Promise((resolve) => setTimeout(resolve, 0));
     const midFlight = await readDirect(REGISTRY_KEY);
-    expect(midFlight.ownedContainers.interactive.groups).toEqual({ '200': browserKey('recon') });
+    expect(midFlight.ownedContainers.interactive.groupIds).toContain(200);
     expect(midFlight.leases[adapterKey('twitter')]).toBeDefined();
 
     gate.resolve();
     await removedDone;
 
     const finalRegistry = await readDirect(REGISTRY_KEY);
-    expect(finalRegistry.ownedContainers.interactive.groups).toEqual({ '200': browserKey('recon') });
-    expect(mod.__test__.getInteractiveContainer().groups).toEqual({ [browserKey('recon')]: 200 });
+    // Group ids are recovered from the browser-session ownership ledger.
+    expect(finalRegistry.ownedContainers.interactive.groupId).toBeUndefined();
+    expect(mod.__test__.getInteractiveContainer().groupId).toBe(200);
     // The unrelated lease survived the unrelated tab-close.
     expect(finalRegistry.leases[adapterKey('twitter')]).toBeDefined();
   });
@@ -3266,68 +2687,6 @@ describe('background tab isolation', () => {
         version: 2,
         contextId: 'user-default',
         ownedContainers: {
-          interactive: { windowId: null, groups: { '200': browserKey('recon') } },
-          automation: { windowId: null },
-        },
-        leases: {},
-      },
-    });
-
-    const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
-    await mod.__test__.reconcileTargetLeaseRegistry();
-
-    // The orphan was adopted and titled for its session — no second group spawned.
-    expect(groups).toHaveLength(1);
-    expect(groups[0].title).toBe('OpenCLI: recon');
-    const createGroupCalls = chrome.tabs.group.mock.calls.filter((call: any[]) => call[0]?.createProperties);
-    expect(createGroupCalls).toHaveLength(0);
-    const container = mod.__test__.getInteractiveContainer();
-    expect(container.groups).toEqual({ [browserKey('recon')]: 200 });
-    expect(container.groupIds).toContain(200);
-  });
-
-  it('adopts an orphan adapter group the same way', async () => {
-    const { chrome, tabs, groups } = createChromeMock();
-    tabs.push({ id: 50, windowId: 5, url: 'about:blank', title: 'blank', active: true, status: 'complete', groupId: 200 });
-    groups.push({ id: 200, windowId: 5, title: '', collapsed: false });
-    vi.stubGlobal('chrome', chrome);
-    await chrome.storage.session.set({
-      [REGISTRY_KEY]: {
-        version: 2,
-        contextId: 'user-default',
-        ownedContainers: {
-          interactive: { windowId: null },
-          automation: { windowId: null, groups: { '200': adapterKey('reddit') } },
-        },
-        leases: {},
-      },
-    });
-
-    const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
-    await mod.__test__.reconcileTargetLeaseRegistry();
-
-    expect(groups).toHaveLength(1);
-    expect(groups[0].title).toBe('OpenCLI: reddit');
-    expect(mod.__test__.getContainer('automation').groups).toEqual({ [adapterKey('reddit')]: 200 });
-  });
-
-  it('never adopts an ownerless group id left by a pre-per-session build', async () => {
-    const { chrome, tabs, groups } = createChromeMock();
-    tabs.push({ id: 50, windowId: 5, url: 'about:blank', title: 'blank', active: true, status: 'complete', groupId: 200 });
-    groups.push({ id: 200, windowId: 5, title: '', collapsed: false });
-    vi.stubGlobal('chrome', chrome);
-    await chrome.storage.session.set({
-      [REGISTRY_KEY]: {
-        version: 2,
-        contextId: 'user-default',
-        ownedContainers: {
-          // The old ledger: bare ids, no session attached.
           interactive: { windowId: null, groupIds: [200] },
           automation: { windowId: null },
         },
@@ -3336,16 +2695,16 @@ describe('background tab isolation', () => {
     });
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     await mod.__test__.reconcileTargetLeaseRegistry();
 
-    // With no session to name it after there is nothing safe to do with it:
-    // it stays as it is, untitled, and no session's group map claims it.
-    expect(groups[0].title).toBe('');
-    expect(chrome.tabGroups.update).not.toHaveBeenCalled();
-    expect(mod.__test__.getInteractiveContainer().groups).toEqual({});
+    // The orphan was adopted and titled — no second "OpenCLI Browser" spawned.
+    expect(groups).toHaveLength(1);
+    expect(groups[0].title).toBe('OpenCLI Browser');
+    const createGroupCalls = chrome.tabs.group.mock.calls.filter((call: any[]) => call[0]?.createProperties);
+    expect(createGroupCalls).toHaveLength(0);
+    const container = mod.__test__.getInteractiveContainer();
+    expect(container.groupId).toBe(200);
+    expect(container.groupIds).toContain(200);
   });
 
   it('prunes a vanished group id from the session ledger on convergence', async () => {
@@ -3356,27 +2715,23 @@ describe('background tab isolation', () => {
         version: 2,
         contextId: 'user-default',
         ownedContainers: {
-          interactive: { windowId: null, groups: { '300': browserKey('recon') }, groupIds: [301] },
-          automation: { windowId: null, groups: { '302': adapterKey('reddit') } },
+          interactive: { windowId: null, groupIds: [300] },
+          automation: { windowId: null },
         },
         leases: {},
       },
     });
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     await mod.__test__.reconcileTargetLeaseRegistry();
 
     expect(chrome.windows.create).not.toHaveBeenCalled();
     const createGroupCalls = chrome.tabs.group.mock.calls.filter((call: any[]) => call[0]?.createProperties);
     expect(createGroupCalls).toHaveLength(0);
-    expect(mod.__test__.getInteractiveContainer().groupIds).toEqual([]);
-    // The pruned ids are gone from the persisted session registry too.
+    expect(mod.__test__.getInteractiveContainer().groupIds).not.toContain(300);
+    // The pruned id is gone from the persisted session registry too.
     const finalRegistry = (await chrome.storage.session.get(REGISTRY_KEY) as any)[REGISTRY_KEY];
-    expect(finalRegistry.ownedContainers.interactive.groups).toEqual({});
-    expect(finalRegistry.ownedContainers.automation.groups).toEqual({});
+    expect(finalRegistry.ownedContainers.interactive.groupIds).toEqual([]);
   });
 
   it('ignores legacy groupIds persisted in the local registry so a recycled id cannot hijack a user group', async () => {
@@ -3399,9 +2754,6 @@ describe('background tab isolation', () => {
     });
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     await mod.__test__.reconcileTargetLeaseRegistry();
 
     // The user group is untouched: no retitle, no merge, no group mutation.
@@ -3434,9 +2786,6 @@ describe('background tab isolation', () => {
     });
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     await mod.__test__.reconcileTargetLeaseRegistry();
 
     // The user group is untouched: no retitle, no merge, no group mutation.
@@ -3445,8 +2794,7 @@ describe('background tab isolation', () => {
     expect(chrome.tabGroups.update).not.toHaveBeenCalled();
     expect(chrome.tabs.group).not.toHaveBeenCalled();
     // And the stale pointer was never adopted into memory.
-    expect(mod.__test__.getInteractiveContainer().groups).toEqual({});
-    expect(mod.__test__.getInteractiveContainer().groupIds).not.toContain(400);
+    expect(mod.__test__.getInteractiveContainer().groupId).toBeNull();
   });
 
   it('ignores legacy container windowIds persisted in the local registry so recycled ids cannot claim user windows', async () => {
@@ -3469,9 +2817,6 @@ describe('background tab isolation', () => {
     });
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     await mod.__test__.reconcileTargetLeaseRegistry();
 
     // The user window was never claimed as an owned container.
@@ -3521,9 +2866,6 @@ describe('background tab isolation', () => {
     });
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     await mod.__test__.reconcileTargetLeaseRegistry();
 
     // The stale lease was not resurrected onto the user's tab, and the tab was
@@ -3549,1244 +2891,10 @@ describe('background tab isolation', () => {
     });
 
     const mod = await import('./background');
-    // This block is about what `background` mode does — the mode the person's own
-    // window is borrowed for. The shipped default is `dedicated`; pin it here.
-    mod.__test__.setDefaultWindowMode('background');
     await mod.__test__.reconcileTargetLeaseRegistry();
 
     expect(chrome.storage.local.remove).toHaveBeenCalledWith(REGISTRY_KEY);
     const leftover = (await chrome.storage.local.get(REGISTRY_KEY) as any)[REGISTRY_KEY];
     expect(leftover).toBeUndefined();
-  });
-});
-
-// ─── Dedicated automation windows (`--window dedicated`) ────────────────────
-function dedicatedHarness(opts: { withDisplayApi?: boolean } = {}) {
-  const mock = createChromeMock();
-  const chrome = mock.chrome as any;
-  const tabs = mock.tabs;
-  type MockWindow = { id: number; type: string; incognito: boolean; focused: boolean; state: string; left: number; top: number; width: number; height: number };
-  const windows = new Map<number, MockWindow>([
-    [1, { id: 1, type: 'normal', incognito: false, focused: false, state: 'normal', left: 0, top: 25, width: 1400, height: 880 }],
-    [2, { id: 2, type: 'normal', incognito: false, focused: true, state: 'normal', left: 40, top: 25, width: 1400, height: 880 }],
-  ]);
-  let nextWindowId = 50;
-  let nextTabId = 500;
-  let lastFocused = 2;
-  chrome.windows.get = vi.fn(async (id: number) => {
-    const win = windows.get(id);
-    if (!win) throw new Error(`No window with id: ${id}`);
-    return { ...win };
-  });
-  chrome.windows.getAll = vi.fn(async () => [...windows.values()].map((w) => ({ ...w })));
-  chrome.windows.getLastFocused = vi.fn(async () => ({ ...windows.get(lastFocused)! }));
-  chrome.windows.create = vi.fn(async (props: any) => {
-    const id = nextWindowId++;
-    windows.set(id, {
-      id, type: 'normal', incognito: false, focused: !!props.focused, state: 'normal',
-      left: props.left ?? 300, top: props.top ?? 200, width: props.width, height: props.height,
-    });
-    tabs.push({ id: nextTabId++, windowId: id, url: props.url, title: props.url, active: true, status: 'complete', groupId: -1 });
-    return { ...windows.get(id)! };
-  });
-  chrome.windows.update = vi.fn(async (id: number, info: any) => {
-    const win = windows.get(id);
-    if (!win) throw new Error(`No window with id: ${id}`);
-    Object.assign(win, info);
-    return { ...win };
-  });
-  const displays = [
-    { id: 'main', name: 'Built-in Retina Display', isPrimary: true, isInternal: true, bounds: { left: 0, top: 0, width: 1512, height: 982 }, workArea: { left: 0, top: 25, width: 1512, height: 957 } },
-    { id: 'virt', name: '虚拟 16:9', isPrimary: false, isInternal: false, bounds: { left: -2560, top: -1440, width: 2560, height: 1440 }, workArea: { left: -2560, top: -1440, width: 2560, height: 1440 } },
-  ];
-  if (opts.withDisplayApi !== false) {
-    chrome.system = { display: { onDisplayChanged: { addListener: vi.fn() }, getInfo: vi.fn(async (cb?: (d: unknown[]) => void) => { cb?.(displays); return displays; }) } };
-  }
-  chrome.tabs.onCreated = { addListener: vi.fn() };
-  chrome.tabs.onAttached = { addListener: vi.fn() };
-  return {
-    ...mock,
-    chrome,
-    windows,
-    displays,
-    setLastFocused: (id: number) => { lastFocused = id; },
-    closeWindow: async (id: number) => {
-      windows.delete(id);
-      for (let i = tabs.length - 1; i >= 0; i -= 1) if (tabs[i].windowId === id) tabs.splice(i, 1);
-      for (const call of chrome.windows.onRemoved.addListener.mock.calls) await call[0](id);
-    },
-  };
-}
-
-describe('dedicated automation window', () => {
-  beforeEach(() => {
-    vi.resetModules();
-    vi.useRealTimers();
-    MockWebSocket.instances = [];
-    vi.stubGlobal('WebSocket', MockWebSocket);
-    vi.stubGlobal('fetch', vi.fn(() => new Promise(() => {})));
-  });
-
-  afterEach(async () => {
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    vi.unstubAllGlobals();
-  });
-
-  const useDedicated = (mod: any, key: string, fields: Record<string, unknown> = {}) => {
-    mod.__test__.sessionOverrides.set(key, { windowMode: 'dedicated' });
-    mod.__test__.applyDedicatedCommandFields(key, { id: 'x', action: 'exec', windowMode: 'dedicated', ...fields });
-  };
-
-  it('creates its own window unfocused at the requested bounds and never touches the person\'s window', async () => {
-    const h = dedicatedHarness();
-    vi.stubGlobal('chrome', h.chrome);
-    const mod = await import('./background');
-    const key = browserKey('semrush');
-    useDedicated(mod, key, { windowSlot: 'semrush', windowBounds: { left: -2480, top: -1380, width: 1280, height: 900 } });
-
-    const tabId = await mod.__test__.resolveTabId(undefined, key, 'https://www.semrush.com/');
-
-    expect(h.chrome.windows.create).toHaveBeenCalledTimes(1);
-    expect(h.chrome.windows.create).toHaveBeenCalledWith(expect.objectContaining({ focused: false, left: -2480, top: -1380, width: 1280, height: 900 }));
-    expect(h.tabs.find((t) => t.id === tabId)?.windowId).toBe(50);
-    for (const call of h.chrome.tabs.create.mock.calls) expect(call[0].windowId).not.toBe(2);
-    for (const call of h.chrome.windows.update.mock.calls) expect(call[1]).not.toHaveProperty('focused');
-    expect(mod.__test__.getDedicatedSlot('semrush')).toMatchObject({ windowId: 50, placement: { source: 'bounds' } });
-    // The person's window stays out of every role container.
-    expect(mod.__test__.getContainer('interactive').windowId).not.toBe(2);
-  });
-
-  it.each([
-    { name: 'primary fallback', bounds: { left: 0, top: 0, width: 500, height: 900 }, avoid: undefined, relocated: true },
-    { name: 'current primary screen', bounds: { left: 0, top: 0, width: 1360, height: 900 }, avoid: { left: 0, top: 0, width: 1512, height: 982 }, relocated: true },
-    { name: 'current virtual screen', bounds: { left: -2480, top: -1380, width: 500, height: 900 }, avoid: { left: -2560, top: -1440, width: 2560, height: 1440 }, relocated: true },
-    { name: 'current primary screen with narrow size', bounds: { left: 0, top: 0, width: 500, height: 900 }, avoid: { left: 0, top: 0, width: 1512, height: 982 }, relocated: true },
-    { name: 'primary fallback with wide size', bounds: { left: 0, top: 0, width: 1360, height: 900 }, avoid: undefined, relocated: true },
-    { name: 'current virtual screen with oversized size', bounds: { left: -2480, top: -1380, width: 3000, height: 2000 }, avoid: { left: -2560, top: -1440, width: 2560, height: 1440 }, relocated: true },
-    { name: 'current primary screen with 3200x1800 size', bounds: { left: 0, top: 0, width: 3200, height: 1800 }, avoid: { left: 0, top: 0, width: 1512, height: 982 }, relocated: true },
-    { name: 'primary fallback with 6000x3000 size', bounds: { left: 0, top: 0, width: 6000, height: 3000 }, avoid: undefined, relocated: true },
-    { name: 'non-overlapping screen edge', bounds: { left: -2560, top: 0, width: 2560, height: 1440 }, avoid: { left: 0, top: 0, width: 1512, height: 982 }, relocated: false },
-    { name: 'other screen', bounds: { left: -2480, top: -1380, width: 500, height: 900 }, avoid: { left: 0, top: 0, width: 1512, height: 982 }, relocated: false },
-  ])('handles explicit bounds on $name', async ({ bounds, avoid, relocated }) => {
-    const h = dedicatedHarness();
-    vi.stubGlobal('chrome', h.chrome);
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const mod = await import('./background');
-    const result = await mod.__test__.handleSessions({
-      id: 'e', action: 'sessions', op: 'window-ensure', windowSlot: 'bounds-check',
-      windowBounds: bounds, avoidDisplayBounds: avoid,
-    } as never);
-    expect(result.ok).toBe(true);
-    let state = mod.__test__.getDedicatedSlot('bounds-check')!;
-    if (relocated) {
-      const area = { left: -2560, top: -1440, width: 2560, height: 1440 };
-      const target = mod.__test__.dedicatedTile(area, 0, 1);
-      expect(state).toMatchObject({ tileIndex: 0, placement: { source: 'auto', cell: 0, requestedBounds: target, relocatedFrom: bounds } });
-      const placed = state.placement.requestedBounds!;
-      expect(state.tileIndex).not.toBeNull();
-      expect(placed.width).toBeLessThanOrEqual(area.width);
-      expect(placed.height).toBeLessThanOrEqual(area.height);
-      expect(placed.left).toBeGreaterThanOrEqual(area.left);
-      expect(placed.top).toBeGreaterThanOrEqual(area.top);
-      expect(placed.left + placed.width).toBeLessThanOrEqual(area.left + area.width);
-      expect(placed.top + placed.height).toBeLessThanOrEqual(area.top + area.height);
-      expect(h.chrome.windows.create).toHaveBeenCalledWith(expect.objectContaining(target));
-      expect(warn).toHaveBeenCalledWith(expect.stringContaining('显式 bounds 落在用户当前屏，位置和尺寸已改到自动宫格'));
-      const status = await mod.__test__.handleSessions({ id: 's', action: 'sessions', op: 'window-status' } as never);
-      expect((status.data as any).windows[0].placement.relocatedFrom).toEqual(bounds);
-      await mod.__test__.restoreDedicatedState();
-      state = mod.__test__.getDedicatedSlot('bounds-check')!;
-      expect(state.placement.relocatedFrom).toEqual(bounds);
-      // Adding a window leaves the fixed slot and tile size unchanged.
-      await mod.__test__.ensureDedicatedWindow('neighbor', { avoidDisplayBounds: avoid });
-      state = mod.__test__.getDedicatedSlot('bounds-check')!;
-      const retiledTarget = target;
-      expect(state.placement.requestedBounds).toEqual(retiledTarget);
-      expect(h.windows.get(state.windowId!)).toMatchObject(retiledTarget);
-      h.chrome.windows.remove = vi.fn(async (id: number) => { await h.closeWindow(id); });
-      expect(await mod.__test__.reapIdleDedicatedWindows(Date.now() + 60_000)).toBe(2);
-      await mod.__test__.ensureDedicatedWindow('bounds-check', { avoidDisplayBounds: avoid });
-      state = mod.__test__.getDedicatedSlot('bounds-check')!;
-      expect(state).toMatchObject({ tileIndex: 0, placement: { source: 'auto', cell: 0, requestedBounds: target, relocatedFrom: bounds } });
-      expect(h.windows.get(state.windowId!)).toMatchObject(target);
-      // Reusing the slot with the caller's original bounds must relocate again.
-      await mod.__test__.ensureDedicatedWindow('bounds-check', { bounds, avoidDisplayBounds: avoid });
-      state = mod.__test__.getDedicatedSlot('bounds-check')!;
-      expect(state.placement.requestedBounds).toEqual(target);
-      expect(h.windows.get(state.windowId!)).toMatchObject(target);
-    } else {
-      expect(state).toMatchObject({ tileIndex: null, placement: { source: 'bounds', requestedBounds: bounds } });
-      expect(state.placement).not.toHaveProperty('relocatedFrom');
-      expect(h.chrome.windows.create).toHaveBeenCalledWith(expect.objectContaining(bounds));
-      expect(warn).not.toHaveBeenCalled();
-    }
-    warn.mockRestore();
-  });
-
-  it('warns once for identical relocated bounds in a slot and again when the rectangle changes', async () => {
-    const h = dedicatedHarness();
-    vi.stubGlobal('chrome', h.chrome);
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    try {
-      const mod = await import('./background');
-      const bounds = { left: 0, top: 0, width: 500, height: 900 };
-      await mod.__test__.ensureDedicatedWindow('warn-dedupe', { bounds });
-      await mod.__test__.ensureDedicatedWindow('warn-dedupe', { bounds: { ...bounds } });
-      expect(warn).toHaveBeenCalledTimes(1);
-      expect(warn).toHaveBeenLastCalledWith(expect.stringContaining('显式 bounds 落在用户当前屏'));
-
-      const changedBounds = { ...bounds, left: 10 };
-      await mod.__test__.ensureDedicatedWindow('warn-dedupe', { bounds: changedBounds });
-      expect(warn).toHaveBeenCalledTimes(2);
-      expect(mod.__test__.getDedicatedSlot('warn-dedupe')!.placement.relocatedFrom).toEqual(changedBounds);
-    } finally {
-      warn.mockRestore();
-    }
-  });
-
-  it('uses grid size for relocated bounds on reuse and restores nudges', async () => {
-    const h = dedicatedHarness();
-    vi.stubGlobal('chrome', h.chrome);
-    const mod = await import('./background');
-    const avoidDisplayBounds = h.displays[0].bounds;
-    await mod.__test__.ensureDedicatedWindow('reuse-bounds', { avoidDisplayBounds, reposition: true });
-    const target = mod.__test__.getDedicatedSlot('reuse-bounds')!.placement.requestedBounds!;
-    expect(target).toMatchObject({ width: 1280, height: 720 });
-    h.chrome.windows.update.mockClear();
-    const request = { bounds: { left: 0, top: 0, width: 1360, height: 900 }, avoidDisplayBounds, reposition: true };
-    expect(await mod.__test__.ensureDedicatedWindow('reuse-bounds', request)).toMatchObject({ windowId: 50, created: false, moved: false });
-    expect(h.chrome.windows.update).not.toHaveBeenCalled();
-    Object.assign(h.windows.get(50)!, { left: -2400, top: -1300 });
-    expect(await mod.__test__.ensureDedicatedWindow('reuse-bounds', request)).toMatchObject({ moved: true });
-    expect(h.chrome.windows.update).toHaveBeenCalledExactlyOnceWith(50, target);
-    expect(h.windows.get(50)).toMatchObject(target);
-  });
-
-  it('restores relocated reused windows to their exact slot within or outside the display', async () => {
-    const h = dedicatedHarness();
-    vi.stubGlobal('chrome', h.chrome);
-    const mod = await import('./background');
-    const avoidDisplayBounds = h.displays[0].bounds;
-    await mod.__test__.ensureDedicatedWindow('nudged-bounds', { avoidDisplayBounds, reposition: true });
-    const target = mod.__test__.getDedicatedSlot('nudged-bounds')!.placement.requestedBounds!;
-    const request = { bounds: { left: 0, top: 0, width: 1400, height: 1300 }, avoidDisplayBounds, reposition: true };
-    for (const position of [{ left: -2500, top: -1400 }, { left: 0, top: 25 }]) {
-      Object.assign(h.windows.get(50)!, position);
-      h.chrome.windows.update.mockClear();
-      expect(await mod.__test__.ensureDedicatedWindow('nudged-bounds', request)).toMatchObject({ moved: true });
-      expect(h.chrome.windows.update).toHaveBeenCalledExactlyOnceWith(50, target);
-      expect(h.windows.get(50)).toMatchObject(target);
-    }
-  });
-
-  it('uses the fixed lower-right grid tile for relocated oversized bounds', async () => {
-    const h = dedicatedHarness();
-    vi.stubGlobal('chrome', h.chrome);
-    const mod = await import('./background');
-    const avoidDisplayBounds = { left: 0, top: 0, width: 1512, height: 982 };
-    for (const slot of ['first', 'second', 'third']) {
-      await mod.__test__.ensureDedicatedWindow(slot, { avoidDisplayBounds, reposition: true });
-    }
-    await mod.__test__.ensureDedicatedWindow('large-bounds', {
-      bounds: { left: 0, top: 0, width: 1400, height: 1300 }, avoidDisplayBounds, reposition: true,
-    });
-    const state = mod.__test__.getDedicatedSlot('large-bounds')!;
-    expect(state.tileIndex).toBe(3);
-    const expected = { left: -1280, top: -720, width: 1280, height: 720 };
-    expect(h.chrome.windows.create).toHaveBeenLastCalledWith(expect.objectContaining(expected));
-    expect(state.placement.requestedBounds).toEqual(expected);
-    expect(h.windows.get(state.windowId!)).toMatchObject(expected);
-  });
-
-  it('tiles slots on the display matched by name without overlapping them', async () => {
-    const h = dedicatedHarness();
-    vi.stubGlobal('chrome', h.chrome);
-    const mod = await import('./background');
-    useDedicated(mod, browserKey('semrush'), { windowSlot: 'semrush', windowDisplay: '/虚拟|virtual/i' });
-    useDedicated(mod, browserKey('similarweb'), { windowSlot: 'similarweb', windowDisplay: '/虚拟|virtual/i' });
-
-    await mod.__test__.resolveTabId(undefined, browserKey('semrush'), 'https://www.semrush.com/');
-    await mod.__test__.resolveTabId(undefined, browserKey('similarweb'), 'https://pro.similarweb.com/');
-
-    expect(h.chrome.windows.create.mock.calls[0][0]).toMatchObject({ left: -2560, top: -1380, width: 1280, height: 900, focused: false });
-    expect(h.chrome.windows.create.mock.calls[1][0]).toMatchObject({ left: -1280, top: -1380, width: 1280, height: 900, focused: false });
-    expect(mod.__test__.getDedicatedSlot('semrush')?.placement).toMatchObject({ source: 'display', displayName: '虚拟 16:9', displayFound: true, cell: 0 });
-    expect(mod.__test__.getDedicatedSlot('similarweb')?.placement).toMatchObject({ cell: 1 });
-  });
-
-  it('computes display cells and matches display names', async () => {
-    vi.stubGlobal('chrome', dedicatedHarness().chrome);
-    const mod = await import('./background');
-    const display = { left: -2560, top: -1440, width: 2560, height: 1440 };
-    expect(mod.__test__.computeDisplayCell(display, 0)).toEqual({ left: -2560, top: -1380, width: 1280, height: 900 });
-    expect(mod.__test__.computeDisplayCell(display, 1)).toEqual({ left: -1280, top: -1380, width: 1280, height: 900 });
-    expect(mod.__test__.computeDisplayCell(display, 2)).toEqual({ left: -2560, top: -1380, width: 1280, height: 900 });
-    expect(mod.__test__.computeDisplayCell({ left: 0, top: 0, width: 1024, height: 768 }, 0)).toEqual({ left: 0, top: 0, width: 1024, height: 768 });
-    expect(mod.__test__.compileDisplayMatcher('/虚拟|virtual/i')!.test('Virtual 16:9')).toBe(true);
-    expect(mod.__test__.compileDisplayMatcher('VIRT')!.test('my virtual screen')).toBe(true);
-    expect(mod.__test__.compileDisplayMatcher('a.b')!.test('axb')).toBe(false);
-    const displays = [
-      { id: '1', name: 'Virtual main', primary: true, internal: false, bounds: { left: 0, top: 0, width: 10, height: 10 }, workArea: null },
-      { id: '2', name: 'Virtual side', primary: false, internal: false, bounds: { left: 10, top: 0, width: 10, height: 10 }, workArea: null },
-    ];
-    expect(mod.__test__.pickDisplay(displays, 'virtual')?.id).toBe('2');
-    expect(mod.__test__.pickDisplay(displays, 'nope')).toBeNull();
-    // Primary only when it is the sole display (physical screen asleep).
-    expect(mod.__test__.pickDisplay([displays[0]], 'virtual')?.id).toBe('1');
-    expect(mod.__test__.pickDisplay([displays[0], { ...displays[1], name: 'Studio Display' }], 'virtual')).toBeNull();
-  });
-
-  it('moves a lease tab that sits in the person\'s window into the dedicated window and selects it', async () => {
-    const h = dedicatedHarness();
-    h.tabs.push({ id: 40, windowId: 2, url: 'https://www.semrush.com/analytics', title: 'semrush', active: false, status: 'complete', groupId: -1 });
-    vi.stubGlobal('chrome', h.chrome);
-    const mod = await import('./background');
-    const key = browserKey('semrush');
-    mod.__test__.setSession(key, { windowId: 2, owned: true, preferredTabId: 40 });
-    useDedicated(mod, key, { windowSlot: 'semrush' });
-
-    const tabId = await mod.__test__.resolveTabId(undefined, key);
-
-    expect(tabId).toBe(40);
-    const tab = h.tabs.find((t) => t.id === 40)!;
-    expect(tab.windowId).toBe(50);
-    expect(tab.active).toBe(true);
-    expect(mod.__test__.getSession(key)?.windowId).toBe(50);
-    // The window's own blank starter tab is litter once the lease tab is in.
-    expect(h.chrome.tabs.remove).toHaveBeenCalledWith(500);
-    expect(h.chrome.windows.create).toHaveBeenCalledWith(expect.objectContaining({ focused: false }));
-  });
-
-  it('selects the session tab before each command unless autoSelect is off', async () => {
-    const h = dedicatedHarness();
-    vi.stubGlobal('chrome', h.chrome);
-    const mod = await import('./background');
-    const a = browserKey('a');
-    const b = browserKey('b');
-    useDedicated(mod, a);
-    useDedicated(mod, b, { autoSelect: false });
-    const tabA = await mod.__test__.resolveTabId(undefined, a, 'https://a.example/');
-    const tabB = await mod.__test__.resolveTabId(undefined, b, 'https://b.example/');
-    // Two leases held at the same time are two tasks that both need to render, so the
-    // pool gives them a window each (tiled, never stacked) instead of one shared window
-    // where only the active tab would be visible.
-    expect(h.tabs.find((t) => t.id === tabB)?.windowId).not.toBe(h.tabs.find((t) => t.id === tabA)?.windowId);
-    // The second window is created for b directly on its URL, and unfocused like every
-    // automation window — `tabs.create` only appears when a window already exists.
-    expect(h.chrome.windows.create).toHaveBeenCalledWith(expect.objectContaining({ url: 'https://b.example/', focused: false }));
-
-    h.tabs.find((t) => t.id === tabA)!.active = false;
-    h.chrome.tabs.update.mockClear();
-    await mod.__test__.resolveTabId(undefined, a);
-    expect(h.chrome.tabs.update).toHaveBeenCalledWith(tabA, { active: true });
-
-    h.chrome.tabs.update.mockClear();
-    await mod.__test__.resolveTabId(undefined, b);
-    expect(h.chrome.tabs.update).not.toHaveBeenCalledWith(tabB, { active: true });
-  });
-
-  it('sends a foreign tab back to the person\'s last window without focusing it, and keeps automation children', async () => {
-    const h = dedicatedHarness();
-    vi.stubGlobal('chrome', h.chrome);
-    const mod = await import('./background');
-    const key = browserKey('semrush');
-    useDedicated(mod, key, { windowSlot: 'semrush' });
-    const leaseTab = await mod.__test__.resolveTabId(undefined, key, 'https://www.semrush.com/');
-    h.tabs.push({ id: 77, windowId: 50, url: 'https://news.example/', title: 'news', active: true, status: 'complete', groupId: -1 });
-    h.tabs.push({ id: 78, windowId: 50, url: 'https://www.semrush.com/popup', title: 'child', active: false, status: 'complete', groupId: -1, openerTabId: leaseTab } as any);
-
-    expect(await mod.__test__.checkDedicatedForeignTab(78)).toBe('ours');
-    expect(await mod.__test__.checkDedicatedForeignTab(77)).toBe('evicted');
-
-    expect(h.tabs.find((t) => t.id === 77)?.windowId).toBe(2);
-    expect(h.chrome.tabs.update).toHaveBeenCalledWith(77, { active: true });
-    for (const call of h.chrome.windows.update.mock.calls) expect(call[1]).not.toHaveProperty('focused');
-    expect(h.tabs.find((t) => t.id === leaseTab)?.windowId).toBe(50);
-    expect(mod.__test__.getDedicatedSlot('semrush')?.evictedTabs).toBe(1);
-    // The dedicated window never becomes "borrowed" because of a foreign tab.
-    expect(mod.__test__.getDedicatedSlot('semrush')?.windowId).toBe(50);
-  });
-
-  it('never evicts into a dedicated window even when it was the last focused one', async () => {
-    const h = dedicatedHarness();
-    vi.stubGlobal('chrome', h.chrome);
-    const mod = await import('./background');
-    useDedicated(mod, browserKey('a'), { windowSlot: 'a' });
-    useDedicated(mod, browserKey('b'), { windowSlot: 'b' });
-    await mod.__test__.resolveTabId(undefined, browserKey('a'), 'https://a.example/');
-    await mod.__test__.resolveTabId(undefined, browserKey('b'), 'https://b.example/');
-    h.setLastFocused(51);
-    h.tabs.push({ id: 77, windowId: 50, url: 'https://news.example/', title: 'news', active: false, status: 'complete', groupId: -1 });
-    expect(await mod.__test__.checkDedicatedForeignTab(77)).toBe('evicted');
-    expect([1, 2]).toContain(h.tabs.find((t) => t.id === 77)?.windowId);
-  });
-
-  it('tolerates foreign tabs when asked, and never hands one to a new session', async () => {
-    const h = dedicatedHarness();
-    vi.stubGlobal('chrome', h.chrome);
-    const mod = await import('./background');
-    const key = browserKey('one');
-    useDedicated(mod, key, { foreignTabPolicy: 'tolerate' });
-    const first = await mod.__test__.resolveTabId(undefined, key, 'https://one.example/');
-    h.tabs.push({ id: 77, windowId: 50, url: 'about:blank', title: 'blank', active: false, status: 'complete', groupId: -1 });
-    expect(await mod.__test__.checkDedicatedForeignTab(77)).toBe('tolerated');
-    expect(h.tabs.find((t) => t.id === 77)?.windowId).toBe(50);
-
-    await mod.__test__.releaseLease(key, 'test');
-    // The last lease leaves a placeholder instead of closing the window.
-    expect(h.chrome.tabs.update).toHaveBeenCalledWith(first, { url: `about:blank#opencli-dedicated=${mod.__test__.getDedicatedSlot()?.slot}` });
-    expect(h.chrome.tabs.remove).not.toHaveBeenCalledWith(first);
-    expect(h.chrome.windows.remove).not.toHaveBeenCalled();
-    expect(mod.__test__.getDedicatedSlot()?.placeholderTabIds).toEqual([first]);
-
-    const two = browserKey('two');
-    useDedicated(mod, two);
-    const second = await mod.__test__.resolveTabId(undefined, two, 'https://two.example/');
-    expect(second).toBe(first);
-    expect(second).not.toBe(77);
-    expect(h.chrome.windows.create).toHaveBeenCalledTimes(1);
-  });
-
-  it('lets a lease tab dragged out of the dedicated window become the person\'s', async () => {
-    const h = dedicatedHarness();
-    vi.stubGlobal('chrome', h.chrome);
-    const mod = await import('./background');
-    const key = browserKey('semrush');
-    useDedicated(mod, key);
-    const tabId = await mod.__test__.resolveTabId(undefined, key, 'https://www.semrush.com/');
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    // Wait out our own grouping moves so this reads as the person's drag.
-    await new Promise((resolve) => setTimeout(resolve, 2100));
-    h.tabs.find((t) => t.id === tabId)!.windowId = 2;
-
-    await mod.__test__.handleTabAttached(tabId, { newWindowId: 2 });
-
-    expect(mod.__test__.getSession(key)).toBeNull();
-    expect(h.chrome.tabs.remove).not.toHaveBeenCalledWith(tabId);
-  }, 10_000);
-
-  it('recreates a closed dedicated window on the next command with the same placement', async () => {
-    const h = dedicatedHarness();
-    vi.stubGlobal('chrome', h.chrome);
-    const mod = await import('./background');
-    const key = browserKey('semrush');
-    useDedicated(mod, key, { windowSlot: 'semrush', windowDisplay: '虚拟' });
-    await mod.__test__.resolveTabId(undefined, key, 'https://www.semrush.com/');
-    await h.closeWindow(50);
-    expect(mod.__test__.getDedicatedSlot('semrush')?.windowId).toBeNull();
-    expect(mod.__test__.getSession(key)).toBeNull();
-
-    mod.__test__.sessionOverrides.set(key, { windowMode: 'dedicated', windowSlot: 'semrush' });
-    const tabId = await mod.__test__.resolveTabId(undefined, key, 'https://www.semrush.com/');
-    expect(h.chrome.windows.create).toHaveBeenCalledTimes(2);
-    expect(h.chrome.windows.create.mock.calls[1][0]).toMatchObject({ left: -2560, top: -1380, focused: false });
-    expect(h.tabs.find((t) => t.id === tabId)?.windowId).toBe(51);
-  });
-
-  it('keeps default-mode and isolated sessions out of the dedicated window', async () => {
-    const h = dedicatedHarness();
-    vi.stubGlobal('chrome', h.chrome);
-    const mod = await import('./background');
-    useDedicated(mod, browserKey('semrush'));
-    await mod.__test__.resolveTabId(undefined, browserKey('semrush'), 'https://www.semrush.com/');
-    // The person clicked the dedicated window once; it is now "last focused".
-    h.setLastFocused(50);
-
-    const bg = await mod.__test__.resolveTabId(undefined, browserKey('recon'), 'https://recon.example/');
-    expect(h.tabs.find((t) => t.id === bg)?.windowId).not.toBe(50);
-
-    mod.__test__.sessionOverrides.set(browserKey('iso'), { windowMode: 'isolated' });
-    const iso = await mod.__test__.resolveTabId(undefined, browserKey('iso'), 'https://iso.example/');
-    expect(h.tabs.find((t) => t.id === iso)?.windowId).not.toBe(50);
-    expect(mod.__test__.getDedicatedSlot()?.windowId).toBe(50);
-  });
-
-  it('reports dedicated windows through sessions window-status and the session list', async () => {
-    const h = dedicatedHarness();
-    vi.stubGlobal('chrome', h.chrome);
-    const mod = await import('./background');
-    const key = browserKey('semrush');
-    useDedicated(mod, key, { windowSlot: 'semrush', windowDisplay: '虚拟' });
-    const tabId = await mod.__test__.resolveTabId(undefined, key, 'https://www.semrush.com/');
-    h.tabs.push({ id: 77, windowId: 50, url: 'https://secret.example/?token=1', title: 'secret', active: false, status: 'complete', groupId: -1 });
-
-    const status = await mod.__test__.handleSessions({ id: 's', action: 'sessions', op: 'window-status' } as never);
-    expect(status.ok).toBe(true);
-    const data = status.data as any;
-    expect(data).toMatchObject({ supported: true, protocol: 1 });
-    expect(data.capabilities).toContain('dedicated-window');
-    expect(data.displays).toHaveLength(2);
-    expect(data.windows).toEqual([expect.objectContaining({
-      slot: 'semrush', windowId: 50, exists: true, onDisplay: true,
-      bounds: { left: -2560, top: -1380, width: 1280, height: 900 },
-      activeTab: expect.objectContaining({ tabId, owner: 'lease', session: 'semrush' }),
-      tabs: expect.objectContaining({ leases: 1, foreign: 1 }),
-      sessions: ['semrush'], foreignTabPolicy: 'evict', autoSelect: true,
-    })]);
-    expect(JSON.stringify(data)).not.toContain('secret');
-
-    const listed = await mod.__test__.handleSessions({ id: 'l', action: 'sessions', op: 'list' } as never);
-    expect(listed.data).toEqual([expect.objectContaining({ session: 'semrush', dedicatedSlot: 'semrush', tabActive: true, windowId: 50 })]);
-  });
-
-  it('window-ensure creates or moves the window back onto its display without focusing', async () => {
-    const h = dedicatedHarness();
-    vi.stubGlobal('chrome', h.chrome);
-    const mod = await import('./background');
-    const ensure = (fields: Record<string, unknown>) => mod.__test__.handleSessions({ id: 'e', action: 'sessions', op: 'window-ensure', ...fields } as never);
-
-    const created = (await ensure({ windowSlot: 'semrush', windowDisplay: '虚拟' })).data as any;
-    expect(created).toMatchObject({ slot: 'semrush', created: true, moved: false, onDisplay: true });
-
-    // Dragged back to the main screen by hand.
-    Object.assign(h.windows.get(50)!, { left: 100, top: 100 });
-    const moved = (await ensure({ windowSlot: 'semrush' })).data as any;
-    expect(moved).toMatchObject({ created: false, moved: true, onDisplay: true });
-    expect(h.chrome.windows.update).toHaveBeenCalledWith(50, { left: -2560, top: -1380, width: 1280, height: 900 });
-
-    // Nudged within the display: left alone.
-    Object.assign(h.windows.get(50)!, { left: -2400, top: -1300 });
-    h.chrome.windows.update.mockClear();
-    expect(((await ensure({ windowSlot: 'semrush' })).data as any).moved).toBe(false);
-    expect(h.chrome.windows.update).not.toHaveBeenCalled();
-
-    const missing = (await ensure({ windowSlot: 'other', windowDisplay: 'no-such-display' })).data as any;
-    expect(missing).toMatchObject({ created: true, placement: expect.objectContaining({ displayFound: false }), onDisplay: false });
-    expect(h.chrome.windows.create.mock.calls[1][0]).not.toHaveProperty('left');
-    expect(h.chrome.windows.create.mock.calls[1][0]).toMatchObject({ focused: false });
-  });
-
-  it('reports displays as unavailable when chrome.system.display is missing', async () => {
-    const h = dedicatedHarness({ withDisplayApi: false });
-    vi.stubGlobal('chrome', h.chrome);
-    const mod = await import('./background');
-    const status = (await mod.__test__.handleSessions({ id: 's', action: 'sessions', op: 'window-status' } as never)).data as any;
-    expect(status.displays).toBeNull();
-    expect(status.displaysError).toMatch(/system\.display/);
-  });
-
-  it('restores the dedicated slot after a service-worker restart', async () => {
-    const h = dedicatedHarness();
-    vi.stubGlobal('chrome', h.chrome);
-    const mod = await import('./background');
-    const key = browserKey('semrush');
-    useDedicated(mod, key, { windowSlot: 'semrush', windowBounds: { left: -2480, top: -1380, width: 1280, height: 900 } });
-    const tabId = await mod.__test__.resolveTabId(undefined, key, 'https://www.semrush.com/');
-    await new Promise((resolve) => setTimeout(resolve, 0));
-
-    vi.resetModules();
-    const restarted = await import('./background');
-    await restarted.__test__.reconcileTargetLeaseRegistry();
-    expect(restarted.__test__.getDedicatedSlot('semrush')).toMatchObject({ windowId: 50, placement: { source: 'bounds' } });
-    expect(restarted.__test__.getSession(key)).toMatchObject({ preferredTabId: tabId, windowId: 50 });
-    // The restored lease is not re-adopted into a role container.
-    expect(restarted.__test__.getContainer('interactive').windowId).not.toBe(50);
-  });
-
-  it('keeps the four existing window modes unaware of dedicated state', async () => {
-    const h = dedicatedHarness();
-    vi.stubGlobal('chrome', h.chrome);
-    const mod = await import('./background');
-    // The four pre-dedicated modes still behave exactly as they did — asked for by
-    // name, since `dedicated` is now what a session gets when nobody names a mode.
-    mod.__test__.setDefaultWindowMode('background');
-    const tabId = await mod.__test__.resolveTabId(undefined, browserKey('plain'), 'https://plain.example/');
-    expect(h.tabs.find((t) => t.id === tabId)?.windowId).toBe(2);
-    expect(mod.__test__.getDedicatedSlot()).toBeNull();
-    expect(h.chrome.system.display.getInfo).not.toHaveBeenCalled();
-  });
-});
-
-describe('dedicated automation window — review regressions', () => {
-  beforeEach(() => {
-    vi.resetModules();
-    vi.useRealTimers();
-    MockWebSocket.instances = [];
-    vi.stubGlobal('WebSocket', MockWebSocket);
-    vi.stubGlobal('fetch', vi.fn(() => new Promise(() => {})));
-  });
-  afterEach(async () => {
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    vi.unstubAllGlobals();
-  });
-  const useDedicated = (mod: any, key: string, fields: Record<string, unknown> = {}) => {
-    mod.__test__.sessionOverrides.set(key, { windowMode: 'dedicated' });
-    mod.__test__.applyDedicatedCommandFields(key, { id: 'x', action: 'exec', windowMode: 'dedicated', ...fields });
-  };
-  // tabs.remove that behaves like Chrome: the tab goes away, an emptied window closes.
-  const realRemove = (h: any) => {
-    h.chrome.tabs.remove = vi.fn(async (tabId: number) => {
-      const i = h.tabs.findIndex((t: any) => t.id === tabId);
-      if (i < 0) throw new Error(`No tab with id: ${tabId}`);
-      const [tab] = h.tabs.splice(i, 1);
-      for (const c of h.chrome.tabs.onRemoved.addListener.mock.calls) await c[0](tabId);
-      if (!h.tabs.some((t: any) => t.windowId === tab.windowId)) await h.closeWindow(tab.windowId);
-    });
-  };
-
-  it('treats a tab opened by an automation child as automation too (opener chain)', async () => {
-    const h = dedicatedHarness();
-    vi.stubGlobal('chrome', h.chrome);
-    const mod: any = await import('./background');
-    const key = browserKey('s');
-    useDedicated(mod, key);
-    const lease = await mod.__test__.resolveTabId(undefined, key, 'https://app.example/');
-    h.tabs.push({ id: 78, windowId: 50, url: 'https://app.example/child', active: false, status: 'complete', groupId: -1, openerTabId: lease } as any);
-    h.tabs.push({ id: 79, windowId: 50, url: 'https://sso.example/login', active: false, status: 'complete', groupId: -1, openerTabId: 78 } as any);
-    expect(await mod.__test__.checkDedicatedForeignTab(78)).toBe('ours');
-    expect(await mod.__test__.checkDedicatedForeignTab(79)).toBe('ours');
-    expect(h.tabs.find((t) => t.id === 79)?.windowId).toBe(50);
-  });
-
-  it('keeps the window when two leases of one slot are released at the same time', async () => {
-    const h = dedicatedHarness();
-    vi.stubGlobal('chrome', h.chrome);
-    const mod: any = await import('./background');
-    const a = browserKey('a'); const b = browserKey('b');
-    useDedicated(mod, a); useDedicated(mod, b);
-    await mod.__test__.resolveTabId(undefined, a, 'https://a.example/');
-    await mod.__test__.resolveTabId(undefined, b, 'https://b.example/');
-    realRemove(h);
-    await Promise.all([mod.__test__.releaseLease(a, 'idle timeout'), mod.__test__.releaseLease(b, 'idle timeout')]);
-    expect(h.windows.has(50)).toBe(true);
-    expect(h.tabs.filter((t) => t.windowId === 50)).toHaveLength(1);
-    expect(mod.__test__.getDedicatedSlot()?.placeholderTabIds).toHaveLength(1);
-  });
-
-  it('never hands out a placeholder the person has navigated to their own page', async () => {
-    const h = dedicatedHarness();
-    vi.stubGlobal('chrome', h.chrome);
-    const mod: any = await import('./background');
-    const one = browserKey('one');
-    useDedicated(mod, one);
-    const first = await mod.__test__.resolveTabId(undefined, one, 'https://one.example/');
-    await mod.__test__.releaseLease(one, 'test');
-    h.tabs.find((t) => t.id === first)!.url = 'https://mail.example/inbox/draft';
-    const two = browserKey('two');
-    useDedicated(mod, two);
-    const second = await mod.__test__.resolveTabId(undefined, two, 'https://two.example/');
-    expect(second).not.toBe(first);
-    expect(h.tabs.find((t) => t.id === first)?.url).toBe('https://mail.example/inbox/draft');
-  });
-
-  it('keeps the lease when moving its tab empties (and closes) the source window', async () => {
-    const h = dedicatedHarness();
-    for (let i = h.tabs.length - 1; i >= 0; i -= 1) if (h.tabs[i].windowId === 1) h.tabs.splice(i, 1);
-    h.tabs.push({ id: 40, windowId: 1, url: 'https://app.example/x', active: true, status: 'complete', groupId: -1 });
-    const origMove = h.chrome.tabs.move;
-    h.chrome.tabs.move = vi.fn(async (tabId: number, props: any) => {
-      const from = h.tabs.find((t) => t.id === tabId)!.windowId;
-      const res = await origMove(tabId, props);
-      if (!h.tabs.some((t) => t.windowId === from)) {
-        h.windows.delete(from);
-        Promise.resolve().then(() => { for (const c of h.chrome.windows.onRemoved.addListener.mock.calls) void c[0](from); });
-      }
-      return res;
-    });
-    vi.stubGlobal('chrome', h.chrome);
-    const mod: any = await import('./background');
-    const key = browserKey('s');
-    mod.__test__.setSession(key, { windowId: 1, owned: true, preferredTabId: 40 });
-    useDedicated(mod, key);
-    await mod.__test__.resolveTabId(undefined, key);
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(mod.__test__.getSession(key)).toMatchObject({ preferredTabId: 40, windowId: 50 });
-  });
-
-  it('gives concurrently ensured slots on one display different tiles', async () => {
-    const h = dedicatedHarness();
-    vi.stubGlobal('chrome', h.chrome);
-    const mod: any = await import('./background');
-    const ensure = (slot: string) => mod.__test__.handleSessions({ id: slot, action: 'sessions', op: 'window-ensure', windowSlot: slot, windowDisplay: '虚拟' });
-    await Promise.all([ensure('semrush'), ensure('similarweb')]);
-    const rects = h.chrome.windows.create.mock.calls.map((x: any) => [x[0].left, x[0].top]);
-    expect(rects[0]).not.toEqual(rects[1]);
-  });
-
-  it('replaces earlier bounds when a later command asks for a display', async () => {
-    const h = dedicatedHarness();
-    vi.stubGlobal('chrome', h.chrome);
-    const mod: any = await import('./background');
-    const key = browserKey('s');
-    useDedicated(mod, key, { windowBounds: { left: 10, top: 10, width: 800, height: 600 } });
-    mod.__test__.applyDedicatedCommandFields(key, { id: 'y', action: 'exec', windowMode: 'dedicated', windowDisplay: '虚拟' });
-    await mod.__test__.resolveTabId(undefined, key, 'https://a.example/');
-    expect(h.chrome.windows.create.mock.calls[0][0]).toMatchObject({ left: -2560, top: -1380 });
-  });
-
-  it('forgets a placeholder of slot A once it is dragged into slot B\'s window', async () => {
-    const h = dedicatedHarness();
-    vi.stubGlobal('chrome', h.chrome);
-    const mod: any = await import('./background');
-    await mod.__test__.handleSessions({ id: 'e', action: 'sessions', op: 'window-ensure', windowSlot: 'A' });
-    await mod.__test__.handleSessions({ id: 'e', action: 'sessions', op: 'window-ensure', windowSlot: 'B' });
-    const pA = mod.__test__.getDedicatedSlot('A').placeholderTabIds[0];
-    h.tabs.find((t) => t.id === pA)!.windowId = 51;
-    mod.__test__.setForeignTabSettleMs(0);
-    await mod.__test__.handleTabAttached(pA, { newWindowId: 51 });
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(mod.__test__.getDedicatedSlot('A').placeholderTabIds).not.toContain(pA);
-    expect([1, 2]).toContain(h.tabs.find((t) => t.id === pA)?.windowId);
-  });
-
-  it('adopts its marked window after an extension reload wiped session storage', async () => {
-    const h = dedicatedHarness();
-    vi.stubGlobal('chrome', h.chrome);
-    const mod: any = await import('./background');
-    await mod.__test__.handleSessions({ id: 'e', action: 'sessions', op: 'window-ensure', windowSlot: 'semrush' });
-    expect(h.tabs.find((t) => t.windowId === 50)?.url).toBe('about:blank#opencli-dedicated=semrush');
-    for (const key of Object.keys((await h.chrome.storage.session.get(null as any)) ?? {})) void key;
-    vi.resetModules();
-    // Reload: storage.session is cleared.
-    h.chrome.storage.session.get = vi.fn(async (key: string) => ({ [key]: undefined }));
-    h.chrome.tabs.query = vi.fn(async (q: any = {}) => h.tabs.filter((t) => q.windowId === undefined || t.windowId === q.windowId));
-    const reloaded: any = await import('./background');
-    await reloaded.__test__.reconcileTargetLeaseRegistry();
-    const res = (await reloaded.__test__.handleSessions({ id: 'e2', action: 'sessions', op: 'window-ensure', windowSlot: 'semrush' })).data;
-    expect(res).toMatchObject({ windowId: 50, created: false });
-    expect(h.chrome.windows.create).toHaveBeenCalledTimes(1);
-  });
-
-  it('does not move a fullscreen or minimized dedicated window', async () => {
-    const h = dedicatedHarness();
-    vi.stubGlobal('chrome', h.chrome);
-    const mod: any = await import('./background');
-    await mod.__test__.handleSessions({ id: 'e', action: 'sessions', op: 'window-ensure', windowSlot: 's', windowDisplay: '虚拟' });
-    Object.assign(h.windows.get(50)!, { left: 0, top: 0, state: 'fullscreen' });
-    const res = (await mod.__test__.handleSessions({ id: 'e', action: 'sessions', op: 'window-ensure', windowSlot: 's' })).data;
-    expect(res).toMatchObject({ moved: false, state: 'fullscreen', onDisplay: false });
-    expect(h.chrome.windows.update).not.toHaveBeenCalled();
-  });
-});
-
-// ─── Window pool, dynamic layout, idle reaping (2026-09-14) ──────────────
-describe('dedicated automation window — pool and layout', () => {
-  beforeEach(() => {
-    vi.resetModules();
-    vi.useRealTimers();
-    MockWebSocket.instances = [];
-    vi.stubGlobal('WebSocket', MockWebSocket);
-    vi.stubGlobal('fetch', vi.fn(() => new Promise(() => {})));
-  });
-  afterEach(async () => {
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    vi.unstubAllGlobals();
-  });
-
-  const useDedicated = (mod: any, key: string, fields: Record<string, unknown> = {}) => {
-    mod.__test__.sessionOverrides.set(key, { windowMode: 'dedicated' });
-    mod.__test__.applyDedicatedCommandFields(key, { id: 'x', action: 'exec', windowMode: 'dedicated', ...fields });
-  };
-  const overlaps = (a: any, b: any) => a.left < b.left + b.width && b.left < a.left + a.width
-    && a.top < b.top + b.height && b.top < a.top + a.height;
-
-  it.each([
-    [5120, 2850, 4, 3], [3840, 2160, 3, 2], [2560, 1440, 2, 2],
-    [1920, 1080, 2, 1], [1512, 949, 1, 1], [1024, 700, 1, 1], [3440, 1441, 3, 2],
-  ])('resolution %i×%i has a fixed %i×%i grid that fills the work area', async (width, height, cols, rows) => {
-    vi.stubGlobal('chrome', dedicatedHarness().chrome);
-    const mod = await import('./background');
-    const area = { left: -width, top: 25, width, height };
-    const grid = mod.__test__.dedicatedGrid(area, 1)!;
-    expect(grid).toMatchObject({ cols, rows });
-    expect(mod.__test__.dedicatedGrid(area, 100)).toEqual(grid);
-    const tiles = Array.from({ length: cols * rows }, (_, i) => mod.__test__.dedicatedTile(area, i, 1));
-    expect(tiles.reduce((sum, t) => sum + t.width * t.height, 0)).toBe(width * height);
-    for (const [i, tile] of tiles.entries()) {
-      expect(tile.width).toBeGreaterThanOrEqual(Math.min(900, width));
-      expect(tile.height).toBeGreaterThanOrEqual(Math.min(620, height));
-      expect(tile).toEqual(mod.__test__.dedicatedTile(area, i, 100));
-      for (const other of tiles.slice(i + 1)) expect(overlaps(tile, other)).toBe(false);
-    }
-  });
-
-  it('grid/tile/capacity: tiles never overlap, never shrink past the minimum, and capacity is honest', async () => {
-    vi.stubGlobal('chrome', dedicatedHarness().chrome);
-    const mod = await import('./background');
-    const area = { left: -2560, top: -1440, width: 2560, height: 1440 };
-    expect(mod.__test__.dedicatedGrid(area, 1)).toMatchObject({ cols: 2, rows: 2, width: 1280, height: 720 });
-    const capacity = mod.__test__.dedicatedCapacity(area);
-    expect(capacity).toBeGreaterThanOrEqual(2);
-    expect({
-      grid: mod.__test__.dedicatedGrid(area, capacity + 1),
-      first: mod.__test__.dedicatedTile(area, 0, capacity + 1),
-      overflow: mod.__test__.dedicatedTile(area, capacity, capacity + 1),
-    }).toEqual({
-      grid: mod.__test__.dedicatedGrid(area),
-      first: mod.__test__.dedicatedTile(area, 0, capacity),
-      overflow: { left: area.left + 80, top: area.top + 60, width: 1280, height: 720 },
-    });
-    for (let n = 1; n <= capacity; n += 1) {
-      const rects = Array.from({ length: n }, (_, i) => mod.__test__.dedicatedTile(area, i, n));
-      expect(rects.every((r: any) => r !== null)).toBe(true);
-      for (let i = 0; i < n; i += 1) {
-        for (let j = i + 1; j < n; j += 1) expect(overlaps(rects[i], rects[j])).toBe(false);
-        expect(rects[i].left).toBeGreaterThanOrEqual(area.left);
-        expect(rects[i].top).toBeGreaterThanOrEqual(area.top);
-        expect(rects[i].left + rects[i].width).toBeLessThanOrEqual(area.left + area.width);
-        expect(rects[i].top + rects[i].height).toBeLessThanOrEqual(area.top + area.height);
-      }
-    }
-  });
-
-  it('picks a secondary, non-internal display for automation and never the built-in one', async () => {
-    vi.stubGlobal('chrome', dedicatedHarness().chrome);
-    const mod = await import('./background');
-    const internal = { id: '1', name: '', primary: true, internal: true, bounds: { left: 0, top: 0, width: 1512, height: 982 }, workArea: null };
-    const virt = { id: '8', name: '', primary: false, internal: false, bounds: { left: -2560, top: -1440, width: 2560, height: 1440 }, workArea: null };
-    expect(mod.__test__.pickAutomationDisplays([internal, { ...virt, id: '10' }, { ...virt, id: '9', internal: true }, virt]).map(d => d.id)).toEqual(['8', '10', '9']);
-    // Lid closed: the virtual screen is the only one left and inherits `primary`.
-    expect(mod.__test__.pickAutomationDisplays([{ ...virt, primary: true }]).map(d => d.id)).toEqual(['8']);
-    expect(mod.__test__.pickAutomationDisplays([])).toEqual([]);
-  });
-
-  it('mouse screen changes affect only new assignments, with mouse-screen fallback when other grids fill', async () => {
-    const h = dedicatedHarness();
-    h.displays[1].id = '20';
-    h.displays.push({ ...h.displays[1], id: '21', name: 'Virtual B', bounds: { left: 1512, top: 0, width: 2560, height: 1440 }, workArea: { left: 1512, top: 0, width: 2560, height: 1440 } });
-    vi.stubGlobal('chrome', h.chrome);
-    const mod = await import('./background');
-    await mod.__test__.ensureDedicatedWindow('a', { avoidDisplayBounds: h.displays[1].bounds });
-    expect(mod.__test__.getDedicatedSlot('a')!.displayId).toBe('21');
-    const old = { ...h.windows.get(50)! };
-    await mod.__test__.ensureDedicatedWindow('a', { avoidDisplayBounds: h.displays[2].bounds });
-    expect(h.windows.get(50)).toEqual(old);
-    for (const slot of ['b', 'c', 'd', 'e']) {
-      await mod.__test__.ensureDedicatedWindow(slot, { avoidDisplayBounds: h.displays[2].bounds });
-      expect(mod.__test__.getDedicatedSlot(slot)!.displayId).toBe('20');
-    }
-    await mod.__test__.ensureDedicatedWindow('f', { avoidDisplayBounds: h.displays[2].bounds });
-    expect(mod.__test__.getDedicatedSlot('f')).toMatchObject({ displayId: '21', tileIndex: 1 });
-    expect(h.windows.get(50)).toEqual(old);
-    h.chrome.windows.update.mockClear();
-    await mod.__test__.reconcileDedicatedWindows();
-    expect(h.chrome.windows.update).not.toHaveBeenCalled();
-  });
-
-  it('opening/closing windows leaves other bounds unchanged and reuses the smallest free cell', async () => {
-    const h = dedicatedHarness();
-    h.chrome.windows.remove = vi.fn(h.closeWindow);
-    vi.stubGlobal('chrome', h.chrome);
-    const mod = await import('./background');
-    await mod.__test__.ensureDedicatedWindow('a');
-    const first = { ...h.windows.get(50)! };
-    await mod.__test__.ensureDedicatedWindow('b');
-    await mod.__test__.ensureDedicatedWindow('c');
-    const third = { ...h.windows.get(52)! };
-    h.chrome.windows.update.mockClear();
-    await mod.__test__.closeDedicatedWindows({ slot: 'b' });
-    await mod.__test__.ensureDedicatedWindow('d');
-    expect(mod.__test__.getDedicatedSlot('d')!.tileIndex).toBe(1);
-    expect(h.windows.get(50)).toEqual(first);
-    expect(h.windows.get(52)).toEqual(third);
-    expect(h.chrome.windows.update).not.toHaveBeenCalled();
-  });
-
-  it.each(['maximized', 'fullscreen', 'minimized', 'normal'])('reconciles a displaced %s window without focusing and is idempotent', async state => {
-    const h = dedicatedHarness();
-    vi.stubGlobal('chrome', h.chrome);
-    const mod = await import('./background');
-    await mod.__test__.ensureDedicatedWindow('heal');
-    const target = mod.__test__.getDedicatedSlot('heal')!.placement.requestedBounds!;
-    Object.assign(h.windows.get(50)!, { state, left: 10, top: 20, width: 1440, height: 900 });
-    h.chrome.windows.update.mockClear();
-    const result = await mod.__test__.handleSessions({ id: 'r', action: 'sessions', op: 'window-relayout' });
-    expect(result.data).toMatchObject({ changed: 1, windows: [{ slot: 'heal', displayId: 'virt', tileIndex: 0, changed: true,
-      old: { bounds: { left: 10, top: 20, width: 1440, height: 900 }, state }, new: { bounds: target, state: 'normal' } }] });
-    expect(h.windows.get(50)).toMatchObject({ ...target, state: 'normal', focused: false });
-    if (state !== 'normal') expect(h.chrome.windows.update.mock.calls[0]).toEqual([50, { state: 'normal' }]);
-    for (const call of h.chrome.windows.update.mock.calls) expect(call[1]).not.toHaveProperty('focused');
-    expect(mod.__test__.getDedicatedSlot('heal')!.reconciledAt).toEqual(expect.any(Number));
-    h.chrome.windows.update.mockClear();
-    h.chrome.storage.session.set.mockClear();
-    await mod.__test__.reconcileDedicatedWindows();
-    expect(h.chrome.windows.update).not.toHaveBeenCalled();
-    expect(h.chrome.storage.session.set).not.toHaveBeenCalled();
-  });
-
-  it('display-change events heal moved bounds, resize grids and move only windows whose display disappeared', async () => {
-    const h = dedicatedHarness();
-    h.displays[1].id = '20';
-    h.displays.push({ ...h.displays[1], id: '21', name: 'Virtual B', bounds: { left: 1512, top: 0, width: 2560, height: 1440 }, workArea: { left: 1512, top: 0, width: 2560, height: 1440 } });
-    vi.stubGlobal('chrome', h.chrome);
-    const mod = await import('./background');
-    await mod.__test__.ensureDedicatedWindow('a');
-    await mod.__test__.ensureDedicatedWindow('b', { avoidDisplayBounds: h.displays[1].bounds });
-    const b = { ...h.windows.get(51)! };
-    const event = h.chrome.system.display.onDisplayChanged.addListener.mock.calls[0][0];
-    Object.assign(h.windows.get(50)!, { left: 0, state: 'maximized' });
-    await event();
-    expect(h.windows.get(50)).toMatchObject({ left: -2560, state: 'normal' });
-    h.displays[1].workArea.width = 1920;
-    await event();
-    expect(h.windows.get(50)!.width).toBe(960);
-    expect(h.windows.get(51)).toEqual(b);
-    h.displays.splice(1, 1);
-    await event();
-    expect(mod.__test__.getDedicatedSlot('a')).toMatchObject({ displayId: '21', tileIndex: 1 });
-    expect(h.windows.get(51)).toEqual(b);
-  });
-
-  it('reassigns slots 4 and 5 into distinct normal cells after a 5120×2850 screen shrinks', async () => {
-    const h = dedicatedHarness();
-    h.displays[1].bounds = h.displays[1].workArea = { left: 0, top: 0, width: 5120, height: 2850 };
-    vi.stubGlobal('chrome', h.chrome);
-    const mod = await import('./background');
-    for (let i = 0; i < 6; i += 1) await mod.__test__.ensureDedicatedWindow(`shrink-${i}`);
-    for (let i = 0; i < 4; i += 1) await h.closeWindow(50 + i);
-    expect(mod.__test__.getDedicatedSlot('shrink-4')!.tileIndex).toBe(4);
-    expect(mod.__test__.getDedicatedSlot('shrink-5')!.tileIndex).toBe(5);
-    h.displays[1].bounds = h.displays[1].workArea = { left: 0, top: 0, width: 2560, height: 1440 };
-    await mod.__test__.reconcileDedicatedWindows();
-    for (let i = 0; i < 2; i += 1) {
-      expect(mod.__test__.getDedicatedSlot(`shrink-${i + 4}`)).toMatchObject({ displayId: 'virt', tileIndex: i });
-      expect(h.windows.get(54 + i)).toMatchObject(mod.__test__.dedicatedTile(h.displays[1].workArea, i));
-    }
-    expect(overlaps(h.windows.get(54), h.windows.get(55))).toBe(false);
-  });
-
-  it('preserves valid cells on two virtual screens and moves excess cells to the next free grid', async () => {
-    const h = dedicatedHarness();
-    h.displays[1].id = '20';
-    h.displays[1].bounds = h.displays[1].workArea = { left: -5120, top: 0, width: 5120, height: 2850 };
-    h.displays.push({ ...h.displays[1], id: '21', name: 'Virtual B', bounds: { left: 1512, top: 0, width: 2560, height: 1440 }, workArea: { left: 1512, top: 0, width: 2560, height: 1440 } });
-    vi.stubGlobal('chrome', h.chrome);
-    const mod = await import('./background');
-    await mod.__test__.ensureDedicatedWindow('stable', { avoidDisplayBounds: h.displays[1].bounds });
-    const stable = { ...h.windows.get(50)! };
-    for (let i = 0; i < 6; i += 1) await mod.__test__.ensureDedicatedWindow(`shrink-${i}`);
-    h.displays[1].bounds = h.displays[1].workArea = { left: -2560, top: 0, width: 2560, height: 1440 };
-    await mod.__test__.reconcileDedicatedWindows();
-    expect(h.windows.get(50)).toEqual(stable);
-    for (let i = 0; i < 6; i += 1) {
-      const display = h.displays[i < 4 ? 1 : 2];
-      const index = i < 4 ? i : i - 3;
-      expect(mod.__test__.getDedicatedSlot(`shrink-${i}`)).toMatchObject({ displayId: display.id, tileIndex: index });
-      expect(h.windows.get(51 + i)).toMatchObject(mod.__test__.dedicatedTile(display.workArea, index));
-    }
-    const windows = [...h.windows.values()].filter(w => w.id >= 50);
-    for (const [i, win] of windows.entries()) {
-      for (const other of windows.slice(i + 1)) expect(overlaps(win, other)).toBe(false);
-    }
-  });
-
-  it('restores a legacy window into another screen before cascading on its full remembered screen', async () => {
-    const h = dedicatedHarness();
-    h.displays[1].id = '20';
-    h.displays.push({ ...h.displays[1], id: '21', name: 'Virtual B', bounds: { left: 1512, top: 0, width: 2560, height: 1440 }, workArea: { left: 1512, top: 0, width: 2560, height: 1440 } });
-    vi.stubGlobal('chrome', h.chrome);
-    const mod = await import('./background');
-    for (let i = 0; i < 4; i += 1) await mod.__test__.ensureDedicatedWindow(`full-${i}`);
-    await mod.__test__.ensureDedicatedWindow('legacy');
-    const storage = await h.chrome.storage.session.get('opencli_dedicated_windows_v1');
-    const legacy = storage.opencli_dedicated_windows_v1.slots.legacy;
-    delete legacy.displayId;
-    legacy.placement.requestedBounds = { ...h.displays[1].workArea, width: 1280, height: 720 };
-    await h.chrome.storage.session.set(storage);
-    await mod.__test__.restoreDedicatedState();
-    await mod.__test__.reconcileDedicatedWindows();
-    expect(mod.__test__.getDedicatedSlot('legacy')).toMatchObject({ displayId: '21', tileIndex: 0 });
-    expect(h.windows.get(54)).toMatchObject(mod.__test__.dedicatedTile(h.displays[2].workArea, 0));
-  });
-
-  it('reuses the 30-second alarm for reconciliation and preserves half width', async () => {
-    const h = dedicatedHarness();
-    vi.stubGlobal('chrome', h.chrome);
-    const mod = await import('./background');
-    mod.__test__.setDedicatedIdleTtlMs(60_000);
-    await mod.__test__.ensureDedicatedWindow('half', { half: true });
-    Object.assign(h.windows.get(50)!, { left: 0, width: 1440, state: 'minimized' });
-    const alarm = h.chrome.alarms.onAlarm.addListener.mock.calls[0][0];
-    await alarm({ name: 'opencli-dedicated-reap' });
-    expect(h.windows.get(50)).toMatchObject({ left: -2560, width: 640, height: 720, state: 'normal' });
-    expect(h.chrome.alarms.create).toHaveBeenCalledWith('opencli-dedicated-reap', { periodInMinutes: 0.5 });
-  });
-
-  it('command preflight heals windows but leaves explicit bounds/display placements alone', async () => {
-    const h = dedicatedHarness();
-    vi.stubGlobal('chrome', h.chrome);
-    const mod = await import('./background');
-    await mod.__test__.ensureDedicatedWindow('auto');
-    await mod.__test__.ensureDedicatedWindow('explicit', { bounds: { left: -2000, top: -1000, width: 1000, height: 800 } });
-    await mod.__test__.ensureDedicatedWindow('display', { display: '虚拟' });
-    for (const id of [50, 51, 52]) Object.assign(h.windows.get(id)!, { left: 10, state: 'maximized' });
-    await mod.__test__.handleCommand({ id: 'command', action: 'unknown', session: 'layout-check' } as never);
-    expect(h.windows.get(50)).toMatchObject({ left: -2560, state: 'normal' });
-    expect(h.windows.get(51)).toMatchObject({ left: 10, state: 'maximized' });
-    expect(h.windows.get(52)).toMatchObject({ left: 10, state: 'maximized' });
-  });
-
-  it('persists fixed assignments across worker restore and forgets vanished windows', async () => {
-    const h = dedicatedHarness();
-    vi.stubGlobal('chrome', h.chrome);
-    const mod = await import('./background');
-    await mod.__test__.ensureDedicatedWindow('a');
-    await mod.__test__.ensureDedicatedWindow('b');
-    const old = { ...h.windows.get(51)! };
-    await mod.__test__.restoreDedicatedState();
-    expect(mod.__test__.getDedicatedSlot('b')).toMatchObject({ displayId: 'virt', tileIndex: 1 });
-    h.windows.delete(50);
-    await mod.__test__.reconcileDedicatedWindows();
-    expect(mod.__test__.getDedicatedSlot('a')).toMatchObject({ windowId: null, displayId: null, tileIndex: null });
-    expect(h.windows.get(51)).toEqual(old);
-  });
-
-  it('adopts a legacy registry on its original screen when displayId is absent', async () => {
-    const h = dedicatedHarness();
-    h.displays[1].id = '20';
-    h.displays.push({ ...h.displays[1], id: '21', name: 'Virtual B', bounds: { left: 1512, top: 0, width: 2560, height: 1440 }, workArea: { left: 1512, top: 0, width: 2560, height: 1440 } });
-    vi.stubGlobal('chrome', h.chrome);
-    const mod = await import('./background');
-    await mod.__test__.ensureDedicatedWindow('legacy', { avoidDisplayBounds: h.displays[1].bounds });
-    const snapshot = { ...h.windows.get(50)! };
-    const storage = await h.chrome.storage.session.get('opencli_dedicated_windows_v1');
-    delete storage.opencli_dedicated_windows_v1.slots.legacy.displayId;
-    await h.chrome.storage.session.set(storage);
-    await mod.__test__.restoreDedicatedState();
-    await mod.__test__.reconcileDedicatedWindows();
-    expect(mod.__test__.getDedicatedSlot('legacy')).toMatchObject({ displayId: '21', tileIndex: 0 });
-    expect(h.windows.get(50)).toEqual(snapshot);
-  });
-
-  it('a failed creation cannot retain a cell later occupied by another window, and creation/reconcile serialize', async () => {
-    const h = dedicatedHarness();
-    vi.stubGlobal('chrome', h.chrome);
-    const mod = await import('./background');
-    h.chrome.windows.create.mockRejectedValueOnce(new Error('mock creation failed'));
-    await expect(mod.__test__.ensureDedicatedWindow('retry')).rejects.toThrow('mock creation failed');
-    await mod.__test__.ensureDedicatedWindow('a');
-    const old = { ...h.windows.get(50)! };
-    await Promise.all([
-      mod.__test__.ensureDedicatedWindow('retry'),
-      mod.__test__.reconcileDedicatedWindows(),
-      mod.__test__.ensureDedicatedWindow('b'),
-    ]);
-    expect(mod.__test__.getDedicatedSlot('a')!.tileIndex).toBe(0);
-    expect(mod.__test__.getDedicatedSlot('retry')!.tileIndex).toBe(1);
-    expect(mod.__test__.getDedicatedSlot('b')!.tileIndex).toBe(2);
-    expect(h.windows.get(50)).toEqual(old);
-  });
-
-  it('status exposes each screen grid and never includes primary while secondary screens exist', async () => {
-    const h = dedicatedHarness();
-    h.displays[1].bounds = { left: -5120, top: 0, width: 5120, height: 2880 };
-    h.displays[1].workArea = { left: -5120, top: 0, width: 5120, height: 2850 };
-    h.displays.push({ ...h.displays[1], id: '21', name: 'Virtual B', bounds: { left: 1512, top: 0, width: 5120, height: 2880 }, workArea: { left: 1512, top: 0, width: 5120, height: 2850 } });
-    vi.stubGlobal('chrome', h.chrome);
-    const mod = await import('./background');
-    await mod.__test__.ensureDedicatedWindow('a', { avoidDisplayBounds: h.displays[1].bounds });
-    const status = (await mod.__test__.handleDedicatedWindowOp({ id: 's', action: 'sessions', op: 'window-status' })).data as any;
-    expect(status.pool).toMatchObject({ naturalCapacity: 24, capacity: 24 });
-    expect(status.pool.automationDisplays).toHaveLength(2);
-    for (const d of status.pool.automationDisplays) expect(d).toMatchObject({ cols: 4, rows: 3, tile: { width: 1280, height: 950 }, naturalCapacity: 12 });
-    expect(status.windows[0]).toMatchObject({ displayId: '21', tileIndex: 0, reconciledAt: expect.any(Number) });
-    h.displays.splice(1);
-    const fallback = (await mod.__test__.handleDedicatedWindowOp({ id: 's2', action: 'sessions', op: 'window-status' })).data as any;
-    expect(fallback.pool.automationDisplays).toMatchObject([{ id: 'main', cols: 1, rows: 1 }]);
-    expect(fallback.windows[0].displayId).toBe('main');
-  });
-
-  it('ten one-shot sessions in a row reuse one window instead of opening ten', async () => {
-    const h = dedicatedHarness();
-    vi.stubGlobal('chrome', h.chrome);
-    const mod = await import('./background');
-    const windowIds = new Set<number>();
-    for (let i = 0; i < 10; i += 1) {
-      const key = browserKey(`one-shot-${i}`);
-      useDedicated(mod, key);
-      const tabId = await mod.__test__.resolveTabId(undefined, key, `https://run-${i}.example/`);
-      windowIds.add(h.tabs.find((t: any) => t.id === tabId)!.windowId);
-      await mod.__test__.releaseLease(key, 'test');
-    }
-    expect(windowIds.size).toBe(1);
-    expect(h.chrome.windows.create).toHaveBeenCalledTimes(1);
-    expect(mod.__test__.dedicatedSlotNames()).toHaveLength(1);
-    // The one window it kept is idle and named by the pool, not by any session.
-    const slot = mod.__test__.getDedicatedSlot();
-    expect(slot).not.toBeNull();
-    expect(slot!.pooled).toBe(true);
-    expect(slot!.slot).toMatch(/^pool-\d+$/);
-    expect(slot!.holders).toEqual([]);
-  });
-
-  it('concurrent sessions each get their own window, tiled without overlap on the automation display', async () => {
-    const h = dedicatedHarness();
-    vi.stubGlobal('chrome', h.chrome);
-    const mod = await import('./background');
-    const keys = ['a', 'b', 'c'].map((n) => browserKey(`conc-${n}`));
-    const tabIds: number[] = [];
-    for (const key of keys) {
-      useDedicated(mod, key);
-      tabIds.push(await mod.__test__.resolveTabId(undefined, key, `https://${key}.example/`));
-    }
-    const windowIds = tabIds.map((id) => h.tabs.find((t: any) => t.id === id)!.windowId);
-    expect(new Set(windowIds).size).toBe(3);
-    const rects = windowIds.map((id) => h.windows.get(id)!);
-    for (let i = 0; i < rects.length; i += 1) {
-      for (let j = i + 1; j < rects.length; j += 1) expect(overlaps(rects[i], rects[j])).toBe(false);
-      // On the virtual display (negative origin), never on the person's screen.
-      expect(rects[i].left).toBeLessThan(0);
-      expect(rects[i].focused).toBe(false);
-    }
-    // Freeing one hands its window back to the pool for the next caller.
-    await mod.__test__.releaseLease(keys[0], 'test');
-    const next = browserKey('conc-d');
-    useDedicated(mod, next);
-    const reused = await mod.__test__.resolveTabId(undefined, next, 'https://d.example/');
-    expect(h.tabs.find((t: any) => t.id === reused)!.windowId).toBe(windowIds[0]);
-    expect(h.chrome.windows.create).toHaveBeenCalledTimes(3);
-  });
-
-  it('refuses a live window beyond the adaptive pool capacity', async () => {
-    const h = dedicatedHarness();
-    vi.stubGlobal('chrome', h.chrome);
-    const mod = await import('./background');
-    const status = await mod.__test__.handleDedicatedWindowOp({ id: 'capacity', action: 'sessions', op: 'window-list' });
-    const capacity = Math.max(4, (status.data as any).pool.naturalCapacity ?? 4);
-    for (let i = 0; i < capacity; i += 1) {
-      const key = browserKey(`full-${i}`);
-      useDedicated(mod, key);
-      await mod.__test__.resolveTabId(undefined, key, `https://full-${i}.example/`);
-    }
-    const overflow = browserKey('overflow');
-    useDedicated(mod, overflow);
-    await expect(mod.__test__.resolveTabId(undefined, overflow, 'https://overflow.example/'))
-      .rejects.toThrow(new RegExp(`dedicated-pool-exhausted: ${capacity} .*capacity ${capacity}.*naturalCapacity.*cascaded`));
-    expect(h.chrome.windows.create).toHaveBeenCalledTimes(capacity);
-    // The failed command holds nothing: its would-be slot is idle, so it is reusable
-    // and reapable instead of pinning a window nobody owns.
-    const stranded = mod.__test__.dedicatedSlotNames().filter((n: string) => {
-      expect(mod.__test__.getDedicatedSlot(n)).not.toBeNull();
-      return !mod.__test__.getDedicatedSlot(n)!.windowId;
-    });
-    for (const name of stranded) {
-      expect(mod.__test__.getDedicatedSlot(name)).not.toBeNull();
-      expect(mod.__test__.getDedicatedSlot(name)!.holders).toEqual([]);
-    }
-  });
-
-  it('closes an idle window once its TTL passes, and never one that is still held', async () => {
-    const h = dedicatedHarness();
-    vi.stubGlobal('chrome', h.chrome);
-    const mod = await import('./background');
-    h.chrome.windows.remove = vi.fn(async (id: number) => { await h.closeWindow(id); });
-    const held = browserKey('held');
-    const done = browserKey('done');
-    useDedicated(mod, held);
-    useDedicated(mod, done);
-    const heldTab = await mod.__test__.resolveTabId(undefined, held, 'https://held.example/');
-    await mod.__test__.resolveTabId(undefined, done, 'https://done.example/');
-    await mod.__test__.releaseLease(done, 'test');
-
-    mod.__test__.setDedicatedIdleTtlMs(60_000);
-    expect(await mod.__test__.reapIdleDedicatedWindows()).toBe(0); // too young
-    mod.__test__.setDedicatedIdleTtlMs(1);
-    await new Promise((r) => setTimeout(r, 5));
-    expect(await mod.__test__.reapIdleDedicatedWindows()).toBe(1);
-    // The held session's window is untouched, and its slot is still there.
-    expect(h.tabs.find((t: any) => t.id === heldTab)).toBeTruthy();
-    expect(mod.__test__.dedicatedSlotNames()).toHaveLength(1);
-  });
-
-  it('window-close closes a window on request, and refuses a busy one unless forced', async () => {
-    const h = dedicatedHarness();
-    vi.stubGlobal('chrome', h.chrome);
-    const mod = await import('./background');
-    h.chrome.windows.remove = vi.fn(async (id: number) => { await h.closeWindow(id); });
-    const key = browserKey('busy');
-    useDedicated(mod, key);
-    await mod.__test__.resolveTabId(undefined, key, 'https://busy.example/');
-    expect(mod.__test__.getDedicatedSlot()).not.toBeNull();
-    const slot = mod.__test__.getDedicatedSlot()!.slot;
-
-    const refused = await mod.__test__.handleDedicatedWindowOp({ id: '1', action: 'sessions', op: 'window-close', windowSlot: slot });
-    expect((refused.data as { closed: string[]; skipped: { slot: string }[] }).closed).toEqual([]);
-    expect((refused.data as { skipped: { slot: string }[] }).skipped[0]).toMatchObject({ slot });
-    expect(h.chrome.windows.remove).not.toHaveBeenCalled();
-
-    const forced = await mod.__test__.handleDedicatedWindowOp({ id: '2', action: 'sessions', op: 'window-close', windowSlot: slot, force: true });
-    expect((forced.data as { closed: string[] }).closed).toEqual([slot]);
-    expect(h.chrome.windows.remove).toHaveBeenCalled();
-    expect(mod.__test__.dedicatedSlotNames()).toEqual([]);
-  });
-
-  it('window-status reports pool capacity, how many windows are live and how many are free', async () => {
-    const h = dedicatedHarness();
-    vi.stubGlobal('chrome', h.chrome);
-    const mod = await import('./background');
-    const key = browserKey('pool-status');
-    useDedicated(mod, key);
-    await mod.__test__.resolveTabId(undefined, key, 'https://status.example/');
-    const res = await mod.__test__.handleDedicatedWindowOp({ id: '1', action: 'sessions', op: 'window-list' });
-    type Display = { id: string; area: { left: number; top: number; width: number; height: number }; primary: boolean };
-    const data = res.data as {
-      capabilities: string[];
-      pool: { naturalCapacity: number; capacity: number; automationDisplays: Display[]; automationDisplay: Display };
-      windows: unknown[];
-    };
-    expect(data.capabilities).toEqual(expect.arrayContaining(['window-pool', 'window-close', 'window-list', 'idle-reap', 'auto-display', 'dynamic-layout']));
-    expect(data.pool).toMatchObject({ live: 1, idle: 0, free: Math.max(4, data.pool.naturalCapacity ?? 4) - 1, naturalCapacity: data.pool.automationDisplays.reduce((sum: number, d: any) => sum + mod.__test__.dedicatedCapacity(d.area), 0), automationDisplays: [expect.objectContaining({ id: data.pool.automationDisplay.id, naturalCapacity: mod.__test__.dedicatedCapacity(data.pool.automationDisplay.area) })] });
-    expect(data.pool.capacity).toBe(Math.max(4, data.pool.naturalCapacity ?? 4));
-    expect(data.pool.automationDisplay.primary).toBe(false);
-    expect(data.windows[0]).toMatchObject({ pooled: true, busy: true, holders: 1 });
-  });
-});
-
-describe('dedicated automation window — holder bookkeeping', () => {
-  beforeEach(() => {
-    vi.resetModules();
-    vi.useRealTimers();
-    MockWebSocket.instances = [];
-    vi.stubGlobal('WebSocket', MockWebSocket);
-    vi.stubGlobal('fetch', vi.fn(() => new Promise(() => {})));
-  });
-  afterEach(async () => {
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    vi.unstubAllGlobals();
-  });
-
-  const useDedicated = (mod: any, key: string, fields: Record<string, unknown> = {}) => {
-    mod.__test__.sessionOverrides.set(key, { windowMode: 'dedicated' });
-    mod.__test__.applyDedicatedCommandFields(key, { id: 'x', action: 'exec', windowMode: 'dedicated', ...fields });
-  };
-
-  it('a command that never takes a lease does not claim a window', async () => {
-    const h = dedicatedHarness();
-    vi.stubGlobal('chrome', h.chrome);
-    const mod = await import('./background');
-    // Policy-only traffic: `close` on a session with nothing open, repeated.
-    for (let i = 0; i < 5; i += 1) useDedicated(mod, browserKey(`policy-${i}`));
-    for (const name of mod.__test__.dedicatedSlotNames()) {
-      expect(mod.__test__.getDedicatedSlot(name)).not.toBeNull();
-      expect(mod.__test__.getDedicatedSlot(name)!.holders).toEqual([]);
-    }
-    expect(h.chrome.windows.create).not.toHaveBeenCalled();
-  });
-
-  it('reaping reconciles holders whose lease is already gone', async () => {
-    const h = dedicatedHarness();
-    vi.stubGlobal('chrome', h.chrome);
-    const mod = await import('./background');
-    h.chrome.windows.remove = vi.fn(async (id: number) => { await h.closeWindow(id); });
-    const key = browserKey('ghost');
-    useDedicated(mod, key);
-    await mod.__test__.resolveTabId(undefined, key, 'https://ghost.example/');
-    expect(mod.__test__.getDedicatedSlot()).not.toBeNull();
-    const slot = mod.__test__.getDedicatedSlot()!.slot;
-    expect(mod.__test__.getDedicatedSlot(slot)).not.toBeNull();
-    expect(mod.__test__.getDedicatedSlot(slot)!.holders).toEqual([key]);
-    // Drop the lease the way a crashed/forgotten command would: registry entry gone,
-    // no release path ever ran.
-    mod.__test__.forgetSession(key);
-    mod.__test__.setDedicatedIdleTtlMs(1);
-    // First pass notices the dead holder and starts the idle clock; the window is
-    // closed on the next pass, like any other idle window.
-    expect(await mod.__test__.reapIdleDedicatedWindows()).toBe(0);
-    expect(mod.__test__.getDedicatedSlot(slot)).not.toBeNull();
-    expect(mod.__test__.getDedicatedSlot(slot)!.holders).toEqual([]);
-    await new Promise((r) => setTimeout(r, 5));
-    expect(await mod.__test__.reapIdleDedicatedWindows()).toBe(1);
-    expect(mod.__test__.dedicatedSlotNames()).toEqual([]);
   });
 });

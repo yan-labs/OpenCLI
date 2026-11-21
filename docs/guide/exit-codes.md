@@ -19,6 +19,6 @@
 ```bash
 opencli spotify status || echo "exit $?"   # 69 if browser not running
 
-opencli gh issue list 2>/dev/null
-[ $? -eq 77 ] && opencli gh auth login      # auto-auth if not logged in
+opencli twitter timeline 2>/dev/null
+[ $? -eq 77 ] && opencli twitter login      # auto-auth if not logged in
 ```

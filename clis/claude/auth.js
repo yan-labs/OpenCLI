@@ -7,9 +7,6 @@ async function hasClaudeSessionCookie(page) {
 }
 
 async function verifyClaudeIdentity(page) {
-  if (!await hasClaudeSessionCookie(page)) {
-    throw new AuthRequiredError('claude.ai', 'Claude sessionKey cookie missing');
-  }
   await page.goto('https://claude.ai/');
   await page.wait(2);
   const result = await page.evaluate(`(async () => {
@@ -35,8 +32,7 @@ async function verifyClaudeIdentity(page) {
   if (result?.kind === 'http') throw new CommandExecutionError(`HTTP ${result.httpStatus} from /api/organizations`);
   if (result?.kind === 'exception') throw new CommandExecutionError(`Claude whoami failed: ${result.detail}`);
   if (!result?.ok) throw new CommandExecutionError(`Unexpected Claude probe: ${JSON.stringify(result)}`);
-  if (!result.user_id) throw new AuthRequiredError('claude.ai', 'Claude session incomplete — ajs_user_id cookie missing');
-  return { user_id: String(result.user_id), org_name: String(result.org_name), org_uuid: String(result.org_uuid) };
+  return { user_id: String(result.user_id || ''), org_name: String(result.org_name), org_uuid: String(result.org_uuid) };
 }
 
 registerSiteAuthCommands({

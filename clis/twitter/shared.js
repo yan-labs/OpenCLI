@@ -1,4 +1,5 @@
-import { ArgumentError } from '@jackwener/opencli/errors';
+import { ArgumentError, AuthRequiredError, CommandExecutionError } from '@jackwener/opencli/errors';
+import { TWITTER_BEARER_TOKEN } from './utils.js';
 
 const QUERY_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
 const SCREEN_NAME_PATTERN = /^[A-Za-z0-9_]{1,15}$/;
@@ -346,6 +347,91 @@ export async function resolveTwitterQueryId(page, operationName, fallbackId) {
     const operation = await resolveTwitterOperationMetadata(page, operationName, fallbackId);
     return operation.queryId;
 }
+// Baked fallback for the viewer lookup; resolveTwitterOperationMetadata()
+// refreshes it from the rotating placeholder / client bundle first.
+const USER_BY_REST_ID_OPERATION = {
+    queryId: 'mxaYWwt52eAb6OAzYHMVzg',
+    features: {
+        hidden_profile_subscriptions_enabled: true,
+        profile_label_improvements_pcf_label_in_post_enabled: true,
+        responsive_web_profile_redirect_enabled: true,
+        rweb_tipjar_consumption_enabled: false,
+        verified_phone_label_enabled: false,
+        highlights_tweets_tab_ui_enabled: true,
+        responsive_web_twitter_article_notes_tab_enabled: true,
+        subscriptions_feature_can_gift_premium: false,
+        creator_subscriptions_tweet_preview_api_enabled: true,
+        responsive_web_graphql_timeline_navigation_enabled: true,
+    },
+};
+const TWID_PATTERN = /^u=(\d{1,20})$/;
+
+/**
+ * X keeps the signed-in account id in the `twid` cookie (`u%3D<rest_id>`).
+ * It is rewritten by the account-switch response itself, so unlike the
+ * sidebar profile link it never lags behind a switch (#2252) and does not
+ * depend on how the web client renders its navigation (#2770).
+ */
+export function parseTwidUserId(value) {
+    let decoded = '';
+    try {
+        decoded = decodeURIComponent(String(value ?? '').trim()).replace(/^"|"$/g, '');
+    } catch {
+        return '';
+    }
+    return decoded.match(TWID_PATTERN)?.[1] || '';
+}
+
+export function buildUserByRestIdQueryUrl(operation, userId) {
+    const variables = JSON.stringify({ userId: String(userId), withSafetyModeUserFields: true });
+    return `/i/api/graphql/${operation.queryId}/UserByRestId`
+        + `?variables=${encodeURIComponent(variables)}`
+        + `&features=${encodeURIComponent(JSON.stringify(operation.features))}`;
+}
+
+export function extractScreenNameFromUserResult(payload) {
+    const result = payload?.data?.user?.result;
+    if (!result || result.__typename !== 'User') return '';
+    return normalizeTwitterScreenName(result.core?.screen_name || result.legacy?.screen_name || '');
+}
+
+/**
+ * Resolve the logged-in account from session state instead of the DOM:
+ * `twid` cookie -> rest_id -> UserByRestId GraphQL -> screen_name.
+ * The page must already be on an x.com origin (the fetch is same-origin).
+ */
+export async function resolveLoggedInTwitterUser(page) {
+    const cookies = await page.getCookies({ url: 'https://x.com' });
+    const ct0 = cookies.find((cookie) => cookie.name === 'ct0')?.value || '';
+    const userId = parseTwidUserId(cookies.find((cookie) => cookie.name === 'twid')?.value);
+    if (!ct0 || !userId) {
+        throw new AuthRequiredError('x.com', 'Could not detect the logged-in Twitter/X account (missing ct0/twid session cookies)');
+    }
+    const operation = await resolveTwitterOperationMetadata(page, 'UserByRestId', USER_BY_REST_ID_OPERATION);
+    const url = buildUserByRestIdQueryUrl(operation, userId);
+    const headers = {
+        Authorization: `Bearer ${decodeURIComponent(TWITTER_BEARER_TOKEN)}`,
+        'X-Csrf-Token': ct0,
+        'X-Twitter-Auth-Type': 'OAuth2Session',
+        'X-Twitter-Active-User': 'yes',
+    };
+    const response = unwrapBrowserResult(await page.evaluate(`async () => {
+        const resp = await fetch(${JSON.stringify(url)}, { headers: ${JSON.stringify(headers)}, credentials: 'include' });
+        if (!resp.ok) return { error: resp.status };
+        return await resp.json();
+    }`));
+    if (response?.error === 401 || response?.error === 403) {
+        throw new AuthRequiredError('x.com', `Twitter/X viewer lookup failed (HTTP ${response.error})`);
+    }
+    if (response?.error) {
+        throw new CommandExecutionError(describeTwitterApiError('UserByRestId', response.error));
+    }
+    const screenName = extractScreenNameFromUserResult(response);
+    if (!screenName) {
+        throw new CommandExecutionError(`Twitter/X viewer lookup returned no screen_name for account ${userId}`);
+    }
+    return { userId, screenName };
+}
 /**
  * Extract media flags and URLs from a tweet's `legacy` object.
  *
@@ -360,32 +446,60 @@ export async function resolveTwitterQueryId(page, operationName, fallbackId) {
  * for photos it equals the photo URL itself. Each entry is a non-null string —
  * it falls back to the media URL if a thumbnail is somehow absent, preserving
  * alignment.
+ *
+ * And `media_durations`, also index-aligned 1:1: `video_info.duration_millis`
+ * in milliseconds for videos / animated GIFs, `0` for photos (and for videos
+ * where X omits the duration). This is the only place the tweet's video length
+ * is available — the timeline row itself carries no duration.
  */
 export function extractMedia(legacy) {
     const media = legacy?.extended_entities?.media || legacy?.entities?.media;
     if (!Array.isArray(media) || media.length === 0) {
-        return { has_media: false, media_urls: [], media_posters: [] };
+        return { has_media: false, media_urls: [], media_posters: [], media_durations: [] };
     }
     const urls = [];
     const posters = [];
+    const durations = [];
     for (const m of media) {
         if (!m) continue;
         if (m.type === 'video' || m.type === 'animated_gif') {
             const variants = m.video_info?.variants || [];
-            const mp4 = variants.find((v) => v?.content_type === 'video/mp4');
-            const url = mp4?.url || m.media_url_https;
+            // X returns variants in ascending bitrate order, so picking the first mp4
+            // always yielded the lowest rendition (480x270). Take the highest bitrate.
+            let best = null;
+            for (const v of variants) {
+                if (v?.content_type !== 'video/mp4' || !v.url) continue;
+                const bitrate = Number(v.bitrate) || 0;
+                if (!best || bitrate > best.bitrate) best = { url: v.url, bitrate };
+            }
+            const url = best?.url || m.media_url_https;
             if (url) {
                 urls.push(url);
                 posters.push(m.media_url_https || url);
+                durations.push(Number(m.video_info?.duration_millis) || 0);
             }
         } else {
             if (m.media_url_https) {
                 urls.push(m.media_url_https);
                 posters.push(m.media_url_https);
+                durations.push(0);
             }
         }
     }
-    return { has_media: urls.length > 0, media_urls: urls, media_posters: posters };
+    return { has_media: urls.length > 0, media_urls: urls, media_posters: posters, media_durations: durations };
+}
+
+/**
+ * Author avatar URL from a GraphQL `user_results.result` object.
+ *
+ * Reads `legacy.profile_image_url_https` (older schema) or `avatar.image_url`
+ * (newer schema, the one that also moved `screen_name` under `core`). X serves
+ * that URL at the 48x48 `_normal` size; swapping the suffix for `_400x400`
+ * returns the same image at a usable resolution. Returns '' when absent.
+ */
+export function extractAuthorAvatar(user) {
+    const raw = user?.legacy?.profile_image_url_https || user?.avatar?.image_url || '';
+    return String(raw).replace(/_normal(\.[A-Za-z0-9]+)?(\?.*)?$/, '_400x400$1$2');
 }
 
 /**
@@ -526,6 +640,7 @@ export function extractQuotedTweet(tweet) {
         has_media: qMedia.has_media,
         media_urls: qMedia.media_urls,
         media_posters: qMedia.media_posters,
+        media_durations: qMedia.media_durations,
     };
     if (qCard) out.card = qCard;
     return out;
@@ -577,6 +692,7 @@ export const __test__ = {
     normalizeTwitterGraphqlPayload,
     normalizeTwitterScreenName,
     extractMedia,
+    extractAuthorAvatar,
     extractCard,
     extractQuotedTweet,
     parseTweetUrl,

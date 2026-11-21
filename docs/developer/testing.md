@@ -1,156 +1,93 @@
 # Testing Guide
 
-> 面向开发者和 AI Agent 的当前测试参考手册。
+测试配置以 `vitest.config.ts` 和 `package.json` 为准；不要维护容易过期的测试数量清单。
 
-## 测试结构
+## 测试职责
 
-OpenCLI 当前测试主要分成四类：
+| Project | 位置 | 负责验证 |
+|---|---|---|
+| `unit` | `src/**/*.test.ts` | 核心逻辑、参数、输出、runtime 与错误分类 |
+| `extension` | `extension/src/**/*.test.ts` | 使用 mocked Chrome APIs 的 extension 行为 |
+| `adapter` | `clis/**/*.test.{ts,js}` | 站点解析、数据归一化、站点特有错误与 command wiring |
+| `e2e-fixed-port` | `tests/e2e/browser-tabs.test.ts`、`daemon-transport.test.ts` | 真实 daemon 与模拟 extension 的协议；串行运行 |
+| `e2e` | `tests/e2e/` 中配置启用的文件 | 默认只跑离线 CLI、管理命令与 auth contract；真实站点和 GitHub plugin 测试需显式启用 |
+| `smoke` | `tests/smoke/` | 公开 API 与命令注册健康检查，无需 Chrome |
 
-| 类别 | 位置 | 当前规模 | 主要用途 |
-|---|---|---:|---|
-| 单元测试 | `src/**/*.test.ts` | 60 | 核心运行时、命令层、浏览器桥、输出、插件、诊断 |
-| E2E 测试 | `tests/e2e/*.test.ts` | 11 | 真实 CLI 入口、公开站点、浏览器命令、管理命令、输出格式 |
-| 烟雾测试 | `tests/smoke/*.test.ts` | 1 | 外部 API 与注册完整性健康检查 |
-| 步骤级测试 | `src/pipeline/steps/*.test.ts` | 已包含在单元测试内 | pipeline step 行为与边界情况 |
+## 本地验证
 
-当前仓库里没有独立的 `clis/**/*.test.{ts,js}` adapter 测试树。adapter 相关验证主要分布在：
-
-- `tests/e2e/`
-- `src/commanderAdapter.test.ts`
-- `src/registry.test.ts`
-- `src/execution.test.ts`
-- `src/validate.ts` / `opencli validate`
-
-## 本地默认策略
-
-本地默认跑最小充分验证，不要先跑全量。
-
-推荐顺序：
-
-1. 改动命令文案、输出格式、参数解析：
-   - 跑对应单元测试
-   - 跑一条真实 CLI 命令做 spot check
-2. 改动 adapter 发现、注册、验证逻辑：
-   - 跑 `src/registry.test.ts`
-   - 跑 `src/execution.test.ts`
-   - 跑 `opencli validate`
-3. 改动 browser / daemon / runtime：
-   - 跑对应 `src/*test.ts`
-   - 必要时补一条 `tests/e2e/*` 或手动 `opencli browser ...` 验证
-4. 改动共享底层、跨多个模块、或 merge 前需要更高信心：
-   - 再扩大到 `npm test`
-
-## 常用命令
+先跑改动对应的测试；共享逻辑或跨模块改动再扩大范围。
 
 ```bash
-# 类型检查
-npx tsc --noEmit
-
-# 编译产物
+npm ci
 npm run build
 
-# 跑一个目标测试文件
-npx vitest run src/<target>.test.ts
+# 默认：unit + extension + adapter，不调用真实站点 E2E
+npm test
 
-# 全量 vitest projects
-npm run test:all
+# 目标文件
+npx vitest run --project adapter clis/ctrip/auth.test.js
 
-# E2E
+# 真实 CLI + 隔离的站点 fixture，无需登录或 Chrome
+npx vitest run --project e2e tests/e2e/auth-contract.test.ts tests/e2e/management.test.ts
+
+# 离线 CLI 与 daemon contract（固定端口测试会重启 daemon）
 npm run test:e2e
 
-# 适配器注册 / schema 校验
-node dist/src/main.js validate
+# 少量严格的真实公开 API 检查
+npx vitest run --project smoke
+
+# 所有默认启用的 projects，包含公开 API smoke
+npm run test:all
 ```
 
-如果你明确要跑 adapter project，也可以执行：
+`npm run build` 已包含 TypeScript 检查。只需要类型反馈时可单独运行 `npm run typecheck`。
+E2E 运行构建后的 CLI，修改源码后先重新 build。
+`e2e-fixed-port` 使用固定端口，运行前确认不会与正在使用的 daemon 冲突。
+
+## 如何避免重复测试
+
+- 共享 helper 的完整边界矩阵放在 helper 所在层；各 command 保留必要 wiring 验证。
+- Adapter test 覆盖站点 response shape 和解析边界；E2E 保留代表性的成功、typed error、exit code 与跨层连接验证，不复制整套解析矩阵。
+- CLI 输出格式入口统一放在 `tests/e2e/management.test.ts`；具体格式渲染逻辑放在 `src/output.test.ts`。
+- 不逐 command 抄录 columns、strategy、默认值做静态断言；manifest 一致性、全量 `validate` 与 column lint 统一负责声明检查。站点测试应调用行为；特有的 session/navigation contract 仍可保留。
+- 相同 test body 如果调用不同 command，并不自动构成重复。
+- 不添加“非零退出时只要有文字就通过”的 auth test：未知命令和程序崩溃也能满足这种断言。应检查具体错误类型、状态或输出内容。
+- 不为了验证 auth 自动执行创建、删除、发布或付费操作；使用隔离 fixture 验证这些分支。
+
+## 浏览器与真实站点
+
+`browser-public.test.ts` 等真实站点测试依赖网络、站点状态和可用的 Browser Bridge。
+部分测试允许站点限制导致的空数据，因此不能把这些通过结果视为完整登录流程已验证。
+Auth 的确定性 CLI contract 在 `auth-contract.test.ts`，站点特有判断在 adapter tests。
+
+可选测试通过环境变量启用：
 
 ```bash
-npm run test:adapter
+# 手动运行真实站点、文章下载与 GitHub plugin 测试
+OPENCLI_E2E=1 npm run test:e2e
+
+# 真实 Chrome + extension contract
+OPENCLI_AX_E2E=1 npx vitest run --project e2e tests/e2e/browser-ax-chrome.test.ts
+
+# 站点槽位池（OPENCLI_SITE_SLOTS）：真实 daemon + extension + 隔离浏览器，本地 fixture；需先停掉占用 19825 的 daemon。
+# 品牌版 Google Chrome 会忽略 --load-extension，需用 CHROME_PATH 指向 Chromium / Chrome for Testing
+# 本地有界面时窗口可能被其他窗口遮挡、被系统标记为 hidden，渲染断言会不稳定，建议加 OPENCLI_E2E_HEADLESS=1
+OPENCLI_E2E_HEADLESS=1 CHROME_PATH=/path/to/chrome-for-testing OPENCLI_AX_E2E=1 npx vitest run --project e2e tests/e2e/site-slots-chrome.test.ts
 ```
 
-## 当前 E2E 文件
+真实登录问题还应使用已登录浏览器，手动执行对应的只读命令验证。
 
-当前 `tests/e2e/` 包含：
+## CI 分工
 
-- `browser-auth.test.ts`
-- `browser-public.test.ts`
-- `cli.test.ts`
-- `extension-bridge.test.ts`
-- `formats.test.ts`
-- `list.test.ts`
-- `management.test.ts`
-- `public-commands.test.ts`
-- `recovery.test.ts`
-- `remote-chrome.test.ts`
-- `tab-targeting.test.ts`
+| Workflow / job | 频率 | 覆盖 |
+|---|---|---|
+| CI / build | PR、main/dev push、每周、手动 | Linux build、lint、manifest 与全部离线 CLI E2E；每周/手动再跑三 OS build |
+| CI / unit-test | 同上 | Linux 两个 shard 跑完整 unit + extension + adapter；每周/手动额外跑 macOS/Windows core tests |
+| CI / bun-test | 每周、手动 | Bun runtime compatibility |
+| CI / smoke-test | 每周、手动 | 四个公开 API family 的代表性 endpoint；非零退出即失败 |
+| E2E Headed Chrome | 匹配路径的 main/dev push、release tag、每日、手动 | 三 OS 的 CLI tab/daemon contract；Linux 真实 extension，不重复整套站点 E2E |
 
-如果这个列表变化，以仓库文件为准：
+Bun compatibility 不再作为每次 PR 的 gate；相关 runtime 改动应在本地额外运行 `npm run test:bun`。
+CI 的精确触发条件与命令以 `.github/workflows/` 为准。
 
-```bash
-find tests/e2e -name '*.test.ts' | sort
-```
-
-## 当前值得优先覆盖的区域
-
-以下改动最容易引入回归：
-
-- `src/cli.ts`
-- `src/commanderAdapter.ts`
-- `src/discovery.ts`
-- `src/execution.ts`
-- `src/runtime.ts`
-- `src/daemon.ts`
-- `src/plugin.ts`
-- `src/pipeline/**`
-
-这类改动优先补：
-
-- 精准单元测试
-- 一条真实 CLI 验证路径
-- 必要时再扩大到 `npm test`
-
-## 手动验证建议
-
-文档或命令面改动后，优先做 2 到 4 条真实命令 spot check，例如：
-
-```bash
-node dist/src/main.js --help
-node dist/src/main.js list --format json
-node dist/src/main.js plugin --help
-node dist/src/main.js doctor --help
-```
-
-浏览器相关改动再补：
-
-```bash
-node dist/src/main.js browser --help
-node dist/src/main.js browser tab list
-```
-
-## CI 角色
-
-CI 负责更大范围的回归信心，本地负责最快闭环。
-
-适合交给 CI 的内容：
-
-- 更大的命令面回归
-- 多环境差异
-- E2E 稳定性
-- smoke 检查
-
-适合本地优先做的内容：
-
-- 参数解析
-- 输出格式
-- 注册与发现
-- 文档相关命令行为
-- 共享模块的小范围回归
-
-## 更新这份文档的规则
-
-当以下任一项变化时，顺手更新此页：
-
-- `tests/e2e/` 文件列表
-- 默认本地测试命令
-- `package.json` 测试脚本
-- 共享运行时的高风险模块
+跨平台 core/build 回归改由每周或手动检查，可能比每次 push 更晚发现。真实站点宽覆盖改为 opt-in；默认 CI 不证明所有网站当前可用。

@@ -17,12 +17,13 @@
  * Lifecycle:
  *   - Auto-spawned by opencli on first browser command
  *   - Persistent — stays alive until explicit shutdown, SIGTERM, or uninstall
- *   - Listens on localhost:19825
+ *   - Listens on 127.0.0.1:19825 (plus [::1]:19825 for legacy `localhost` clients)
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createServer as createNetServer } from 'node:net';
 import { WebSocketServer, WebSocket, type RawData } from 'ws';
-import { DEFAULT_DAEMON_PORT, isIgnorableDaemonPortEnv, unsupportedDaemonPortEnvMessage } from './constants.js';
+import { DAEMON_HOST, DEFAULT_DAEMON_PORT, isIgnorableDaemonPortEnv, unsupportedDaemonPortEnvMessage } from './constants.js';
 import { EXIT_CODES } from './errors.js';
 import { log } from './logger.js';
 import { PKG_VERSION } from './version.js';
@@ -34,19 +35,19 @@ import {
   buildCommandTimeoutFailure,
   buildExtensionDisconnectFailure,
   getResponseCorsHeaders,
-  isProcessAlive,
   resolveProfileRoute,
 } from './daemon-utils.js';
 import {
+  SESSION_LEASE_TTL_MS,
   SessionLeaseRegistry,
   buildSessionBusyFailure,
   getSessionLeaseKey,
   isSessionLeaseCommand,
 } from './session-lease.js';
+import { SLOT_WAIT_DEFAULT_MS, SiteSlotScheduler, SlotAdmission, parseSlotPolicy, validSlotWaitMs } from './site-slots.js';
+
 import { installDaemonLogSink } from './daemon-logs.js';
 
-// Before anything else can log: the daemon is detached with no terminal, so
-// without this every record it writes is lost at the moment it is produced.
 installDaemonLogSink();
 
 const PORT = DEFAULT_DAEMON_PORT;
@@ -92,11 +93,25 @@ type PendingEntry = {
 };
 const pending = new Map<string, PendingEntry>();
 
-// One logical write lease per (contextId, surface, session). Serializes
-// concurrent adapter and browser-surface writes so two processes cannot drive
-// the same Chrome tab. Stale leases self-expire (see session-lease.ts).
+// One logical write lease per (contextId, surface, persistent site session).
+// Serializes concurrent adapter write commands so a retry can't drive the same
+// Chrome tab as a still-running command. Stale leases self-expire (see
+// session-lease.ts).
 const sessionLeases = new SessionLeaseRegistry();
 
+// Per-(contextId, site) slot pools with a cancellable admission queue
+// (site-slots.ts). A queued slot-acquire is an open HTTP request.
+const slotAdmission = new SlotAdmission({
+  scheduler: new SiteSlotScheduler({ ttlMs: SESSION_LEASE_TTL_MS }),
+  routeFailure: (contextId) => {
+    const route = resolveExtensionConnection(contextId, undefined);
+    return route.connection ? null : { errorCode: route.errorCode, error: route.error };
+  },
+  hasPendingWork: (runId) => runHasPendingWork(runId),
+  log: (msg) => pushLog({ level: 'info', msg, ts: Date.now() }),
+});
+
+/** A TTL-stale lease holder with a command still in flight is alive, not dead. */
 function runHasPendingWork(runId: string): boolean {
   for (const entry of pending.values()) {
     if (entry.runId === runId) return true;
@@ -110,6 +125,7 @@ function settlePending(id: string, entry: PendingEntry, outcome: { data?: unknow
   // A settling command is proof of holder liveness — restart the TTL clock so
   // an exec that outlived the TTL hands over to normal heartbeats seamlessly.
   if (entry.leaseKey && entry.runId) sessionLeases.heartbeat(entry.leaseKey, entry.runId, Date.now());
+  if (entry.runId) slotAdmission.onWorkSettled(entry.runId);
   for (const settler of entry.settlers) {
     if (outcome.error) settler.reject(outcome.error);
     else settler.resolve(outcome.data);
@@ -322,6 +338,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       profiles,
       pending: pending.size,
       sessionLeases: sessionLeases.list(Date.now(), runHasPendingWork),
+      siteSlots: slotAdmission.list(),
       commandResultUnknown: commandResultUnknownCount,
       memoryMB: Math.round(mem.rss / 1024 / 1024 * 10) / 10,
       port: PORT,
@@ -364,7 +381,10 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       // runIds are globally unique, and re-resolving the profile route here
       // could fail (the profile may have disconnected since acquire).
       if (body.action === 'lease-release') {
-        if (typeof body.runId === 'string') sessionLeases.releaseByRunId(body.runId);
+        if (typeof body.runId === 'string') {
+          sessionLeases.releaseByRunId(body.runId);
+          slotAdmission.release(body.runId);
+        }
         jsonResponse(res, 200, { id: body.id, ok: true });
         return;
       }
@@ -384,15 +404,47 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
         return;
       }
 
+      // ─── Site slot pool: admission ───────────────────────────────────
+      // Daemon-local. Runs after profile routing (pools are per profile) and
+      // before anything is dispatched. The request stays open while the run
+      // is queued; a client that goes away is dequeued (site-slots.ts).
+      if (body.action === 'slot-acquire') {
+        const policy = parseSlotPolicy(body);
+        if (typeof body.site !== 'string' || !body.site || typeof body.runId !== 'string' || !body.runId || !policy || (body.waitMs !== undefined && !validSlotWaitMs(body.waitMs))) {
+          jsonResponse(res, 400, { id: body.id, ok: false, error: 'slot-acquire needs site, runId, poolSize' });
+          return;
+        }
+        let replied = false;
+        const cancel = slotAdmission.acquire({
+          contextId: route.connection.contextId,
+          site: body.site,
+          runId: body.runId,
+          policy,
+          waitMs: body.waitMs === undefined ? SLOT_WAIT_DEFAULT_MS : body.waitMs as number,
+          reply: ({ status, body: payload }) => {
+            replied = true;
+            jsonResponse(res, status, { id: body.id, ...payload });
+          },
+        });
+        res.on('close', () => { if (!replied) cancel(); });
+        return;
+      }
+
+      // Slot ownership: a holder's command refreshes its slot; a run that lost
+      // its slot can no longer drive that tab.
+      const slotRejection = slotAdmission.admitCommand({ contextId: route.connection.contextId, session: body.session, runId: body.runId });
+      if (slotRejection) {
+        jsonResponse(res, slotRejection.status, { id: body.id, ...slotRejection.body });
+        return;
+      }
+
       // ─── Session write lease: arbitration ────────────────────────────
       // Runs AFTER profile routing (the resolved contextId is part of the
       // lease key — the same site session in two Chrome profiles drives two
       // different browsers) but BEFORE any dispatch to the extension. The
-      // first write acquires, same-runId commands refresh (heartbeat), and a
-      // concurrent different-runId write gets a local retry hint. The client
-      // waits and asks the daemon again; nothing reaches Chrome or the site
-      // until this lease is granted. Reads and ephemeral adapter commands are
-      // never arbitrated.
+      // first write acquires, same-runId execs refresh (heartbeat), and a
+      // concurrent different-runId write fails fast. Read and ephemeral
+      // commands are never arbitrated.
       let leaseKey: string | undefined;
       let leaseRunId: string | undefined;
       if (isSessionLeaseCommand(body)) {
@@ -405,11 +457,6 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
           // A holder past the TTL whose exec is still in flight is alive — a
           // single slow command produces no heartbeat until it settles.
           hasPendingWork: runHasPendingWork,
-          // ...unless its CLI process is gone. A native alert() blocks the
-          // renderer so the reply never arrives, and without this probe the
-          // lease outlives the client forever — taking `dialog accept`, the
-          // only way out, down with it.
-          isClientAlive: isProcessAlive,
         });
         if (!outcome.granted) {
           const failure = buildSessionBusyFailure(body.session, outcome.holder, now);
@@ -423,21 +470,8 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
             errorCode: failure.errorCode,
             error: failure.message,
             errorHint: failure.errorHint,
-            retryAfterMs: 2_000,
           });
           return;
-        }
-        if (outcome.reclaimedFrom) {
-          const heldSeconds = Math.max(0, Math.round((now - outcome.reclaimedFrom.startedAt) / 1000));
-          const prevPid = outcome.reclaimedFrom.pid != null ? String(outcome.reclaimedFrom.pid) : 'unknown';
-          const reason = outcome.reclaimReason === 'client_dead'
-            ? 'its client process is gone (stale lock)'
-            : 'its TTL expired';
-          log.warn(
-            `[daemon] Session ${key} lock reclaimed from ${outcome.reclaimedFrom.command} ` +
-            `(pid ${prevPid}, runId=${outcome.reclaimedFrom.runId}), held for ${heldSeconds}s — ${reason}; ` +
-            `granting to ${body.command ?? body.action} (runId=${body.runId})`,
-          );
         }
         leaseKey = key;
         leaseRunId = body.runId;
@@ -478,6 +512,8 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
           settlers: [{ resolve, reject }],
           timer,
           ...(leaseKey && leaseRunId ? { leaseKey, runId: leaseRunId } : {}),
+          // Slot holders (reads included) stay alive while an exec is in flight.
+          ...(!leaseKey && typeof body.runId === 'string' && body.runId ? { runId: body.runId } : {}),
         };
         pending.set(body.id, entry);
         const failBeforeDispatch = (err: unknown) => {
@@ -614,8 +650,24 @@ wss.on('connection', (ws: WebSocket) => {
 
 // ─── Start ───────────────────────────────────────────────────────────
 
-httpServer.listen(PORT, '127.0.0.1', () => {
-  log.info(`[daemon] Listening on http://127.0.0.1:${PORT}`);
+// Browser Bridge extensions up to 1.0.26 dial `ws://localhost`, which
+// IPv6-preferring hosts resolve to ::1 first (#2690). Accept the IPv6 loopback
+// too and hand its sockets to the same HTTP server, so routing, the WebSocket
+// upgrade and the security checks stay single-sourced. Strictly `::1`, never
+// `::` (that would listen on every interface). Best effort: a host without
+// IPv6, or a foreign listener on [::1]:PORT, must not take the daemon down.
+const ipv6LoopbackServer = createNetServer((socket) => httpServer.emit('connection', socket));
+ipv6LoopbackServer.on('error', (err: NodeJS.ErrnoException) => {
+  log.warn(`[daemon] Not listening on [::1]:${PORT} (${err.code ?? err.message}); IPv4 loopback only.`);
+});
+
+httpServer.listen(PORT, DAEMON_HOST, () => {
+  log.info(`[daemon] Listening on http://${DAEMON_HOST}:${PORT}`);
+  // Only after the authoritative IPv4 bind succeeded: if another daemon owns
+  // the port, the EADDRINUSE handler below exits before touching ::1.
+  ipv6LoopbackServer.listen(PORT, '::1', () => {
+    log.info(`[daemon] Also listening on http://[::1]:${PORT}`);
+  });
 });
 
 httpServer.on('error', (err: NodeJS.ErrnoException) => {
@@ -650,6 +702,7 @@ function shutdown(): void {
   }
   pending.clear();
   for (const profile of extensionProfiles.values()) profile.ws.close();
+  if (ipv6LoopbackServer.listening) ipv6LoopbackServer.close();
   // Let the rejection responses flush before exiting — a synchronous
   // process.exit() would kill the queued microtasks that write them.
   httpServer.close(() => process.exit(EXIT_CODES.SUCCESS));

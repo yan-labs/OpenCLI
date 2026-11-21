@@ -1,10 +1,37 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { JSDOM } from 'jsdom';
 import { ArgumentError, CommandExecutionError } from '@jackwener/opencli/errors';
 import { getRegistry } from '@jackwener/opencli/registry';
 import './bookmark.js';
 import { createPageMock } from '../test-utils.js';
 
 describe('twitter bookmark command', () => {
+    it('confirms a delayed target update, never retries the click, and fails uncertain on timeout', async () => {
+        vi.useFakeTimers();
+        try {
+            for (const confirmed of [true, false]) {
+                const dom = new JSDOM(`<main><article><a href="/alice/status/123">Target</a><button data-testid="bookmark">Save</button></article><article><a href="/bob/status/456">Other</a><button data-testid="removeBookmark">Saved</button></article></main>`, { url: 'https://x.com/alice/status/123', runScripts: 'outside-only' });
+                dom.window.setTimeout = setTimeout;
+                dom.window.Date = Date;
+                const button = dom.window.document.querySelector('[data-testid="bookmark"]');
+                const clicked = vi.fn(() => {
+                    if (confirmed) setTimeout(() => { button.dataset.testid = 'removeBookmark'; }, 1500);
+                });
+                button.addEventListener('click', clicked);
+                const page = createPageMock([]);
+                page.evaluate.mockImplementation(script => dom.window.eval(script));
+                const result = getRegistry().get('twitter/bookmark').func(page, { url: 'https://x.com/alice/status/123' })
+                    .then(rows => ({ rows }), error => ({ error }));
+                await vi.runAllTimersAsync();
+                const outcome = await result;
+                expect(clicked).toHaveBeenCalledTimes(1);
+                if (confirmed) expect(outcome.rows).toEqual([{ status: 'success', message: 'Tweet successfully bookmarked.' }]);
+                else expect(outcome.error).toMatchObject({ code: 'TIMEOUT', exitCode: 75, hint: expect.stringContaining('may already have succeeded') });
+                dom.window.close();
+            }
+        } finally { vi.useRealTimers(); }
+    });
+
     it('navigates to the tweet URL and reports success when the bookmark script confirms', async () => {
         const cmd = getRegistry().get('twitter/bookmark');
         expect(cmd?.func).toBeTypeOf('function');
@@ -16,7 +43,7 @@ describe('twitter bookmark command', () => {
         });
         expect(page.goto).toHaveBeenCalledWith('https://x.com/alice/status/2040254679301718161');
         expect(page.wait).toHaveBeenNthCalledWith(1, { selector: '[data-testid="primaryColumn"]' });
-        expect(page.wait).toHaveBeenNthCalledWith(2, 2);
+        expect(page.wait).toHaveBeenCalledTimes(1);
         const script = page.evaluate.mock.calls[0][0];
         // Idempotency probe: when already bookmarked ([data-testid="removeBookmark"] present),
         // the script returns ok:true with an "already bookmarked" message.

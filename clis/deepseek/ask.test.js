@@ -83,11 +83,32 @@ describe('deepseek ask --file', () => {
     await expect(askCommand.func(page, {
       prompt: 'summarize this',
       timeout: 120,
-      new: false,
+      new: true,
       model: 'instant',
       think: false,
       search: false,
+      __opencliOptionSources: { model: 'cli' },
     })).rejects.toThrow(new CommandExecutionError('Could not switch to instant model'));
+  });
+
+  it('sends a prompt with --new when the model selector is unavailable', async () => {
+    mockSelectModel.mockResolvedValue({ ok: false });
+    mockSendMessage.mockResolvedValue({ ok: true });
+
+    const rows = await askCommand.func(page, {
+      prompt: 'hello',
+      timeout: 120,
+      new: true,
+      model: 'instant',
+      think: true,
+      search: false,
+    });
+
+    expect(rows).toEqual([{ response: 'new reply' }]);
+    expect(page.goto).toHaveBeenCalledWith('https://chat.deepseek.com/');
+    expect(mockSelectModel).not.toHaveBeenCalled();
+    expect(mockSetFeature).toHaveBeenCalledWith(page, 'DeepThink', true);
+    expect(mockSendMessage).toHaveBeenCalledWith(page, 'hello');
   });
 });
 
@@ -146,12 +167,6 @@ describe('deepseek ask --think', () => {
 
     expect(rows).toEqual([{ response: 'The answer is 42.' }]);
     expect(mockWaitForResponse).toHaveBeenCalledWith(page, 5, 'what is the answer?', 120000, false);
-  });
-
-  it('does not declare static columns (derived from row keys)', () => {
-    // columns should be undefined so the renderer infers from row keys,
-    // avoiding empty trailing columns on non-think output.
-    expect(askCommand.columns).toBeUndefined();
   });
 
   it('non-think rows only contain response key', async () => {

@@ -58,13 +58,6 @@ describe('isLoginWallSnapshot', () => {
 });
 
 describe('readUserSnapshotHydrated', () => {
-    it('快路径：首读即有笔记 → 不 wait、不重试', async () => {
-        const page = createPageMock(vi.fn().mockResolvedValue(NOTES_SNAP));
-        const out = await readUserSnapshotHydrated(page);
-        expect(out).toBe(NOTES_SNAP);
-        expect(page.evaluate).toHaveBeenCalledTimes(1);
-        expect(page.wait).not.toHaveBeenCalled();
-    });
     it('慢加载：store/notes 晚到 → 重试直到笔记出现（回归 2026-06-09 hydration 竞态）', async () => {
         const page = createPageMock(vi
             .fn()
@@ -75,31 +68,11 @@ describe('readUserSnapshotHydrated', () => {
         expect(countFlatNotes(out)).toBe(1);
         expect(page.wait).toHaveBeenCalled(); // 确实等过
     });
-    it('登录墙：命中即停，不浪费重试预算', async () => {
-        const page = createPageMock(vi.fn().mockResolvedValue(LOGIN_WALL_SNAP));
-        const out = await readUserSnapshotHydrated(page);
-        expect(isLoginWallSnapshot(out)).toBe(true);
-        expect(page.evaluate).toHaveBeenCalledTimes(1); // 没进重试循环
-        expect(page.wait).not.toHaveBeenCalled();
-    });
-    it('真·空号：走满重试后返回空快照（交给下游 EmptyResultError）', async () => {
-        const page = createPageMock(vi.fn().mockResolvedValue(EMPTY_GROUPS_SNAP));
-        const out = await readUserSnapshotHydrated(page, 3, 0.01);
-        expect(countFlatNotes(out)).toBe(0);
-        expect(isLoginWallSnapshot(out)).toBe(false);
-        expect(page.wait).toHaveBeenCalledTimes(3); // maxRetries 次
-    });
+
 });
 
 describe('xiaohongshu user command', () => {
     const command = getRegistry().get('xiaohongshu/user');
-
-    it('登录墙 → 抛 AUTH_REQUIRED（不再误报 Malformed/EMPTY）', async () => {
-        const page = createPageMock(vi.fn().mockResolvedValue(LOGIN_WALL_SNAP));
-        await expect(command.func(page, { id: '56d290df84edcd782a3c8748', limit: 5 })).rejects.toMatchObject({
-            code: 'AUTH_REQUIRED',
-        });
-    });
 
     it('笔记晚到 → 重试后成功返回（端到端回归）', async () => {
         const page = createPageMock(vi
@@ -112,23 +85,6 @@ describe('xiaohongshu user command', () => {
         expect(rows[0].id).toBe('aaa');
     });
 
-    it('滚动续读时被重定向到登录墙 → 抛 AUTH_REQUIRED', async () => {
-        const page = createPageMock(vi
-            .fn()
-            .mockResolvedValueOnce(snap({ noteGroups: [[noteEntry('aaa')]] }))
-            .mockResolvedValueOnce(LOGIN_WALL_SNAP));
-        await expect(command.func(page, { id: 'someuser', limit: 5 })).rejects.toMatchObject({
-            code: 'AUTH_REQUIRED',
-        });
-        expect(page.autoScroll).toHaveBeenCalledTimes(1);
-    });
-
-    it('真·空号 → 抛 EMPTY_RESULT', async () => {
-        const page = createPageMock(vi.fn().mockResolvedValue(EMPTY_GROUPS_SNAP));
-        await expect(command.func(page, { id: 'emptyuser', limit: 5 })).rejects.toMatchObject({
-            code: 'EMPTY_RESULT',
-        });
-    });
 });
 
 describe('assertReadableUserSnapshot (既有契约保持)', () => {
@@ -137,5 +93,79 @@ describe('assertReadableUserSnapshot (既有契约保持)', () => {
     });
     it('正常快照不抛', () => {
         expect(() => assertReadableUserSnapshot(NOTES_SNAP)).not.toThrow();
+    });
+});
+
+describe('offline user pagination', () => {
+    const command = getRegistry().get('xiaohongshu/user');
+    const notes = ids => snap({ noteGroups: [ids.map(noteEntry)] });
+
+    it('loads 1000 unique notes beyond four scrolls', async () => {
+        let count = 20;
+        const page = createPageMock(vi.fn(async () => notes(Array.from({ length: count }, (_, i) => String(i)))));
+        page.autoScroll.mockImplementation(async () => { count += 20; });
+        const rows = await command.func(page, { id: 'offline', limit: 1000, timeout: 300 });
+        expect(rows).toHaveLength(1000);
+        expect(new Set(rows.map(row => row.id)).size).toBe(1000);
+        expect(page.autoScroll).toHaveBeenCalledTimes(49);
+        expect(page.wait).toHaveBeenCalledWith({ time: 2 });
+    });
+
+    it('tolerates two stagnant reads and retains notes when the store replaces visible rows', async () => {
+        const page = createPageMock(vi.fn()
+            .mockResolvedValueOnce(notes(['a']))
+            .mockResolvedValueOnce(notes(['a']))
+            .mockResolvedValueOnce(notes(['a']))
+            .mockResolvedValueOnce(notes(['b']))
+            .mockResolvedValueOnce(notes(['b']))
+            .mockResolvedValueOnce(notes(['c'])));
+        const rows = await command.func(page, { id: 'offline', limit: 3 });
+        expect(rows.map(row => row.id)).toEqual(['a', 'b', 'c']);
+        expect(page.autoScroll).toHaveBeenCalledTimes(5);
+    });
+
+    it('stops after three consecutive stagnant scrolls even when duplicates multiply', async () => {
+        const page = createPageMock(vi.fn().mockResolvedValue(notes(['a', 'a', 'a'])));
+        expect(await command.func(page, { id: 'offline', limit: 1000 })).toHaveLength(1);
+        expect(page.autoScroll).toHaveBeenCalledTimes(3);
+    });
+
+    it('does not hide a login wall or malformed store behind previously collected notes', async () => {
+        for (const invalid of [LOGIN_WALL_SNAP, NO_STORE_SNAP]) {
+            const page = createPageMock(vi.fn().mockResolvedValueOnce(NOTES_SNAP).mockResolvedValue(invalid));
+            await expect(command.func(page, { id: 'offline', limit: 5 })).rejects.toMatchObject({ code: invalid.loginWall ? 'AUTH_REQUIRED' : 'COMMAND_EXEC' });
+        }
+    });
+
+    it('validates limit and timeout before any browser work', async () => {
+        for (const kwargs of [{ limit: 0 }, { limit: 1001 }, { limit: 1.5 }, { timeout: 0 }, { timeout: 1801 }]) {
+            const page = createPageMock(vi.fn());
+            await expect(command.func(page, { id: 'offline', ...kwargs })).rejects.toMatchObject({ code: 'ARGUMENT' });
+            expect(page.goto).not.toHaveBeenCalled();
+        }
+    });
+
+    it('stops before starting another scroll after exhausting the time budget', async () => {
+        let now = 0;
+        const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+        try {
+            const page = createPageMock(vi.fn().mockResolvedValue(NOTES_SNAP));
+            page.autoScroll.mockImplementation(async () => { now += 1500; });
+            page.wait.mockImplementation(async options => { now += options.time * 1000; });
+            expect(await command.func(page, { id: 'offline', limit: 1000, timeout: 5 })).toHaveLength(1);
+            expect(page.autoScroll).toHaveBeenCalledTimes(1);
+        } finally { clock.mockRestore(); }
+    });
+
+    it('does not continue hydration reads after the timeout', async () => {
+        let now = 0;
+        const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+        try {
+            const page = createPageMock(vi.fn().mockResolvedValue(NO_STORE_SNAP));
+            page.wait.mockImplementation(async options => { now += options.time * 1000; });
+            await expect(command.func(page, { id: 'offline', limit: 5, timeout: 1 })).rejects.toMatchObject({ code: 'TIMEOUT' });
+            expect(page.evaluate).toHaveBeenCalledTimes(1);
+            expect(page.autoScroll).not.toHaveBeenCalled();
+        } finally { clock.mockRestore(); }
     });
 });

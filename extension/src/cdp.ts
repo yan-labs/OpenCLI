@@ -7,156 +7,21 @@
  */
 
 const attached = new Set<number>();
-const viewports = new Map<number, { width: number; height: number }>();
 
-async function applyViewport(tabId: number, viewport: { width: number; height: number }): Promise<void> {
-  await sendDebuggerCommand({ tabId }, 'Emulation.setDeviceMetricsOverride', {
-    ...viewport, mobile: false, deviceScaleFactor: 1,
-  });
-}
-
-export async function setViewport(tabId: number, viewport: { width: number; height: number } | null): Promise<void> {
-  if (viewport && (!Number.isSafeInteger(viewport.width) || viewport.width <= 0
-    || !Number.isSafeInteger(viewport.height) || viewport.height <= 0)) {
-    throw new Error('Viewport width and height must be positive safe integers');
-  }
-  await ensureAttached(tabId);
-  if (viewport) {
-    await applyViewport(tabId, viewport);
-    viewports.set(tabId, viewport);
-  } else {
-    await sendDebuggerCommand({ tabId }, 'Emulation.clearDeviceMetricsOverride');
-    viewports.delete(tabId);
-  }
-}
-
-type ConsoleMessage = { type: string; text: string; timestamp: number };
-type ConsoleCapture = { captureSupported: boolean; startedAt: number | null; messages: ConsoleMessage[] };
-const consoleCaptures = new Map<number, ConsoleCapture>();
-
-export function readConsoleCapture(tabId: number): ConsoleCapture {
-  const capture = consoleCaptures.get(tabId);
-  return capture ? { ...capture, messages: [...capture.messages] }
-    : { captureSupported: false, startedAt: null, messages: [] };
-}
-
-function recordConsoleEvent(tabId: number, method: string, params: any): void {
-  const capture = consoleCaptures.get(tabId);
-  if (!capture) return;
-  let type: string;
-  let text: string;
-  if (method === 'Runtime.consoleAPICalled') {
-    type = params?.type === 'warn' ? 'warning' : String(params?.type ?? 'log');
-    text = (params?.args ?? []).map((arg: any) => arg.value !== undefined
-      ? (typeof arg.value === 'string' ? arg.value : JSON.stringify(arg.value))
-      : String(arg.description ?? arg.unserializableValue ?? arg.type ?? '')).join(' ');
-  } else if (method === 'Runtime.exceptionThrown') {
-    type = 'error';
-    text = String(params?.exceptionDetails?.exception?.description ?? params?.exceptionDetails?.text ?? 'Uncaught exception');
-  } else return;
-  capture.messages.push({ type, text: text.slice(0, 8192), timestamp: Number(params?.timestamp) || Date.now() });
-  if (capture.messages.length > 500) capture.messages.shift();
-}
-
-
-/**
- * `sessionId` is the flatten-mode CDP session (per chrome.debugger's `source`
- * param) that the Runtime.executionContextCreated event actually arrived on.
- * A context created in a child OOPIF session is NOT visible to a
- * `Runtime.evaluate` sent on the tab-level `{tabId}` debuggee — each flatten
- * session has its own independently-numbered Runtime domain, so a stray
- * `{tabId}`-only send with a child session's contextId does not error, it
- * silently evaluates against whatever context happens to own that same
- * small integer in the MAIN frame's session. Recording sessionId here is
- * what lets evaluateInFrame's cached-context fast path (and the CLI's
- * `eval --context <id>` path in background.ts) address the correct session
- * instead of guessing tabId-only and getting a wrong-but-successful result.
- * Undefined sessionId means the context belongs to the tab-level session.
- */
-const tabFrameContexts = new Map<number, Map<string, { contextId: number; sessionId?: string }>>();
-const tabAllContexts = new Map<number, Map<number, { id: number; origin: string; name: string; auxData: any; sessionId?: string }>>();
-/** Child flatten-mode sessionIds currently attached per tab (added on Target.attachedToTarget, removed on detach/destroy/crash). A route or cached context whose sessionId is missing here is stale and must not be used. */
-const tabLiveSessionIds = new Map<number, Set<string>>();
+const tabFrameContexts = new Map<number, Map<string, number>>();
 const frameTargets = new Map<string, string>();
 const frameTargetKeys = new Map<string, string>();
 let frameTargetCleanupRegistered = false;
-
-/**
- * Chrome 125+ widened `chrome.debugger`'s debuggee to `DebuggerSession`, which
- * adds an optional `sessionId` alongside `tabId` — that is how an extension
- * addresses a flatten-mode child session (an OOPIF auto-attached under a
- * tab-level attach) without attaching to its targetId separately. The
- * @types/chrome pinned in this repo still types `Debuggee` as
- * `{ tabId | extensionId | targetId }` only, so the field is declared here and
- * cast at the call site. Drop the cast once the types catch up.
- */
-type DebuggerSessionTarget = chrome.debugger.Debuggee & { sessionId?: string };
-
-/**
- * How to reach a given child frame. 'session' is the preferred flatten-mode
- * route ({tabId, sessionId}, no extra attach); 'target' is the legacy
- * `chrome.debugger.attach({targetId})` fallback for Chromes that reject the
- * sessionId debuggee. Cached per `frameTargetKey` so each command does not
- * re-probe both paths.
- */
-type FrameRoute =
-  | { kind: 'session'; targetId: string; sessionId: string; debuggee: chrome.debugger.Debuggee }
-  | { kind: 'target'; targetId: string; debuggee: chrome.debugger.Debuggee };
-const frameRoutes = new Map<string, FrameRoute>();
-/** frameTargetKeys for which the sessionId route was tried and rejected — never retried. */
-const frameSessionUnsupported = new Set<string>();
-
-/**
- * OOPIF (out-of-process iframe) targets discovered via CDP `Target.attachedToTarget`
- * events, keyed by tabId then targetId. Populated by registerFrameTracking's
- * onEvent listener once `Target.setAutoAttach` is armed for a tab (see
- * listIframeTargets / ensureFrameRoute). This is the primary discovery path —
- * Chrome pushes an event as each matching sub-target attaches, which is more
- * reliable than a one-shot `Target.getTargets` snapshot that can race target
- * creation or (per anecdotal real-world testing, see listIframeTargets) simply
- * come back empty for a tab-level chrome.debugger session in some cases.
- *
- * Attribution: events for sub-targets auto-attached under a tab-level
- * `chrome.debugger.attach({tabId})` session arrive through chrome.debugger's
- * onEvent with `source.tabId` set to that SAME parent tab (this mirrors the
- * pre-existing Runtime.executionContextCreated handling below, which has
- * relied on the identical fact for child-frame execution contexts). So tabId
- * is the attribution signal used here, and it is the correct one.
- *
- * `sessionId` is the flatten-mode CDP session the `Target.attachedToTarget`
- * event carried in its own params. It is recorded because Chrome 125+ accepts
- * `{ tabId, sessionId }` as a chrome.debugger debuggee (see
- * DebuggerSessionTarget below), which is the ONLY way to talk to an OOPIF from
- * a tab-level session: the older `chrome.debugger.attach({targetId})` route
- * first needs `Target.getTargets`, and Chrome answers that with
- * `{"code":-32000,"message":"Not allowed"}` for a tab-level session.
- */
-const tabIframeTargets = new Map<number, Map<string, { url: string; title: string; sessionId?: string }>>();
-/** Diagnostic counters: total Target.attachedToTarget (iframe) events seen per tab, for the 'debug' frames output. Not reset between calls — it is a lifetime counter surfaced as a coarse "did events fire at all" signal. */
-const tabAttachedEventCounts = new Map<number, number>();
 
 // Large cap so agents stop hitting silent JSON.parse failures on real API bodies.
 // See src/browser/cdp.ts CDP_RESPONSE_BODY_CAPTURE_LIMIT for the matching constant
 // on the direct-CDP path. Keep in sync.
 const CDP_RESPONSE_BODY_CAPTURE_LIMIT = 8 * 1024 * 1024;
 const CDP_REQUEST_BODY_CAPTURE_LIMIT = 1 * 1024 * 1024;
-/**
- * Upper bound on response-body chars held by one tab's capture between reads.
- * Bodies are fetched eagerly at Network.loadingFinished (Chrome discards its
- * own buffer on detach/eviction), so without a ceiling an unread capture on a
- * chatty page would grow without limit. Past the budget a body is NOT stored
- * and the entry is flagged `responseBodyUnavailable` with the reason.
- */
-const CDP_RESPONSE_BODY_TOTAL_BUDGET = 64 * 1024 * 1024;
-/** Deadline for one Network.getResponseBody — shorter than the generic 60s command deadline. */
-const CDP_BODY_FETCH_TIMEOUT_MS = 15_000;
-/** How long a capture read waits for bodies still being fetched before flagging them. */
-const CDP_READ_PENDING_BODY_WAIT_MS = 10_000;
-/** Deadline for chrome.debugger.getTargets when double-checking a timed-out probe. */
-const CDP_TARGET_QUERY_TIMEOUT_MS = 1_000;
 
 type NetworkCaptureEntry = {
   kind: 'cdp';
+  requestId: string;
   url: string;
   method: string;
   requestHeaders?: Record<string, string>;
@@ -170,14 +35,9 @@ type NetworkCaptureEntry = {
   responsePreview?: string;
   responseBodyFullSize?: number;
   responseBodyTruncated?: boolean;
-  /**
-   * Set (with `responseBodyError`) when the response body could not be
-   * captured. `responsePreview` is then absent — an unavailable body is never
-   * reported as an empty string. Absent on entries whose body was captured.
-   */
-  responseBodyUnavailable?: boolean;
-  /** Human-readable reason the body is unavailable (CDP error, re-attach, budget, request failure). */
-  responseBodyError?: string;
+  captureComplete?: boolean;
+  requestBodyPending?: boolean;
+  responseFinished?: boolean;
   timestamp: number;
 };
 
@@ -185,24 +45,7 @@ type NetworkCaptureState = {
   patterns: string[];
   entries: NetworkCaptureEntry[];
   requestToIndex: Map<string, number>;
-  /** Network.getResponseBody calls still running, keyed by the entry they fill in. */
-  bodyFetchesInFlight: Map<NetworkCaptureEntry, Promise<void>>;
-  /** Response-body chars stored on undrained entries (see CDP_RESPONSE_BODY_TOTAL_BUDGET). */
-  storedBodyChars: number;
-  /** Bumped on every read, so a body fetch that lands after its entry was drained does not count against the budget. */
-  generation: number;
 };
-
-function createNetworkCaptureState(patterns: string[]): NetworkCaptureState {
-  return {
-    patterns,
-    entries: [],
-    requestToIndex: new Map(),
-    bodyFetchesInFlight: new Map(),
-    storedBodyChars: 0,
-    generation: 0,
-  };
-}
 
 export type DownloadWaitResult = {
   downloaded: boolean;
@@ -232,22 +75,6 @@ const CDP_COMMAND_TIMEOUT_MS = 60_000;
 const CDP_PROBE_TIMEOUT_MS = 2_000;
 
 /**
- * Raised when a chrome.debugger command misses its deadline. A distinct class
- * lets the health-check tell "renderer busy, command still queued" apart from
- * a real CDP failure ("Debugger is not attached", "Inspected target navigated
- * or closed"). The message is unchanged from the previous plain Error.
- */
-export class CdpCommandTimeoutError extends Error {
-  readonly method: string;
-  readonly timeoutMs: number;
-  constructor(method: string, timeoutMs: number) {
-    super(`CDP command ${method} timed out after ${Math.round(timeoutMs / 1000)}s — the page may be blocked by a native dialog (alert/confirm/print)`);
-    this.method = method;
-    this.timeoutMs = timeoutMs;
-  }
-}
-
-/**
  * chrome.debugger.sendCommand with a deadline. The underlying command cannot
  * be cancelled — this only unblocks the caller so the CLI gets an error
  * instead of an infinite hang.
@@ -270,7 +97,9 @@ export async function sendDebuggerCommand<T = unknown>(
     return await Promise.race([
       commandPromise,
       new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new CdpCommandTimeoutError(method, timeoutMs)), timeoutMs);
+        timer = setTimeout(() => reject(new Error(
+          `CDP command ${method} timed out after ${Math.round(timeoutMs / 1000)}s — the page may be blocked by a native dialog (alert/confirm/print)`,
+        )), timeoutMs);
       }),
     ]);
   } finally {
@@ -281,7 +110,7 @@ export async function sendDebuggerCommand<T = unknown>(
 /** Check if a URL can be attached via CDP — only allow http(s) and blank pages. */
 function isDebuggableUrl(url?: string): boolean {
   if (!url) return true;  // empty/undefined = tab still loading, allow it
-  return url.startsWith('http://') || url.startsWith('https://') || (url === 'about:blank' || url.startsWith('about:blank#')) || url.startsWith('data:');
+  return url.startsWith('http://') || url.startsWith('https://') || url === 'about:blank' || url.startsWith('data:');
 }
 
 export async function ensureAttached(tabId: number, aggressiveRetry: boolean = false): Promise<void> {
@@ -307,18 +136,7 @@ export async function ensureAttached(tabId: number, aggressiveRetry: boolean = f
         expression: '1', returnByValue: true,
       }, CDP_PROBE_TIMEOUT_MS);
       return; // Still attached and working
-    } catch (err) {
-      // A probe that merely TIMED OUT usually means the renderer main thread is
-      // busy (heavy SPA boot, long tasks): Runtime.evaluate queues behind it.
-      // That is not a stale attach, and tearing the session down is actively
-      // harmful — the forced detach below discards every response body Chrome
-      // buffered for the old session, so requests that had already finished
-      // come back with no body. Only re-attach when the probe failed with a
-      // real CDP error or Chrome confirms the debugger is really gone.
-      if (err instanceof CdpCommandTimeoutError && await isDebuggerAttachedToTab(tabId)) {
-        console.warn(`[opencli] health-check probe for tab ${tabId} timed out after ${CDP_PROBE_TIMEOUT_MS}ms but the debugger is still attached — page busy, keeping the session`);
-        return;
-      }
+    } catch {
       // Stale cache entry — need to re-attach
       attached.delete(tabId);
     }
@@ -388,18 +206,11 @@ export async function ensureAttached(tabId: number, aggressiveRetry: boolean = f
   }
   attached.add(tabId);
 
-  // Start a new capture interval after each attachment; a detach creates a gap.
-  const capture: ConsoleCapture = { captureSupported: false, startedAt: Date.now(), messages: [] };
-  consoleCaptures.set(tabId, capture);
   try {
     await sendDebuggerCommand({ tabId }, 'Runtime.enable');
-    capture.captureSupported = true;
   } catch {
-    capture.startedAt = null;
+    // Some pages may not need explicit enable
   }
-
-  const viewport = viewports.get(tabId);
-  if (viewport) await applyViewport(tabId, viewport);
 
   // Restore network capture that the re-attach (detach + onDetach) tore down.
   // The detach always disables the CDP Network domain, so re-enable it and put
@@ -409,10 +220,6 @@ export async function ensureAttached(tabId: number, aggressiveRetry: boolean = f
   if (preservedNetworkCapture) {
     try {
       await sendDebuggerCommand({ tabId }, 'Network.enable');
-      // The old session's response buffers died with the detach: any entry
-      // whose body was not fetched yet can never get one. Say so explicitly
-      // instead of letting it surface as a 200 with an empty body.
-      markBodiesLostToReattach(preservedNetworkCapture);
       networkCaptures.set(tabId, preservedNetworkCapture);
     } catch {
       // Leave capture cleared rather than arm a half-attached Network domain;
@@ -473,7 +280,6 @@ export async function screenshot(
 ): Promise<string> {
   await ensureAttached(tabId);
 
-  const persistentViewport = viewports.get(tabId);
   const format = options.format ?? 'png';
   const fullPage = options.fullPage === true;
   const overrideWidth = options.width && options.width > 0 ? Math.ceil(options.width) : undefined;
@@ -481,38 +287,38 @@ export async function screenshot(
   const overrideHeight = !fullPage && options.height && options.height > 0 ? Math.ceil(options.height) : undefined;
   const needsOverride = fullPage || overrideWidth !== undefined || overrideHeight !== undefined;
 
-  try {
-    if (needsOverride) {
-      // When width is set, apply it first so layout reflows before we read content size.
-      if (overrideWidth !== undefined && fullPage) {
-        await sendDebuggerCommand({ tabId }, 'Emulation.setDeviceMetricsOverride', {
-          mobile: false,
-          width: overrideWidth,
-          height: 0,
-          deviceScaleFactor: 1,
-        });
-      }
-      let finalWidth = overrideWidth ?? persistentViewport?.width ?? 0;
-      let finalHeight = overrideHeight ?? persistentViewport?.height ?? 0;
-      if (fullPage) {
-        const metrics = await sendDebuggerCommand({ tabId }, 'Page.getLayoutMetrics') as {
-          contentSize?: { width: number; height: number };
-          cssContentSize?: { width: number; height: number };
-        };
-        const size = metrics.cssContentSize || metrics.contentSize;
-        if (size) {
-          if (finalWidth === 0) finalWidth = Math.ceil(size.width);
-          finalHeight = Math.ceil(size.height);
-        }
-      }
+  if (needsOverride) {
+    // When width is set, apply it first so layout reflows before we read content size.
+    if (overrideWidth !== undefined && fullPage) {
       await sendDebuggerCommand({ tabId }, 'Emulation.setDeviceMetricsOverride', {
         mobile: false,
-        width: finalWidth,
-        height: finalHeight,
+        width: overrideWidth,
+        height: 0,
         deviceScaleFactor: 1,
       });
     }
+    let finalWidth = overrideWidth ?? 0;
+    let finalHeight = overrideHeight ?? 0;
+    if (fullPage) {
+      const metrics = await sendDebuggerCommand({ tabId }, 'Page.getLayoutMetrics') as {
+        contentSize?: { width: number; height: number };
+        cssContentSize?: { width: number; height: number };
+      };
+      const size = metrics.cssContentSize || metrics.contentSize;
+      if (size) {
+        if (finalWidth === 0) finalWidth = Math.ceil(size.width);
+        finalHeight = Math.ceil(size.height);
+      }
+    }
+    await sendDebuggerCommand({ tabId }, 'Emulation.setDeviceMetricsOverride', {
+      mobile: false,
+      width: finalWidth,
+      height: finalHeight,
+      deviceScaleFactor: 1,
+    });
+  }
 
+  try {
     const params: Record<string, unknown> = { format };
     if (format === 'jpeg' && options.quality !== undefined) {
       params.quality = Math.max(0, Math.min(100, options.quality));
@@ -525,8 +331,7 @@ export async function screenshot(
     return result.data;
   } finally {
     if (needsOverride) {
-      if (persistentViewport) await applyViewport(tabId, persistentViewport);
-      else await sendDebuggerCommand({ tabId }, 'Emulation.clearDeviceMetricsOverride').catch(() => {});
+      await sendDebuggerCommand({ tabId }, 'Emulation.clearDeviceMetricsOverride').catch(() => {});
     }
   }
 }
@@ -588,9 +393,11 @@ export async function setFileInputFiles(
       };
       chrome.debugger.onEvent.addListener(listener);
       // Open the chooser programmatically — interception suppresses the native
-      // dialog and fires Page.fileChooserOpened instead. Works for hidden inputs.
+      // dialog and fires Page.fileChooserOpened instead. Chrome requires user
+      // activation even for visible inputs; hidden inputs need no style changes.
       void sendDebuggerCommand({ tabId }, 'Runtime.evaluate', {
         expression: `document.querySelector(${JSON.stringify(query)}).click()`,
+        userGesture: true,
       }).catch((err) => {
         cleanup();
         reject(err instanceof Error ? err : new Error(String(err)));
@@ -729,34 +536,21 @@ function registerFrameTargetCleanup(): void {
 function clearFrameTarget(targetId: string): void {
   if (!targetId) return;
   const key = frameTargetKeys.get(targetId);
-  if (key) {
-    frameTargets.delete(key);
-    frameRoutes.delete(key);
-  }
+  if (key) frameTargets.delete(key);
   frameTargetKeys.delete(targetId);
 }
 
-/**
- * Resolve a frame to a usable CDP route, preferring the flatten-mode
- * `{tabId, sessionId}` session recorded from `Target.attachedToTarget` over
- * the legacy attach-by-targetId path (which depends on `Target.getTargets`,
- * a command Chrome answers with "Not allowed" for a tab-level session).
- *
- * `forceAttach` skips the session route — used by the one-shot fallback in
- * sendCommandInFrameTarget when a sessionId debuggee is rejected.
- */
-async function ensureFrameRoute(
+async function ensureFrameTarget(
   tabId: number,
   frameId: string,
   aggressiveRetry: boolean = false,
   targetUrl?: string,
-  forceAttach: boolean = false,
-): Promise<FrameRoute> {
+): Promise<string> {
   registerFrameTargetCleanup();
   await ensureAttached(tabId, aggressiveRetry);
   const key = frameTargetKey(tabId, frameId);
-  const cached = frameRoutes.get(key);
-  if (cached) return cached;
+  const existing = frameTargets.get(key);
+  if (existing) return existing;
 
   await sendDebuggerCommand({ tabId }, 'Target.setDiscoverTargets', { discover: true }).catch(() => {});
   await sendDebuggerCommand({ tabId }, 'Target.setAutoAttach', {
@@ -765,83 +559,18 @@ async function ensureFrameRoute(
     flatten: true,
     filter: [{ type: 'iframe', exclude: false }],
   }).catch(() => {});
-
-  let known = resolveFrameFromAttachEvents(tabId, frameId, targetUrl);
-  if (!known && !(tabIframeTargets.get(tabId)?.size)) {
-    // Nothing recorded yet for this tab — autoAttach was likely just armed, so
-    // give the asynchronous attachedToTarget events a brief chance to land.
-    await waitForIframeAttachEvents(tabId, 300);
-    known = resolveFrameFromAttachEvents(tabId, frameId, targetUrl);
+  const targetId = await resolveFrameTargetId(tabId, frameId, targetUrl);
+  try {
+    await chrome.debugger.attach({ targetId } as chrome.debugger.Debuggee, '1.3');
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (!message.includes('Another debugger is already attached')) throw err;
   }
-
-  const useSession = !forceAttach && !frameSessionUnsupported.has(key) && !!known?.sessionId;
-  let route: FrameRoute;
-  if (useSession && known?.sessionId) {
-    route = {
-      kind: 'session',
-      targetId: known.targetId,
-      sessionId: known.sessionId,
-      // Cast: sessionId is a Chrome 125+ debuggee field the pinned
-      // @types/chrome does not know about. See DebuggerSessionTarget.
-      debuggee: { tabId, sessionId: known.sessionId } as DebuggerSessionTarget as chrome.debugger.Debuggee,
-    };
-  } else {
-    const targetId = known?.targetId ?? await resolveFrameTargetId(tabId, frameId, targetUrl);
-    try {
-      await chrome.debugger.attach({ targetId } as chrome.debugger.Debuggee, '1.3');
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      if (!message.includes('Another debugger is already attached')) throw err;
-    }
-    frameTargets.set(key, targetId);
-    route = { kind: 'target', targetId, debuggee: { targetId } as chrome.debugger.Debuggee };
-  }
-  frameTargetKeys.set(route.targetId, key);
-  frameRoutes.set(key, route);
-  // Runtime domain must be enabled once per session before Runtime.evaluate.
-  await sendDebuggerCommand(route.debuggee, 'Runtime.enable').catch(() => {});
-  return route;
+  frameTargets.set(key, targetId);
+  frameTargetKeys.set(targetId, key);
+  return targetId;
 }
 
-/** Forget a route that turned out to be unusable, so the next call re-resolves. */
-function demoteFrameRoute(tabId: number, frameId: string): void {
-  const key = frameTargetKey(tabId, frameId);
-  const route = frameRoutes.get(key);
-  frameRoutes.delete(key);
-  if (route) {
-    frameSessionUnsupported.add(key);
-    frameTargetKeys.delete(route.targetId);
-  }
-}
-
-/**
- * Look the frame up in the targets collected from `Target.attachedToTarget`.
- * The CLI passes the OOPIF's targetId as the frameId (that is what the
- * `frames` command reports), so a direct key hit is the normal case; URL
- * matching covers callers that only know the frame's URL.
- */
-function resolveFrameFromAttachEvents(
-  tabId: number,
-  frameId: string,
-  targetUrl?: string,
-): { targetId: string; sessionId?: string } | undefined {
-  const known = tabIframeTargets.get(tabId);
-  if (!known) return undefined;
-  const direct = known.get(frameId);
-  if (direct) return { targetId: frameId, sessionId: direct.sessionId };
-  if (targetUrl) {
-    for (const [targetId, info] of known) {
-      if (info.url === targetUrl) return { targetId, sessionId: info.sessionId };
-    }
-  }
-  return undefined;
-}
-
-/**
- * Last-resort resolution via `Target.getTargets`. Kept for the environments where
- * the command is permitted; a tab-level chrome.debugger session normally gets
- * `{"code":-32000,"message":"Not allowed"}` back, hence the catch.
- */
 async function resolveFrameTargetId(tabId: number, frameId: string, targetUrl?: string): Promise<string> {
   const result = await sendDebuggerCommand({ tabId }, 'Target.getTargets').catch(() => null) as
     | { targetInfos?: Array<{ targetId?: string; id?: string; type?: string; url?: string }> }
@@ -864,143 +593,6 @@ async function resolveFrameTargetId(tabId: number, frameId: string, targetUrl?: 
   throw new Error(`No iframe target found for frame ${frameId}${targetUrl ? ` (${targetUrl})` : ''}. Candidates: ${candidates || 'none'}`);
 }
 
-export type IframeTargetInfo = { targetId: string; url: string; title: string };
-
-export type IframeDiscoveryDebug = {
-  /** Error from Target.setAutoAttach, if it rejected (normally swallowed). */
-  autoAttachError?: string;
-  /** Error from Target.getTargets, if it rejected (normally swallowed). */
-  getTargetsError?: string;
-  /** How many type==='iframe' entries Target.getTargets returned, before DOM filtering. */
-  getTargetsIframeCount: number;
-  /** How many Target.attachedToTarget (iframe) events had landed in tabIframeTargets by the time discovery finished. */
-  attachedEventCount: number;
-  /** <iframe src> URLs found by walking the tab's DOM (including shadow roots), used to filter getTargets candidates. */
-  domFrameUrls: string[];
-};
-
-/**
- * Poll tabIframeTargets for this tab until it stops growing (2 consecutive
- * empty ticks) or maxWaitMs elapses, so callers give chrome.debugger time to
- * deliver Target.attachedToTarget events after Target.setAutoAttach arms —
- * those events are asynchronous and are not guaranteed to have landed by the
- * time setAutoAttach's own promise resolves.
- */
-async function waitForIframeAttachEvents(tabId: number, maxWaitMs = 500): Promise<void> {
-  const start = Date.now();
-  const tickMs = 50;
-  let lastSize = tabIframeTargets.get(tabId)?.size ?? 0;
-  let stableTicks = 0;
-  while (Date.now() - start < maxWaitMs) {
-    await new Promise((resolve) => setTimeout(resolve, tickMs));
-    const size = tabIframeTargets.get(tabId)?.size ?? 0;
-    if (size === lastSize) {
-      stableTicks += 1;
-      if (stableTicks >= 2 && size > 0) return;
-    } else {
-      stableTicks = 0;
-      lastSize = size;
-    }
-  }
-}
-
-/**
- * List OOPIF (out-of-process iframe) targets for a tab, for cross-origin
- * iframes that Page.getFrameTree's childFrames omits under Chrome's site
- * isolation.
- *
- * Primary source: `Target.attachedToTarget` events, collected into
- * tabIframeTargets by registerFrameTracking as they land (see that map's own
- * doc comment for why source.tabId is trustworthy attribution here). This is
- * the reliable path — real-world testing found `Target.getTargets` can come
- * back empty for a tab-level chrome.debugger session even when a matching
- * OOPIF genuinely exists (e.g. a shadow-DOM-hosted cross-origin iframe
- * injected by another extension), so a getTargets snapshot alone is not
- * sufficient.
- *
- * Secondary source: `Target.getTargets`, kept as a supplementary candidate
- * list in case autoAttach events are slow or the target attached before
- * tracking was armed. Because Target.getTargets is a CDP-spec browser-global
- * command and it is undocumented whether chrome.debugger's per-tab
- * attachment narrows its result to this tab, every getTargets candidate is
- * cross-checked against this tab's own DOM (the <iframe> elements' `src`,
- * walking shadow roots, by exact URL or, failing that, origin) before being
- * trusted — event-sourced candidates are NOT filtered this way since they are
- * already tab-scoped by construction. If the DOM can't be read (e.g. CSP or a
- * timing race), getTargets candidates are kept unfiltered rather than
- * silently dropped, since an unverified frame is still more useful than none.
- */
-export async function listIframeTargets(tabId: number): Promise<{ targets: IframeTargetInfo[]; debug: IframeDiscoveryDebug }> {
-  await ensureAttached(tabId);
-  await sendDebuggerCommand({ tabId }, 'Target.setDiscoverTargets', { discover: true }).catch(() => {});
-
-  let autoAttachError: string | undefined;
-  try {
-    await sendDebuggerCommand({ tabId }, 'Target.setAutoAttach', {
-      autoAttach: true,
-      waitForDebuggerOnStart: false,
-      flatten: true,
-      filter: [{ type: 'iframe', exclude: false }],
-    });
-  } catch (err) {
-    autoAttachError = err instanceof Error ? err.message : String(err);
-  }
-
-  await waitForIframeAttachEvents(tabId);
-
-  const eventCandidates: IframeTargetInfo[] = Array.from(tabIframeTargets.get(tabId)?.entries() ?? [])
-    .map(([targetId, info]) => ({ targetId, url: info.url, title: info.title }));
-  const knownTargetIds = new Set(eventCandidates.map((c) => c.targetId));
-
-  let getTargetsError: string | undefined;
-  let getTargetsCandidates: IframeTargetInfo[] = [];
-  try {
-    const result = await sendDebuggerCommand({ tabId }, 'Target.getTargets') as
-      { targetInfos?: Array<{ targetId?: string; id?: string; type?: string; url?: string; title?: string }> };
-    const targets = result?.targetInfos ?? [];
-    getTargetsCandidates = targets
-      .filter((t) => t.type === 'iframe')
-      .map((t) => ({ targetId: t.targetId || t.id || '', url: t.url || '', title: t.title || '' }))
-      .filter((t) => t.targetId && !knownTargetIds.has(t.targetId));
-  } catch (err) {
-    getTargetsError = err instanceof Error ? err.message : String(err);
-  }
-  const getTargetsIframeCount = getTargetsCandidates.length;
-
-  let domFrameUrls: string[] = [];
-  if (getTargetsCandidates.length > 0) {
-    try {
-      const raw = await evaluate(
-        tabId,
-        `(() => { const out = []; const walk = (root) => { for (const el of root.querySelectorAll('*')) { if (el.tagName === 'IFRAME' && el.src) out.push(el.src); if (el.shadowRoot) walk(el.shadowRoot); } }; walk(document); return out; })()`,
-      );
-      if (Array.isArray(raw)) domFrameUrls = raw as string[];
-    } catch {
-      // Can't verify — fall through and trust getTargets' own scoping.
-    }
-    if (domFrameUrls.length > 0) {
-      const domOrigins = new Set<string>();
-      for (const url of domFrameUrls) {
-        try { domOrigins.add(new URL(url).origin); } catch { /* ignore */ }
-      }
-      getTargetsCandidates = getTargetsCandidates.filter((c) => domFrameUrls.includes(c.url) || (() => {
-        try { return domOrigins.has(new URL(c.url).origin); } catch { return false; }
-      })());
-    }
-  }
-
-  return {
-    targets: [...eventCandidates, ...getTargetsCandidates],
-    debug: {
-      autoAttachError,
-      getTargetsError,
-      getTargetsIframeCount,
-      attachedEventCount: eventCandidates.length,
-      domFrameUrls,
-    },
-  };
-}
-
 export async function sendCommandInFrameTarget(
   tabId: number,
   frameId: string,
@@ -1010,18 +602,9 @@ export async function sendCommandInFrameTarget(
   timeoutMs: number = CDP_COMMAND_TIMEOUT_MS,
   targetUrl?: string,
 ): Promise<unknown> {
-  const route = await ensureFrameRoute(tabId, frameId, aggressiveRetry, targetUrl);
-  try {
-    return await sendDebuggerCommand(route.debuggee, method, params, timeoutMs);
-  } catch (err) {
-    if (route.kind !== 'session') throw err;
-    // The {tabId, sessionId} debuggee is Chrome 125+; on an older build it is
-    // rejected outright, and a session can also disappear under us. Fall back
-    // once to attach-by-targetId and remember not to try the session again.
-    demoteFrameRoute(tabId, frameId);
-    const fallback = await ensureFrameRoute(tabId, frameId, aggressiveRetry, targetUrl, true);
-    return sendDebuggerCommand(fallback.debuggee, method, params, timeoutMs);
-  }
+  const targetId = await ensureFrameTarget(tabId, frameId, aggressiveRetry, targetUrl);
+  const target = { targetId } as chrome.debugger.Debuggee;
+  return sendDebuggerCommand(target, method, params, timeoutMs);
 }
 
 export async function insertText(
@@ -1037,138 +620,35 @@ export function registerFrameTracking(): void {
   chrome.debugger.onEvent.addListener((source, method, params: any) => {
     const tabId = source.tabId;
     if (!tabId) return;
-    // Chrome 106+ stamps flatten-mode child-session events with
-    // source.sessionId (same DebuggerSessionTarget widening as the debuggee
-    // side — see the type above). Undefined means this event came from the
-    // tab-level session itself.
-    const eventSessionId = (source as DebuggerSessionTarget).sessionId;
-    recordConsoleEvent(tabId, method, params);
 
     if (method === 'Runtime.executionContextCreated') {
       const context = params.context;
-      // Store ALL contexts (including content script isolated worlds)
-      if (context?.auxData?.frameId) {
-        if (!tabAllContexts.has(tabId)) {
-          tabAllContexts.set(tabId, new Map());
-        }
-        tabAllContexts.get(tabId)!.set(context.id, {
-          id: context.id,
-          origin: context.origin || '',
-          name: context.name || '',
-          auxData: context.auxData,
-          sessionId: eventSessionId,
-        });
-      }
       if (!context?.auxData?.frameId || context.auxData.isDefault !== true) return;
       const frameId = context.auxData.frameId as string;
       if (!tabFrameContexts.has(tabId)) {
         tabFrameContexts.set(tabId, new Map());
       }
-      tabFrameContexts.get(tabId)!.set(frameId, { contextId: context.id, sessionId: eventSessionId });
+      tabFrameContexts.get(tabId)!.set(frameId, context.id);
     }
 
     if (method === 'Runtime.executionContextDestroyed') {
       const ctxId = params.executionContextId;
-      tabAllContexts.get(tabId)?.delete(ctxId);
       const contexts = tabFrameContexts.get(tabId);
       if (contexts) {
-        for (const [fid, entry] of contexts) {
-          if (entry.contextId === ctxId) { contexts.delete(fid); break; }
+        for (const [fid, cid] of contexts) {
+          if (cid === ctxId) { contexts.delete(fid); break; }
         }
       }
     }
 
     if (method === 'Runtime.executionContextsCleared') {
       tabFrameContexts.delete(tabId);
-      tabAllContexts.delete(tabId);
-    }
-
-    if (method === 'Target.attachedToTarget') {
-      const targetInfo = params?.targetInfo as { targetId?: string; type?: string; url?: string; title?: string } | undefined;
-      const attachedSessionId = typeof params?.sessionId === 'string' ? params.sessionId : undefined;
-      if (attachedSessionId) {
-        if (!tabLiveSessionIds.has(tabId)) tabLiveSessionIds.set(tabId, new Set());
-        tabLiveSessionIds.get(tabId)!.add(attachedSessionId);
-      }
-      if (targetInfo?.type === 'iframe' && targetInfo.targetId) {
-        if (!tabIframeTargets.has(tabId)) tabIframeTargets.set(tabId, new Map());
-        tabIframeTargets.get(tabId)!.set(targetInfo.targetId, {
-          url: targetInfo.url || '',
-          title: targetInfo.title || '',
-          // Flatten-mode child session id — the preferred way to command this
-          // OOPIF (see ensureFrameRoute).
-          sessionId: attachedSessionId,
-        });
-        tabAttachedEventCounts.set(tabId, (tabAttachedEventCounts.get(tabId) || 0) + 1);
-      }
-    }
-
-    if (method === 'Target.detachedFromTarget') {
-      const targetId = String(params?.targetId || '');
-      if (targetId) tabIframeTargets.get(tabId)?.delete(targetId);
-      const sessionId = String(params?.sessionId || '');
-      if (sessionId) {
-        tabLiveSessionIds.get(tabId)?.delete(sessionId);
-        clearFrameRoutesForSession(tabId, sessionId);
-        clearContextsForSession(tabId, sessionId);
-      }
-    }
-
-    // Target.targetDestroyed / Target.targetCrashed carry only targetId (no
-    // sessionId) but mean the same thing for routing purposes: whatever
-    // route or cached context pointed at that target is now dead and must
-    // not be reused silently. Chrome does not guarantee detachedFromTarget
-    // also fires in every case (e.g. the tab-level session going away out
-    // from under a still-listed OOPIF), so this is a second, independent
-    // invalidation path rather than relying on detachedFromTarget alone.
-    if (method === 'Target.targetDestroyed' || method === 'Target.targetCrashed') {
-      const targetId = String(params?.targetId || '');
-      if (targetId) {
-        const info = tabIframeTargets.get(tabId)?.get(targetId);
-        tabIframeTargets.get(tabId)?.delete(targetId);
-        if (info?.sessionId) {
-          tabLiveSessionIds.get(tabId)?.delete(info.sessionId);
-          clearFrameRoutesForSession(tabId, info.sessionId);
-          clearContextsForSession(tabId, info.sessionId);
-        }
-        clearFrameTarget(targetId);
-      }
     }
   });
 
   chrome.tabs.onRemoved.addListener((tabId) => {
-    consoleCaptures.delete(tabId);
     tabFrameContexts.delete(tabId);
-    tabAllContexts.delete(tabId);
-    tabIframeTargets.delete(tabId);
-    tabLiveSessionIds.delete(tabId);
-    tabAttachedEventCounts.delete(tabId);
   });
-}
-
-export function getAllContexts(tabId: number): Array<{ id: number; origin: string; name: string; auxData: any; sessionId?: string }> {
-  const contexts = tabAllContexts.get(tabId);
-  if (!contexts) return [];
-  return Array.from(contexts.values());
-}
-
-/**
- * Which flatten-mode session (undefined = tab-level) a given execution
- * context id belongs to, and whether that session is still live. Used by
- * background.ts's `eval --context <id>` handling to route the command to
- * the session that actually owns the context instead of guessing
- * `{tabId}`-only — which, for a child-session context id, does not error,
- * it silently evaluates a same-numbered context in the wrong (main) frame.
- */
-export function resolveContextSession(
-  tabId: number,
-  contextId: number,
-): { sessionId?: string; live: boolean } | undefined {
-  const entry = tabAllContexts.get(tabId)?.get(contextId);
-  if (!entry) return undefined;
-  if (!entry.sessionId) return { sessionId: undefined, live: true };
-  const live = tabLiveSessionIds.get(tabId)?.has(entry.sessionId) ?? false;
-  return { sessionId: entry.sessionId, live };
 }
 
 export async function getFrameTree(tabId: number): Promise<any> {
@@ -1188,25 +668,13 @@ export async function evaluateInFrame(
   await sendDebuggerCommand({ tabId }, 'Runtime.enable').catch(() => {});
 
   const contexts = tabFrameContexts.get(tabId);
-  const cached = contexts?.get(frameId);
+  const contextId = contexts?.get(frameId);
 
-  // A cached context tied to a child flatten-mode session MUST be routed via
-  // {tabId, sessionId} — sending it on the plain {tabId} (tab-level) debuggee
-  // does not error, it silently evaluates a same-numbered context in the
-  // main frame's own session instead (each flatten session numbers its
-  // Runtime contexts independently). If the owning session is no longer
-  // live, treat the cache as stale rather than guessing.
-  const cacheUsable = cached !== undefined
-    && (cached.sessionId === undefined || (tabLiveSessionIds.get(tabId)?.has(cached.sessionId) ?? false));
-
-  if (cacheUsable && cached) {
-    const debuggee = cached.sessionId
-      ? ({ tabId, sessionId: cached.sessionId } as DebuggerSessionTarget as chrome.debugger.Debuggee)
-      : ({ tabId } as chrome.debugger.Debuggee);
+  if (contextId !== undefined) {
     try {
-      const result = await sendDebuggerCommand(debuggee, 'Runtime.evaluate', {
+      const result = await sendDebuggerCommand({ tabId }, 'Runtime.evaluate', {
         expression,
-        contextId: cached.contextId,
+        contextId,
         returnByValue: true,
         awaitPromise: true,
       }, timeoutMs) as {
@@ -1228,20 +696,15 @@ export async function evaluateInFrame(
       // fall through to the frame-target path instead of failing (evaluate()
       // likewise re-resolves on a dead context). Re-throw genuine page errors.
       const msg = String((err as { message?: string })?.message || err);
-      if (!/Cannot find context|context with specified id|Execution context was destroyed|No session with given id|Detached while handling command/i.test(msg)) {
+      if (!/Cannot find context|context with specified id|Execution context was destroyed/i.test(msg)) {
         throw err;
       }
       contexts?.delete(frameId);
     }
-  } else if (cached) {
-    // Cache hit but the owning session is no longer live — drop it instead
-    // of ever sending the stale contextId anywhere.
-    contexts?.delete(frameId);
   }
 
-  // No cached context, or the cached one went stale: resolve via the frame
-  // target/session. ensureFrameRoute issues Runtime.enable once per route, so
-  // no per-command enable is needed here.
+  // No cached context, or the cached one went stale: resolve via the frame target.
+  await sendCommandInFrameTarget(tabId, frameId, 'Runtime.enable', {}, aggressiveRetry, timeoutMs).catch(() => undefined);
   const result = await sendCommandInFrameTarget(tabId, frameId, 'Runtime.evaluate', {
     expression,
     returnByValue: true,
@@ -1298,6 +761,7 @@ function getOrCreateNetworkCaptureEntry(tabId: number, requestId: string, fallba
   if (!shouldCaptureUrl(url, state.patterns)) return null;
   const entry: NetworkCaptureEntry = {
     kind: 'cdp',
+    requestId,
     url,
     method: fallback?.method || 'GET',
     requestHeaders: fallback?.requestHeaders || {},
@@ -1308,140 +772,42 @@ function getOrCreateNetworkCaptureEntry(tabId: number, requestId: string, fallba
   return entry;
 }
 
-/**
- * Ask Chrome (browser process, not the renderer) whether a debugger is still
- * attached to the tab. Used only after a health-check probe TIMED OUT, to tell
- * a busy page from a dead session. Any failure or missing API answers "no",
- * which keeps the old re-attach behaviour.
- */
-async function isDebuggerAttachedToTab(tabId: number): Promise<boolean> {
-  const api = chrome.debugger as unknown as {
-    getTargets?: () => Promise<Array<{ tabId?: number; attached?: boolean }>>;
-  };
-  if (typeof api.getTargets !== 'function') return false;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    const targets = await Promise.race([
-      api.getTargets(),
-      new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), CDP_TARGET_QUERY_TIMEOUT_MS); }),
-    ]);
-    if (!Array.isArray(targets)) return false;
-    return targets.some((target) => target.tabId === tabId && target.attached === true);
-  } catch {
-    return false;
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-  }
-}
-
-function markBodyUnavailable(entry: NetworkCaptureEntry, reason: string): void {
-  // Never clobber a body that was already captured.
-  if (entry.responsePreview !== undefined) return;
-  entry.responseBodyUnavailable = true;
-  entry.responseBodyError = reason;
-}
-
-const REATTACH_BODY_LOST_REASON = 'debugger re-attached before this response body was fetched; Chrome discards the previous debugger session\'s response buffers, so Network.getResponseBody can no longer return it';
-const REATTACH_IN_FLIGHT_LOST_REASON = 'debugger re-attached while this request was in flight; its completion and body are not observable from the new debugger session';
-
-function markBodiesLostToReattach(state: NetworkCaptureState): void {
-  for (const entry of state.entries) {
-    if (entry.responsePreview !== undefined || entry.responseBodyUnavailable) continue;
-    // A fetch already running records its own outcome (success, or the CDP error).
-    if (state.bodyFetchesInFlight.has(entry)) continue;
-    markBodyUnavailable(entry, entry.responseStatus === undefined ? REATTACH_IN_FLIGHT_LOST_REASON : REATTACH_BODY_LOST_REASON);
-  }
-}
-
-/**
- * Fetch and cache one response body right at Network.loadingFinished, while
- * Chrome still holds it. Never rejects: every failure lands on the entry as
- * `responseBodyUnavailable` + `responseBodyError`.
- */
-function captureResponseBody(
-  tabId: number,
-  state: NetworkCaptureState,
-  requestId: string,
-  entry: NetworkCaptureEntry,
-): Promise<void> {
-  const existing = state.bodyFetchesInFlight.get(entry);
-  if (existing) return existing;
-  const generation = state.generation;
-  // Declared before assignment so the IIFE's finally can compare against it
-  // (it only runs after the first await, once the assignment has happened).
-  let fetchPromise: Promise<void> | undefined;
-  fetchPromise = (async () => {
-    try {
-      const result = await sendDebuggerCommand<{ body?: string; base64Encoded?: boolean }>(
-        { tabId }, 'Network.getResponseBody', { requestId }, CDP_BODY_FETCH_TIMEOUT_MS,
-      );
-      if (typeof result?.body !== 'string') {
-        markBodyUnavailable(entry, 'Network.getResponseBody returned no body');
-        return;
-      }
-      const fullSize = result.body.length;
-      const truncated = fullSize > CDP_RESPONSE_BODY_CAPTURE_LIMIT;
-      const stored = truncated ? result.body.slice(0, CDP_RESPONSE_BODY_CAPTURE_LIMIT) : result.body;
-      // A fetch that lands after its entry was drained belongs to a snapshot
-      // that is already gone — it must not eat the current budget.
-      const counted = generation === state.generation;
-      if (counted && state.storedBodyChars + stored.length > CDP_RESPONSE_BODY_TOTAL_BUDGET) {
-        entry.responseBodyFullSize = fullSize;
-        markBodyUnavailable(entry, `capture body budget exceeded: undrained bodies on this tab already hold ${state.storedBodyChars} chars (budget ${CDP_RESPONSE_BODY_TOTAL_BUDGET}); read the capture more often`);
-        return;
-      }
-      entry.responsePreview = result.base64Encoded ? `base64:${stored}` : stored;
-      entry.responseBodyFullSize = fullSize;
-      entry.responseBodyTruncated = truncated;
-      delete entry.responseBodyUnavailable;
-      delete entry.responseBodyError;
-      if (counted) state.storedBodyChars += stored.length;
-    } catch (err) {
-      markBodyUnavailable(entry, `Network.getResponseBody failed: ${err instanceof Error ? err.message : String(err)}`);
-    } finally {
-      if (state.bodyFetchesInFlight.get(entry) === fetchPromise) state.bodyFetchesInFlight.delete(entry);
-    }
-  })();
-  state.bodyFetchesInFlight.set(entry, fetchPromise);
-  return fetchPromise;
-}
-
 export async function startNetworkCapture(
   tabId: number,
   pattern?: string,
 ): Promise<void> {
   await ensureAttached(tabId);
   await sendDebuggerCommand({ tabId }, 'Network.enable');
-  networkCaptures.set(tabId, createNetworkCaptureState(normalizeCapturePatterns(pattern)));
+  networkCaptures.set(tabId, {
+    patterns: normalizeCapturePatterns(pattern),
+    entries: [],
+    requestToIndex: new Map(),
+  });
 }
 
-export async function readNetworkCapture(tabId: number): Promise<NetworkCaptureEntry[]> {
-  let state = networkCaptures.get(tabId);
+export async function readNetworkCapture(tabId: number, retainIncomplete = false): Promise<NetworkCaptureEntry[]> {
+  const state = networkCaptures.get(tabId);
   if (!state) return [];
-  // A body fetch can still be running when the caller reads (busy page, slow
-  // renderer). Draining now would ship the entry without its body and then
-  // drop the late result on the floor — wait a bounded time instead.
-  if (state.bodyFetchesInFlight.size > 0) {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    await Promise.race([
-      Promise.all([...state.bodyFetchesInFlight.values()]),
-      new Promise<void>((resolve) => { timer = setTimeout(resolve, CDP_READ_PENDING_BODY_WAIT_MS); }),
-    ]);
-    if (timer !== undefined) clearTimeout(timer);
-    state = networkCaptures.get(tabId);
-    if (!state) return [];
+  // A request can be visible in the page before CDP finishes fetching its
+  // response body. Return a snapshot, but retain unfinished entries so a
+  // later read can observe the completed response instead of losing it.
+  const entries = state.entries.map(entry => ({ ...entry }));
+  if (!retainIncomplete) {
+    state.entries = [];
+    state.requestToIndex.clear();
+    return entries;
   }
-  for (const entry of state.bodyFetchesInFlight.keys()) {
-    markBodyUnavailable(entry, `response body fetch still pending after waiting ${CDP_READ_PENDING_BODY_WAIT_MS}ms when the capture was read`);
+  const pendingEntries: NetworkCaptureEntry[] = [];
+  const pendingMap = new Map<string, number>();
+  for (const [requestId, index] of state.requestToIndex) {
+    const entry = state.entries[index];
+    if (entry && !entry.captureComplete) {
+      pendingMap.set(requestId, pendingEntries.length);
+      pendingEntries.push(entry);
+    }
   }
-  // Copies: a fetch that lands after this read must not mutate the snapshot
-  // while it is being serialized back to the daemon.
-  const entries = state.entries.map((entry) => ({ ...entry }));
-  state.entries = [];
-  state.requestToIndex.clear();
-  state.bodyFetchesInFlight.clear();
-  state.storedBodyChars = 0;
-  state.generation += 1;
+  state.entries = pendingEntries;
+  state.requestToIndex = pendingMap;
   return entries;
 }
 
@@ -1449,52 +815,9 @@ export function hasActiveNetworkCapture(tabId: number): boolean {
   return networkCaptures.has(tabId);
 }
 
-/**
- * Drop any tabFrameContexts / tabAllContexts entries attributed to a
- * flatten-mode session that just detached, was destroyed, or crashed — a
- * cached contextId for a dead session must never be reused; a numerically
- * identical contextId can legitimately exist in a different (e.g. the
- * tab-level) session and silently produce a wrong-frame result instead of
- * an error. See evaluateInFrame's fast path and handleExec's
- * `cmd.execContextId` branch in background.ts.
- */
-function clearContextsForSession(tabId: number, sessionId: string): void {
-  const frameCtxs = tabFrameContexts.get(tabId);
-  if (frameCtxs) {
-    for (const [fid, entry] of [...frameCtxs.entries()]) {
-      if (entry.sessionId === sessionId) frameCtxs.delete(fid);
-    }
-  }
-  const allCtxs = tabAllContexts.get(tabId);
-  if (allCtxs) {
-    for (const [cid, entry] of [...allCtxs.entries()]) {
-      if (entry.sessionId === sessionId) allCtxs.delete(cid);
-    }
-  }
-}
-
-/** Drop any cached session route whose flatten-mode session just went away. */
-function clearFrameRoutesForSession(tabId: number, sessionId: string): void {
-  for (const [key, route] of [...frameRoutes.entries()]) {
-    if (route.kind !== 'session' || route.sessionId !== sessionId) continue;
-    if (!key.startsWith(`${tabId}:`)) continue;
-    frameRoutes.delete(key);
-    frameTargetKeys.delete(route.targetId);
-  }
-}
-
 function clearFrameTargetsForTab(tabId: number): void {
-  const prefix = `${tabId}:`;
-  for (const [key, route] of [...frameRoutes.entries()]) {
-    if (!key.startsWith(prefix)) continue;
-    frameRoutes.delete(key);
-    frameSessionUnsupported.delete(key);
-    // Session routes own no separate chrome.debugger attachment — the tab-level
-    // one covers them — so only the legacy targetId routes are detached below.
-    if (route.kind === 'session') frameTargetKeys.delete(route.targetId);
-  }
   for (const [key, targetId] of [...frameTargets.entries()]) {
-    if (!key.startsWith(prefix)) continue;
+    if (!key.startsWith(`${tabId}:`)) continue;
     frameTargets.delete(key);
     frameTargetKeys.delete(targetId);
     chrome.debugger.detach({ targetId } as chrome.debugger.Debuggee).catch(() => {});
@@ -1502,40 +825,26 @@ function clearFrameTargetsForTab(tabId: number): void {
 }
 
 export async function detach(tabId: number): Promise<void> {
-  consoleCaptures.delete(tabId);
   clearFrameTargetsForTab(tabId);
   if (!attached.has(tabId)) return;
   attached.delete(tabId);
   networkCaptures.delete(tabId);
   tabFrameContexts.delete(tabId);
-  tabAllContexts.delete(tabId);
-  tabIframeTargets.delete(tabId);
-  tabAttachedEventCounts.delete(tabId);
   try { await chrome.debugger.detach({ tabId }); } catch { /* ignore */ }
 }
 
 export function registerListeners(): void {
   chrome.tabs.onRemoved.addListener((tabId) => {
-    viewports.delete(tabId);
-    consoleCaptures.delete(tabId);
     attached.delete(tabId);
     networkCaptures.delete(tabId);
     tabFrameContexts.delete(tabId);
-    tabAllContexts.delete(tabId);
-    tabIframeTargets.delete(tabId);
-    tabAttachedEventCounts.delete(tabId);
     clearFrameTargetsForTab(tabId);
   });
   chrome.debugger.onDetach.addListener((source) => {
     if (source.tabId) {
-      const capture = consoleCaptures.get(source.tabId);
-      if (capture) capture.captureSupported = false;
       attached.delete(source.tabId);
       networkCaptures.delete(source.tabId);
       tabFrameContexts.delete(source.tabId);
-      tabAllContexts.delete(source.tabId);
-      tabIframeTargets.delete(source.tabId);
-      tabAttachedEventCounts.delete(source.tabId);
       clearFrameTargetsForTab(source.tabId);
       return;
     }
@@ -1584,6 +893,7 @@ export function registerListeners(): void {
           entry.requestBodyFullSize = fullSize;
           entry.requestBodyTruncated = truncated;
         }
+        entry.requestBodyPending = true;
         try {
           const postData = await sendDebuggerCommand({ tabId }, 'Network.getRequestPostData', { requestId }) as { postData?: string };
           if (postData?.postData) {
@@ -1597,6 +907,9 @@ export function registerListeners(): void {
           }
         } catch {
           // Optional; some requests do not expose postData.
+        } finally {
+          entry.requestBodyPending = false;
+          if (entry.responseFinished) entry.captureComplete = true;
         }
       }
       return;
@@ -1631,9 +944,25 @@ export function registerListeners(): void {
       if (stateEntryIndex === undefined) return;
       const entry = state.entries[stateEntryIndex];
       if (!entry) return;
-      // Fetch now, while Chrome still buffers the body. Failures are recorded
-      // on the entry (responseBodyUnavailable/responseBodyError), not swallowed.
-      await captureResponseBody(tabId, state, requestId, entry);
+      try {
+        const body = await sendDebuggerCommand({ tabId }, 'Network.getResponseBody', { requestId }) as {
+          body?: string;
+          base64Encoded?: boolean;
+        };
+        if (typeof body?.body === 'string') {
+          const fullSize = body.body.length;
+          const truncated = fullSize > CDP_RESPONSE_BODY_CAPTURE_LIMIT;
+          const stored = truncated ? body.body.slice(0, CDP_RESPONSE_BODY_CAPTURE_LIMIT) : body.body;
+          entry.responsePreview = body.base64Encoded ? `base64:${stored}` : stored;
+          entry.responseBodyFullSize = fullSize;
+          entry.responseBodyTruncated = truncated;
+        }
+      } catch {
+        // Optional; bodies are unavailable for some requests (e.g. uploads).
+      } finally {
+        entry.responseFinished = true;
+        if (!entry.requestBodyPending) entry.captureComplete = true;
+      }
       return;
     }
 
@@ -1642,13 +971,10 @@ export function registerListeners(): void {
       const stateEntryIndex = state.requestToIndex.get(requestId);
       if (stateEntryIndex === undefined) return;
       const entry = state.entries[stateEntryIndex];
-      if (!entry) return;
-      const errorText = String(eventParams?.errorText || 'unknown error');
-      const detail = [
-        eventParams?.canceled ? 'canceled' : '',
-        eventParams?.blockedReason ? `blocked: ${String(eventParams.blockedReason)}` : '',
-      ].filter(Boolean).join(', ');
-      markBodyUnavailable(entry, `request failed: ${errorText}${detail ? ` (${detail})` : ''}`);
+      if (entry) {
+        entry.responseFinished = true;
+        if (!entry.requestBodyPending) entry.captureComplete = true;
+      }
     }
   });
 }

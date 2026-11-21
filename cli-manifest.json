@@ -1652,881 +1652,6 @@
     "siteSession": "persistent"
   },
   {
-    "site": "antigravity",
-    "name": "add-context",
-    "description": "Click the Add context button in the composer (opens file/URL picker for context attachment).",
-    "access": "write",
-    "domain": "127.0.0.1",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Status"
-    ],
-    "type": "js",
-    "modulePath": "antigravity/audit-extras.js",
-    "sourceFile": "antigravity/audit-extras.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "antigravity",
-    "name": "cookies",
-    "description": "List cookies on the Antigravity renderer (JS-visible via document.cookie).",
-    "access": "read",
-    "domain": "127.0.0.1",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Index",
-      "Key",
-      "Bytes",
-      "Name",
-      "Preview",
-      "Database",
-      "Version",
-      "Kind",
-      "Path",
-      "Workspace Id",
-      "Folder",
-      "Modified",
-      "Field",
-      "Value"
-    ],
-    "type": "js",
-    "modulePath": "antigravity/storage.js",
-    "sourceFile": "antigravity/storage.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "antigravity",
-    "name": "copy-code",
-    "description": "Return the text of a code block in the current conversation. Default: last code block; pass --index N (1-based from top) to pick a specific one.",
-    "access": "read",
-    "domain": "127.0.0.1",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "index",
-        "type": "int",
-        "required": false,
-        "help": "1-based index of code block (default: last)"
-      }
-    ],
-    "columns": [
-      "Field",
-      "Value"
-    ],
-    "type": "js",
-    "modulePath": "antigravity/audit-extras.js",
-    "sourceFile": "antigravity/audit-extras.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "antigravity",
-    "name": "copy-message",
-    "description": "Return the text of the last assistant message (best-effort: walks up from the last visible Copy button).",
-    "access": "write",
-    "domain": "127.0.0.1",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "click-button",
-        "type": "boolean",
-        "default": false,
-        "required": false,
-        "help": "Also click the in-UI Copy button"
-      }
-    ],
-    "columns": [
-      "Field",
-      "Value"
-    ],
-    "type": "js",
-    "modulePath": "antigravity/audit-extras.js",
-    "sourceFile": "antigravity/audit-extras.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "antigravity",
-    "name": "delete",
-    "description": "Delete an Antigravity conversation by ID. Antigravity asks for confirmation; we click through it. Require --yes to actually delete.",
-    "access": "write",
-    "domain": "127.0.0.1",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "id",
-        "type": "string",
-        "required": true,
-        "positional": true,
-        "help": "Conversation UUID (the part after \"convo-pill-\" in the sidebar testid)"
-      },
-      {
-        "name": "yes",
-        "type": "boolean",
-        "default": false,
-        "required": false,
-        "help": "Actually delete (default: dry-run preview)"
-      }
-    ],
-    "columns": [
-      "status",
-      "id"
-    ],
-    "type": "js",
-    "modulePath": "antigravity/delete.js",
-    "sourceFile": "antigravity/delete.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "antigravity",
-    "name": "display-options",
-    "description": "Open the Display Options menu and list its items.",
-    "access": "read",
-    "domain": "127.0.0.1",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Index",
-      "Item"
-    ],
-    "type": "js",
-    "modulePath": "antigravity/audit-extras.js",
-    "sourceFile": "antigravity/audit-extras.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "antigravity",
-    "name": "dump",
-    "description": "Dump the DOM to help AI understand the UI",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "htmlFile",
-      "snapFile"
-    ],
-    "type": "js",
-    "modulePath": "antigravity/dump.js",
-    "sourceFile": "antigravity/dump.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "antigravity",
-    "name": "extract-code",
-    "description": "Extract multi-line code blocks from the current Antigravity conversation",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "code"
-    ],
-    "type": "js",
-    "modulePath": "antigravity/extract-code.js",
-    "sourceFile": "antigravity/extract-code.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "antigravity",
-    "name": "history",
-    "description": "List visible Antigravity conversations from the sidebar",
-    "access": "read",
-    "domain": "127.0.0.1",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "limit",
-        "type": "int",
-        "default": 50,
-        "required": false,
-        "help": "Max conversations to return"
-      }
-    ],
-    "columns": [
-      "Index",
-      "Id",
-      "Title"
-    ],
-    "type": "js",
-    "modulePath": "antigravity/history.js",
-    "sourceFile": "antigravity/history.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "antigravity",
-    "name": "idb-list",
-    "description": "List IndexedDB databases on the Antigravity renderer.",
-    "access": "read",
-    "domain": "127.0.0.1",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Index",
-      "Key",
-      "Bytes",
-      "Name",
-      "Preview",
-      "Database",
-      "Version",
-      "Kind",
-      "Path",
-      "Workspace Id",
-      "Folder",
-      "Modified",
-      "Field",
-      "Value"
-    ],
-    "type": "js",
-    "modulePath": "antigravity/storage.js",
-    "sourceFile": "antigravity/storage.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "antigravity",
-    "name": "mark-read",
-    "description": "Mark an unread Antigravity conversation as read. Fails if the row is already read or the postcondition cannot be verified.",
-    "access": "write",
-    "domain": "127.0.0.1",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "id",
-        "type": "string",
-        "required": true,
-        "positional": true,
-        "help": "Conversation UUID (the part after \"convo-pill-\" in the sidebar testid)"
-      }
-    ],
-    "columns": [
-      "status",
-      "id",
-      "clicked"
-    ],
-    "type": "js",
-    "modulePath": "antigravity/mark-read.js",
-    "sourceFile": "antigravity/mark-read.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "antigravity",
-    "name": "model",
-    "description": "Read or switch the active model in Antigravity. Without arguments, reports the current model. With <name> (substring, case-insensitive), switches.",
-    "access": "write",
-    "domain": "127.0.0.1",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "name",
-        "type": "str",
-        "required": false,
-        "positional": true,
-        "help": "Substring (case-insensitive) of target model name. Omit to read current."
-      },
-      {
-        "name": "list",
-        "type": "boolean",
-        "default": false,
-        "required": false,
-        "help": "List models in the picker (does not switch)"
-      }
-    ],
-    "columns": [
-      "Status",
-      "Model"
-    ],
-    "type": "js",
-    "modulePath": "antigravity/model.js",
-    "sourceFile": "antigravity/model.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "antigravity",
-    "name": "nav",
-    "description": "Click Go Back or Go Forward (Antigravity in-app history).",
-    "access": "write",
-    "domain": "127.0.0.1",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "direction",
-        "type": "str",
-        "required": true,
-        "positional": true,
-        "help": "back or forward"
-      }
-    ],
-    "columns": [
-      "Status"
-    ],
-    "type": "js",
-    "modulePath": "antigravity/audit-extras.js",
-    "sourceFile": "antigravity/audit-extras.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "antigravity",
-    "name": "new",
-    "description": "Start a new conversation / clear context in Antigravity",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "status"
-    ],
-    "type": "js",
-    "modulePath": "antigravity/new.js",
-    "sourceFile": "antigravity/new.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "antigravity",
-    "name": "react",
-    "description": "Click \"Good response\" or \"Bad response\" on the LAST assistant message.",
-    "access": "write",
-    "domain": "127.0.0.1",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "kind",
-        "type": "str",
-        "required": true,
-        "positional": true,
-        "help": "good or bad"
-      }
-    ],
-    "columns": [
-      "Status",
-      "Reaction"
-    ],
-    "type": "js",
-    "modulePath": "antigravity/audit-extras.js",
-    "sourceFile": "antigravity/audit-extras.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "antigravity",
-    "name": "read",
-    "description": "Read the latest chat messages from Antigravity AI",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "last",
-        "type": "str",
-        "required": false,
-        "help": "Number of recent messages to read (not fully implemented due to generic structure, currently returns full history text or latest chunk)"
-      }
-    ],
-    "columns": [
-      "role",
-      "content"
-    ],
-    "type": "js",
-    "modulePath": "antigravity/read.js",
-    "sourceFile": "antigravity/read.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "antigravity",
-    "name": "recent-paths",
-    "description": "Show Antigravity's recently-opened folders/files (history.recentlyOpenedPathsList).",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "local",
-    "browser": false,
-    "args": [
-      {
-        "name": "limit",
-        "type": "int",
-        "default": 20,
-        "required": false,
-        "help": "Max rows to return"
-      }
-    ],
-    "columns": [
-      "Index",
-      "Key",
-      "Bytes",
-      "Name",
-      "Preview",
-      "Database",
-      "Version",
-      "Kind",
-      "Path",
-      "Workspace Id",
-      "Folder",
-      "Modified",
-      "Field",
-      "Value"
-    ],
-    "type": "js",
-    "modulePath": "antigravity/storage.js",
-    "sourceFile": "antigravity/storage.js"
-  },
-  {
-    "site": "antigravity",
-    "name": "rename",
-    "description": "Rename an Antigravity conversation by ID (NOT YET IMPLEMENTED — see source comment).",
-    "access": "write",
-    "domain": "127.0.0.1",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "id",
-        "type": "string",
-        "required": true,
-        "positional": true,
-        "help": "Conversation UUID (the part after \"convo-pill-\" in the sidebar testid)"
-      },
-      {
-        "name": "title",
-        "type": "string",
-        "required": true,
-        "positional": true,
-        "help": "New title"
-      }
-    ],
-    "columns": [
-      "status"
-    ],
-    "type": "js",
-    "modulePath": "antigravity/rename.js",
-    "sourceFile": "antigravity/rename.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "antigravity",
-    "name": "revert",
-    "description": "Click the revert button (per-message revert for agent changes). Requires --yes (this modifies your workspace).",
-    "access": "write",
-    "domain": "127.0.0.1",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "yes",
-        "type": "boolean",
-        "default": false,
-        "required": false,
-        "help": "Actually revert (default: dry-run)"
-      }
-    ],
-    "columns": [
-      "Status"
-    ],
-    "type": "js",
-    "modulePath": "antigravity/audit-extras.js",
-    "sourceFile": "antigravity/audit-extras.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "antigravity",
-    "name": "send",
-    "description": "Send a message to Antigravity AI via the internal Lexical editor",
-    "access": "write",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "message",
-        "type": "str",
-        "required": true,
-        "positional": true,
-        "help": "The message text to send"
-      }
-    ],
-    "columns": [
-      "Status",
-      "Message"
-    ],
-    "type": "js",
-    "modulePath": "antigravity/send.js",
-    "sourceFile": "antigravity/send.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "antigravity",
-    "name": "settings",
-    "description": "Click the Antigravity settings button (matched by data-testid=\"settings-button\").",
-    "access": "write",
-    "domain": "127.0.0.1",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Status"
-    ],
-    "type": "js",
-    "modulePath": "antigravity/audit-extras.js",
-    "sourceFile": "antigravity/audit-extras.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "antigravity",
-    "name": "settings-read",
-    "description": "Read Antigravity's user settings.json (theme, proxy, agCockpit, tfa.system.autoAccept, etc.).",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "local",
-    "browser": false,
-    "args": [],
-    "columns": [
-      "Index",
-      "Key",
-      "Bytes",
-      "Name",
-      "Preview",
-      "Database",
-      "Version",
-      "Kind",
-      "Path",
-      "Workspace Id",
-      "Folder",
-      "Modified",
-      "Field",
-      "Value"
-    ],
-    "type": "js",
-    "modulePath": "antigravity/storage.js",
-    "sourceFile": "antigravity/storage.js"
-  },
-  {
-    "site": "antigravity",
-    "name": "sidebar-toggle",
-    "description": "Click Toggle Sidebar (collapses/expands the Antigravity sidebar).",
-    "access": "write",
-    "domain": "127.0.0.1",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Status"
-    ],
-    "type": "js",
-    "modulePath": "antigravity/audit-extras.js",
-    "sourceFile": "antigravity/audit-extras.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "antigravity",
-    "name": "state-get",
-    "description": "Read one value from Antigravity's state.vscdb. Pass --workspace <id> for per-workspace.",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "local",
-    "browser": false,
-    "args": [
-      {
-        "name": "key",
-        "type": "str",
-        "required": true,
-        "positional": true,
-        "help": "Storage key name"
-      },
-      {
-        "name": "workspace",
-        "type": "str",
-        "required": false,
-        "help": "Workspace id (from workspaces-list) to query per-workspace DB"
-      },
-      {
-        "name": "max-bytes",
-        "type": "int",
-        "default": 8000,
-        "required": false,
-        "help": "Truncate value to this many chars"
-      }
-    ],
-    "columns": [
-      "Index",
-      "Key",
-      "Bytes",
-      "Name",
-      "Preview",
-      "Database",
-      "Version",
-      "Kind",
-      "Path",
-      "Workspace Id",
-      "Folder",
-      "Modified",
-      "Field",
-      "Value"
-    ],
-    "type": "js",
-    "modulePath": "antigravity/storage.js",
-    "sourceFile": "antigravity/storage.js"
-  },
-  {
-    "site": "antigravity",
-    "name": "state-keys",
-    "description": "List keys in Antigravity's globalStorage state.vscdb (VSCode-style). Pass --workspace <id> to query a per-workspace DB. Works while Antigravity is closed.",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "local",
-    "browser": false,
-    "args": [
-      {
-        "name": "filter",
-        "type": "str",
-        "required": false,
-        "help": "Case-insensitive substring filter over keys"
-      },
-      {
-        "name": "workspace",
-        "type": "str",
-        "required": false,
-        "help": "Workspace id (from workspaces-list) to query per-workspace DB"
-      },
-      {
-        "name": "limit",
-        "type": "int",
-        "default": 200,
-        "required": false,
-        "help": "Max rows to return"
-      }
-    ],
-    "columns": [
-      "Index",
-      "Key",
-      "Bytes",
-      "Name",
-      "Preview",
-      "Database",
-      "Version",
-      "Kind",
-      "Path",
-      "Workspace Id",
-      "Folder",
-      "Modified",
-      "Field",
-      "Value"
-    ],
-    "type": "js",
-    "modulePath": "antigravity/storage.js",
-    "sourceFile": "antigravity/storage.js"
-  },
-  {
-    "site": "antigravity",
-    "name": "status",
-    "description": "Check Antigravity CDP connection and get current page state",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "status",
-      "url",
-      "title"
-    ],
-    "type": "js",
-    "modulePath": "antigravity/status.js",
-    "sourceFile": "antigravity/status.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "antigravity",
-    "name": "storage-get",
-    "description": "Read a single localStorage / sessionStorage value on the Antigravity renderer.",
-    "access": "read",
-    "domain": "127.0.0.1",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "key",
-        "type": "str",
-        "required": true,
-        "positional": true,
-        "help": "Storage key name"
-      },
-      {
-        "name": "storage",
-        "type": "str",
-        "default": "local",
-        "required": false,
-        "help": "\"local\" or \"session\""
-      },
-      {
-        "name": "max-bytes",
-        "type": "int",
-        "default": 4000,
-        "required": false,
-        "help": "Truncate value to this many chars"
-      }
-    ],
-    "columns": [
-      "Index",
-      "Key",
-      "Bytes",
-      "Name",
-      "Preview",
-      "Database",
-      "Version",
-      "Kind",
-      "Path",
-      "Workspace Id",
-      "Folder",
-      "Modified",
-      "Field",
-      "Value"
-    ],
-    "type": "js",
-    "modulePath": "antigravity/storage.js",
-    "sourceFile": "antigravity/storage.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "antigravity",
-    "name": "storage-keys",
-    "description": "List localStorage / sessionStorage keys on the Antigravity renderer (CDP).",
-    "access": "read",
-    "domain": "127.0.0.1",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "storage",
-        "type": "str",
-        "default": "local",
-        "required": false,
-        "help": "\"local\" or \"session\""
-      },
-      {
-        "name": "filter",
-        "type": "str",
-        "required": false,
-        "help": "Case-insensitive substring filter"
-      },
-      {
-        "name": "limit",
-        "type": "int",
-        "default": 100,
-        "required": false,
-        "help": "Max rows to return"
-      }
-    ],
-    "columns": [
-      "Index",
-      "Key",
-      "Bytes",
-      "Name",
-      "Preview",
-      "Database",
-      "Version",
-      "Kind",
-      "Path",
-      "Workspace Id",
-      "Folder",
-      "Modified",
-      "Field",
-      "Value"
-    ],
-    "type": "js",
-    "modulePath": "antigravity/storage.js",
-    "sourceFile": "antigravity/storage.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "antigravity",
-    "name": "toggle-aux",
-    "description": "Toggle the Auxiliary Pane (Antigravity's secondary panel for code/preview).",
-    "access": "write",
-    "domain": "127.0.0.1",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Status"
-    ],
-    "type": "js",
-    "modulePath": "antigravity/audit-extras.js",
-    "sourceFile": "antigravity/audit-extras.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "antigravity",
-    "name": "watch",
-    "description": "Stream new chat messages from Antigravity in real-time",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "timeout",
-        "type": "int",
-        "default": 86400,
-        "required": false,
-        "help": "Max seconds to keep watching (default: 86400 — 24h)"
-      }
-    ],
-    "columns": [],
-    "type": "js",
-    "modulePath": "antigravity/watch.js",
-    "sourceFile": "antigravity/watch.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "antigravity",
-    "name": "workspaces-list",
-    "description": "List Antigravity workspaceStorage entries (each represents a previously-opened folder).",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "local",
-    "browser": false,
-    "args": [
-      {
-        "name": "limit",
-        "type": "int",
-        "default": 50,
-        "required": false,
-        "help": "Max rows to return"
-      }
-    ],
-    "columns": [
-      "Index",
-      "Key",
-      "Bytes",
-      "Name",
-      "Preview",
-      "Database",
-      "Version",
-      "Kind",
-      "Path",
-      "Workspace Id",
-      "Folder",
-      "Modified",
-      "Field",
-      "Value"
-    ],
-    "type": "js",
-    "modulePath": "antigravity/storage.js",
-    "sourceFile": "antigravity/storage.js"
-  },
-  {
     "site": "apple-podcasts",
     "name": "episodes",
     "description": "List recent episodes of an Apple Podcast (use ID from search)",
@@ -3777,11 +2902,22 @@
     "columns": [
       "rank",
       "time",
+      "pub_ts",
       "author",
+      "mid",
       "title",
       "type",
+      "duration",
+      "duration_sec",
+      "plays",
+      "danmaku",
       "likes",
-      "url"
+      "url",
+      "bvid",
+      "cover",
+      "face",
+      "desc",
+      "only_fans"
     ],
     "type": "js",
     "modulePath": "bilibili/feed.js",
@@ -4070,8 +3206,19 @@
       "rank",
       "title",
       "author",
+      "mid",
       "score",
-      "url"
+      "plays",
+      "likes",
+      "danmaku",
+      "favorites",
+      "duration",
+      "duration_sec",
+      "pubdate_ts",
+      "url",
+      "cover",
+      "face",
+      "desc"
     ],
     "type": "js",
     "modulePath": "bilibili/search.js",
@@ -4111,7 +3258,9 @@
       "index",
       "from",
       "to",
-      "content"
+      "content",
+      "language",
+      "track_type"
     ],
     "type": "js",
     "modulePath": "bilibili/subtitle.js",
@@ -4215,8 +3364,18 @@
       "title",
       "plays",
       "likes",
+      "likes_known",
+      "comments",
+      "danmaku",
       "date",
-      "url"
+      "created_ts",
+      "duration",
+      "duration_sec",
+      "url",
+      "bvid",
+      "cover",
+      "desc",
+      "is_pay"
     ],
     "type": "js",
     "modulePath": "bilibili/user-videos.js",
@@ -6210,7 +5369,7 @@
   {
     "site": "chatgpt",
     "name": "ask",
-    "description": "Send a prompt to ChatGPT web and wait for the response; sources lists the web pages the answer cites",
+    "description": "Send a prompt to ChatGPT web and wait for the response",
     "access": "write",
     "domain": "chatgpt.com",
     "strategy": "cookie",
@@ -6270,20 +5429,82 @@
         "type": "boolean",
         "default": false,
         "required": false,
-        "help": "Turn on ChatGPT 网页搜索 (Web Search) from the composer + menu before sending. The model can also search on its own when the prompt asks it to"
+        "help": "Enable ChatGPT 网页搜索 (Web Search)"
       }
     ],
     "columns": [
       "conversationId",
       "conversationUrl",
       "tool",
-      "response",
-      "sources",
-      "searchedCount"
+      "response"
     ],
     "type": "js",
     "modulePath": "chatgpt/ask.js",
     "sourceFile": "chatgpt/ask.js",
+    "navigateBefore": false,
+    "siteSession": "persistent"
+  },
+  {
+    "site": "chatgpt",
+    "name": "ask-file",
+    "description": "Send a prompt to ChatGPT with attached local file(s) (images, documents, code) and return the assistant response",
+    "access": "write",
+    "domain": "chatgpt.com",
+    "strategy": "cookie",
+    "browser": true,
+    "args": [
+      {
+        "name": "prompt",
+        "type": "str",
+        "required": true,
+        "positional": true,
+        "help": "Prompt to send"
+      },
+      {
+        "name": "file",
+        "type": "str",
+        "required": true,
+        "help": "Local file path(s) to attach, comma-separated (e.g. \"screenshot.png,notes.txt\")"
+      },
+      {
+        "name": "timeout",
+        "type": "int",
+        "default": 120,
+        "required": false,
+        "help": "Max seconds to wait for response (default: 120)"
+      },
+      {
+        "name": "new",
+        "type": "boolean",
+        "default": false,
+        "required": false,
+        "help": "Start a new chat before sending"
+      },
+      {
+        "name": "conversation",
+        "type": "str",
+        "required": false,
+        "valueRequired": true,
+        "help": "Continue an existing ChatGPT conversation ID or /c/<id> URL"
+      },
+      {
+        "name": "project",
+        "type": "str",
+        "required": false,
+        "valueRequired": true,
+        "help": "Start a new chat inside a ChatGPT project ID or /g/g-p-<id> URL"
+      }
+    ],
+    "columns": [
+      "conversation_id",
+      "conversation_url",
+      "attachments",
+      "response"
+    ],
+    "defaultFormat": "plain",
+    "type": "js",
+    "modulePath": "chatgpt/ask-file.js",
+    "sourceFile": "chatgpt/ask-file.js",
     "navigateBefore": false,
     "siteSession": "persistent"
   },
@@ -6800,390 +6021,6 @@
     "siteSession": "persistent"
   },
   {
-    "site": "chatgpt-app",
-    "name": "ask",
-    "description": "Send a prompt and wait for the AI response (send + wait + read)",
-    "access": "write",
-    "domain": "localhost",
-    "strategy": "public",
-    "browser": false,
-    "args": [
-      {
-        "name": "text",
-        "type": "str",
-        "required": true,
-        "positional": true,
-        "help": "Prompt to send"
-      },
-      {
-        "name": "model",
-        "type": "str",
-        "required": false,
-        "help": "Model/mode to use: auto, instant, thinking, 5.2-instant, 5.2-thinking",
-        "choices": [
-          "auto",
-          "instant",
-          "thinking",
-          "5.2-instant",
-          "5.2-thinking"
-        ]
-      },
-      {
-        "name": "timeout",
-        "type": "int",
-        "default": 30,
-        "required": false,
-        "help": "Max seconds to wait for response (default: 30)"
-      },
-      {
-        "name": "image",
-        "type": "str",
-        "required": false,
-        "help": "Path to local image to attach (optional)"
-      }
-    ],
-    "columns": [
-      "Role",
-      "Text"
-    ],
-    "type": "js",
-    "modulePath": "chatgpt-app/ask.js",
-    "sourceFile": "chatgpt-app/ask.js"
-  },
-  {
-    "site": "chatgpt-app",
-    "name": "model",
-    "description": "Switch ChatGPT Desktop model/mode (auto, instant, thinking, 5.2-instant, 5.2-thinking)",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "public",
-    "browser": false,
-    "args": [
-      {
-        "name": "model",
-        "type": "str",
-        "required": true,
-        "positional": true,
-        "help": "Model to switch to",
-        "choices": [
-          "auto",
-          "instant",
-          "thinking",
-          "5.2-instant",
-          "5.2-thinking"
-        ]
-      }
-    ],
-    "columns": [
-      "Status",
-      "Model"
-    ],
-    "type": "js",
-    "modulePath": "chatgpt-app/model.js",
-    "sourceFile": "chatgpt-app/model.js"
-  },
-  {
-    "site": "chatgpt-app",
-    "name": "new",
-    "description": "Open a new chat in ChatGPT Desktop App",
-    "access": "write",
-    "domain": "localhost",
-    "strategy": "public",
-    "browser": false,
-    "args": [
-      {
-        "name": "temp",
-        "type": "boolean",
-        "default": false,
-        "required": false,
-        "help": "Open a temporary chat with privacy protection"
-      }
-    ],
-    "columns": [
-      "Status"
-    ],
-    "type": "js",
-    "modulePath": "chatgpt-app/new.js",
-    "sourceFile": "chatgpt-app/new.js"
-  },
-  {
-    "site": "chatgpt-app",
-    "name": "read",
-    "description": "Read the last visible message from the focused ChatGPT Desktop window",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "public",
-    "browser": false,
-    "args": [],
-    "columns": [
-      "Role",
-      "Text"
-    ],
-    "type": "js",
-    "modulePath": "chatgpt-app/read.js",
-    "sourceFile": "chatgpt-app/read.js"
-  },
-  {
-    "site": "chatgpt-app",
-    "name": "send",
-    "description": "Send a message to the active ChatGPT Desktop App window",
-    "access": "write",
-    "domain": "localhost",
-    "strategy": "public",
-    "browser": false,
-    "args": [
-      {
-        "name": "text",
-        "type": "str",
-        "required": true,
-        "positional": true,
-        "help": "Message to send"
-      },
-      {
-        "name": "model",
-        "type": "str",
-        "required": false,
-        "help": "Model/mode to use: auto, instant, thinking, 5.2-instant, 5.2-thinking",
-        "choices": [
-          "auto",
-          "instant",
-          "thinking",
-          "5.2-instant",
-          "5.2-thinking"
-        ]
-      }
-    ],
-    "columns": [
-      "Status"
-    ],
-    "type": "js",
-    "modulePath": "chatgpt-app/send.js",
-    "sourceFile": "chatgpt-app/send.js"
-  },
-  {
-    "site": "chatgpt-app",
-    "name": "status",
-    "description": "Check if ChatGPT Desktop App is running natively on macOS",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "public",
-    "browser": false,
-    "args": [],
-    "columns": [
-      "Status"
-    ],
-    "type": "js",
-    "modulePath": "chatgpt-app/status.js",
-    "sourceFile": "chatgpt-app/status.js"
-  },
-  {
-    "site": "chatwise",
-    "name": "ask",
-    "description": "Send a prompt and wait for the AI response (send + wait + read)",
-    "access": "write",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "text",
-        "type": "str",
-        "required": true,
-        "positional": true,
-        "help": "Prompt to send"
-      },
-      {
-        "name": "timeout",
-        "type": "int",
-        "default": 30,
-        "required": false,
-        "help": "Max seconds to wait (default: 30)"
-      }
-    ],
-    "columns": [
-      "Role",
-      "Text"
-    ],
-    "type": "js",
-    "modulePath": "chatwise/ask.js",
-    "sourceFile": "chatwise/ask.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "chatwise",
-    "name": "export",
-    "description": "Export the current ChatWise conversation to a Markdown file",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "output",
-        "type": "str",
-        "required": false,
-        "help": "Output file (default: /tmp/chatwise-export.md)"
-      }
-    ],
-    "columns": [
-      "Status",
-      "File",
-      "Messages"
-    ],
-    "type": "js",
-    "modulePath": "chatwise/export.js",
-    "sourceFile": "chatwise/export.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "chatwise",
-    "name": "history",
-    "description": "List conversation history in ChatWise sidebar",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Index",
-      "Title"
-    ],
-    "type": "js",
-    "modulePath": "chatwise/history.js",
-    "sourceFile": "chatwise/history.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "chatwise",
-    "name": "model",
-    "description": "Get or switch the active AI model in ChatWise",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "model-name",
-        "type": "str",
-        "required": false,
-        "positional": true,
-        "help": "Model to switch to (e.g. gpt-4, claude-3)"
-      }
-    ],
-    "columns": [
-      "Status",
-      "Model"
-    ],
-    "type": "js",
-    "modulePath": "chatwise/model.js",
-    "sourceFile": "chatwise/model.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "chatwise",
-    "name": "new",
-    "description": "Start a new ChatWise conversation session",
-    "access": "write",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Status"
-    ],
-    "type": "js",
-    "modulePath": "chatwise/new.js",
-    "sourceFile": "chatwise/new.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "chatwise",
-    "name": "read",
-    "description": "Read the current ChatWise conversation history",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Content"
-    ],
-    "type": "js",
-    "modulePath": "chatwise/read.js",
-    "sourceFile": "chatwise/read.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "chatwise",
-    "name": "screenshot",
-    "description": "Capture a snapshot of the current ChatWise window (DOM + Accessibility tree)",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "output",
-        "type": "str",
-        "required": false,
-        "help": "Output file path (default: /tmp/chatwise-snapshot.txt)"
-      }
-    ],
-    "columns": [
-      "Status",
-      "File"
-    ],
-    "type": "js",
-    "modulePath": "chatwise/screenshot.js",
-    "sourceFile": "chatwise/screenshot.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "chatwise",
-    "name": "send",
-    "description": "Send a message to the active ChatWise conversation",
-    "access": "write",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "text",
-        "type": "str",
-        "required": true,
-        "positional": true,
-        "help": "Message to send"
-      }
-    ],
-    "columns": [
-      "Status",
-      "InjectedText"
-    ],
-    "type": "js",
-    "modulePath": "chatwise/send.js",
-    "sourceFile": "chatwise/send.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "chatwise",
-    "name": "status",
-    "description": "Check active CDP connection to ChatWise Desktop",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Status",
-      "Url",
-      "Title"
-    ],
-    "type": "js",
-    "modulePath": "chatwise/status.js",
-    "sourceFile": "chatwise/status.js",
-    "navigateBefore": true
-  },
-  {
     "site": "chess",
     "name": "analyze",
     "description": "Open a Chess.com game in the browser analysis board",
@@ -7624,585 +6461,6 @@
     "modulePath": "cnki/search.js",
     "sourceFile": "cnki/search.js",
     "navigateBefore": false
-  },
-  {
-    "site": "codex",
-    "name": "archive",
-    "description": "Archive (Codex's term for delete) the selected conversation via the Chat actions header menu. No confirmation in UI — pass --yes to actually archive.",
-    "access": "write",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "yes",
-        "type": "boolean",
-        "default": false,
-        "required": false,
-        "help": "Actually archive (default: dry-run preview)"
-      },
-      {
-        "name": "project",
-        "type": "str",
-        "required": false,
-        "help": "Project label or path to select before running the command"
-      },
-      {
-        "name": "conversation",
-        "type": "str",
-        "required": false,
-        "help": "Conversation title to select within --project"
-      },
-      {
-        "name": "index",
-        "type": "str",
-        "required": false,
-        "help": "1-based conversation index within --project"
-      },
-      {
-        "name": "thread-id",
-        "type": "str",
-        "required": false,
-        "help": "Exact Codex thread id to select"
-      }
-    ],
-    "columns": [
-      "status",
-      "thread_id",
-      "project",
-      "conversation"
-    ],
-    "type": "js",
-    "modulePath": "codex/archive.js",
-    "sourceFile": "codex/archive.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "codex",
-    "name": "ask",
-    "description": "Send a prompt to the current or selected Codex conversation and wait for the AI response",
-    "access": "write",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "text",
-        "type": "str",
-        "required": true,
-        "positional": true,
-        "help": "Prompt to send"
-      },
-      {
-        "name": "timeout",
-        "type": "int",
-        "default": 60,
-        "required": false,
-        "help": "Max seconds to wait for response (default: 60)"
-      },
-      {
-        "name": "project",
-        "type": "str",
-        "required": false,
-        "help": "Project label or path to select before running the command"
-      },
-      {
-        "name": "conversation",
-        "type": "str",
-        "required": false,
-        "help": "Conversation title to select within --project"
-      },
-      {
-        "name": "index",
-        "type": "str",
-        "required": false,
-        "help": "1-based conversation index within --project"
-      },
-      {
-        "name": "thread-id",
-        "type": "str",
-        "required": false,
-        "help": "Exact Codex thread id to select"
-      }
-    ],
-    "columns": [
-      "Role",
-      "Project",
-      "Conversation",
-      "Text"
-    ],
-    "type": "js",
-    "modulePath": "codex/ask.js",
-    "sourceFile": "codex/ask.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "codex",
-    "name": "dump",
-    "description": "Dump the DOM and Accessibility tree of codex for reverse-engineering",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "action",
-      "files"
-    ],
-    "type": "js",
-    "modulePath": "codex/dump.js",
-    "sourceFile": "codex/dump.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "codex",
-    "name": "export",
-    "description": "Export the current Codex conversation to a Markdown file",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "output",
-        "type": "str",
-        "required": false,
-        "help": "Output file (default: /tmp/codex-export.md)"
-      }
-    ],
-    "columns": [
-      "Status",
-      "File",
-      "Messages"
-    ],
-    "type": "js",
-    "modulePath": "codex/export.js",
-    "sourceFile": "codex/export.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "codex",
-    "name": "extract-diff",
-    "description": "Extract visual code review diff patches from Codex",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "File",
-      "Diff"
-    ],
-    "type": "js",
-    "modulePath": "codex/extract-diff.js",
-    "sourceFile": "codex/extract-diff.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "codex",
-    "name": "history",
-    "description": "List visible Codex conversation threads grouped by project",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "project",
-        "type": "str",
-        "required": false,
-        "help": "Filter by project label or path"
-      },
-      {
-        "name": "limit",
-        "type": "str",
-        "required": false,
-        "help": "Max conversations per project"
-      }
-    ],
-    "columns": [
-      "Project",
-      "Index",
-      "Title",
-      "Updated",
-      "Active"
-    ],
-    "type": "js",
-    "modulePath": "codex/history.js",
-    "sourceFile": "codex/history.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "codex",
-    "name": "model",
-    "description": "Read, list, or switch the active model / reasoning level in Codex Desktop. The composer toolbar button toggles a menu that mixes model variants (GPT-5.5, Speed) with reasoning levels (Low/Medium/High/Extra High).",
-    "access": "write",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "name",
-        "type": "str",
-        "required": false,
-        "positional": true,
-        "help": "Substring (case-insensitive) of a model / reasoning level to switch to. Omit to read current."
-      },
-      {
-        "name": "list",
-        "type": "boolean",
-        "default": false,
-        "required": false,
-        "help": "List all menu options (does not switch)"
-      }
-    ],
-    "columns": [
-      "Status",
-      "Model"
-    ],
-    "type": "js",
-    "modulePath": "codex/model.js",
-    "sourceFile": "codex/model.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "codex",
-    "name": "new",
-    "description": "Start a new Codex conversation session",
-    "access": "write",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Status"
-    ],
-    "type": "js",
-    "modulePath": "codex/new.js",
-    "sourceFile": "codex/new.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "codex",
-    "name": "pin",
-    "description": "Pin the selected Codex conversation via the Chat actions header menu.",
-    "access": "write",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "project",
-        "type": "str",
-        "required": false,
-        "help": "Project label or path to select before running the command"
-      },
-      {
-        "name": "conversation",
-        "type": "str",
-        "required": false,
-        "help": "Conversation title to select within --project"
-      },
-      {
-        "name": "index",
-        "type": "str",
-        "required": false,
-        "help": "1-based conversation index within --project"
-      },
-      {
-        "name": "thread-id",
-        "type": "str",
-        "required": false,
-        "help": "Exact Codex thread id to select"
-      }
-    ],
-    "columns": [
-      "status",
-      "thread_id",
-      "project",
-      "conversation"
-    ],
-    "type": "js",
-    "modulePath": "codex/pin.js",
-    "sourceFile": "codex/pin.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "codex",
-    "name": "projects",
-    "description": "List Codex projects and visible conversations from the sidebar",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "project",
-        "type": "str",
-        "required": false,
-        "help": "Filter by project label or path"
-      },
-      {
-        "name": "limit",
-        "type": "str",
-        "required": false,
-        "help": "Max conversations per project"
-      }
-    ],
-    "columns": [
-      "Project",
-      "Index",
-      "Title",
-      "Updated",
-      "Active"
-    ],
-    "type": "js",
-    "modulePath": "codex/projects.js",
-    "sourceFile": "codex/projects.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "codex",
-    "name": "read",
-    "description": "Read the contents of the current or selected Codex conversation thread",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "project",
-        "type": "str",
-        "required": false,
-        "help": "Project label or path to select before running the command"
-      },
-      {
-        "name": "conversation",
-        "type": "str",
-        "required": false,
-        "help": "Conversation title to select within --project"
-      },
-      {
-        "name": "index",
-        "type": "str",
-        "required": false,
-        "help": "1-based conversation index within --project"
-      },
-      {
-        "name": "thread-id",
-        "type": "str",
-        "required": false,
-        "help": "Exact Codex thread id to select"
-      }
-    ],
-    "columns": [
-      "Project",
-      "Conversation",
-      "Content"
-    ],
-    "type": "js",
-    "modulePath": "codex/read.js",
-    "sourceFile": "codex/read.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "codex",
-    "name": "rename",
-    "description": "Rename the selected Codex conversation. Opens the Chat actions menu → \"Rename chat\", then types the new title.",
-    "access": "write",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "title",
-        "type": "str",
-        "required": true,
-        "positional": true,
-        "help": "New title (single line, no newlines)"
-      },
-      {
-        "name": "project",
-        "type": "str",
-        "required": false,
-        "help": "Project label or path to select before running the command"
-      },
-      {
-        "name": "conversation",
-        "type": "str",
-        "required": false,
-        "help": "Conversation title to select within --project"
-      },
-      {
-        "name": "index",
-        "type": "str",
-        "required": false,
-        "help": "1-based conversation index within --project"
-      },
-      {
-        "name": "thread-id",
-        "type": "str",
-        "required": false,
-        "help": "Exact Codex thread id to select"
-      }
-    ],
-    "columns": [
-      "status",
-      "title",
-      "thread_id",
-      "project"
-    ],
-    "type": "js",
-    "modulePath": "codex/rename.js",
-    "sourceFile": "codex/rename.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "codex",
-    "name": "screenshot",
-    "description": "Capture a snapshot of the current Codex window (DOM + Accessibility tree)",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "output",
-        "type": "str",
-        "required": false,
-        "help": "Output file path (default: /tmp/codex-snapshot.txt)"
-      }
-    ],
-    "columns": [
-      "Status",
-      "File"
-    ],
-    "type": "js",
-    "modulePath": "codex/screenshot.js",
-    "sourceFile": "codex/screenshot.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "codex",
-    "name": "send",
-    "description": "Send text/commands to the current or selected Codex AI composer",
-    "access": "write",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "text",
-        "type": "str",
-        "required": true,
-        "positional": true,
-        "help": "Text, command (e.g. /review), or skill (e.g. $imagegen)"
-      },
-      {
-        "name": "pick",
-        "type": "str",
-        "required": false,
-        "help": "Picker option label to select when a slash command opens the picker (e.g. \"Review Agent\")"
-      },
-      {
-        "name": "project",
-        "type": "str",
-        "required": false,
-        "help": "Project label or path to select before running the command"
-      },
-      {
-        "name": "conversation",
-        "type": "str",
-        "required": false,
-        "help": "Conversation title to select within --project"
-      },
-      {
-        "name": "index",
-        "type": "str",
-        "required": false,
-        "help": "1-based conversation index within --project"
-      },
-      {
-        "name": "thread-id",
-        "type": "str",
-        "required": false,
-        "help": "Exact Codex thread id to select"
-      }
-    ],
-    "columns": [
-      "Status",
-      "Project",
-      "Conversation",
-      "InjectedText"
-    ],
-    "type": "js",
-    "modulePath": "codex/send.js",
-    "sourceFile": "codex/send.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "codex",
-    "name": "status",
-    "description": "Check active CDP connection to OpenAI Codex App",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Status",
-      "Url",
-      "Title"
-    ],
-    "type": "js",
-    "modulePath": "codex/status.js",
-    "sourceFile": "codex/status.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "codex",
-    "name": "unpin",
-    "description": "Unpin the selected Codex conversation via the Chat actions header menu.",
-    "access": "write",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "project",
-        "type": "str",
-        "required": false,
-        "help": "Project label or path to select before running the command"
-      },
-      {
-        "name": "conversation",
-        "type": "str",
-        "required": false,
-        "help": "Conversation title to select within --project"
-      },
-      {
-        "name": "index",
-        "type": "str",
-        "required": false,
-        "help": "1-based conversation index within --project"
-      },
-      {
-        "name": "thread-id",
-        "type": "str",
-        "required": false,
-        "help": "Exact Codex thread id to select"
-      }
-    ],
-    "columns": [
-      "status",
-      "thread_id",
-      "project",
-      "conversation"
-    ],
-    "type": "js",
-    "modulePath": "codex/pin.js",
-    "sourceFile": "codex/pin.js",
-    "navigateBefore": true
   },
   {
     "site": "coingecko",
@@ -9159,7 +7417,8 @@
     "type": "js",
     "modulePath": "ctrip/flight.js",
     "sourceFile": "ctrip/flight.js",
-    "navigateBefore": false
+    "navigateBefore": false,
+    "defaultWindowMode": "foreground"
   },
   {
     "site": "ctrip",
@@ -9597,282 +7856,13 @@
     "siteSession": "persistent"
   },
   {
-    "site": "cursor",
-    "name": "ask",
-    "description": "Send a prompt and wait for the AI response (send + wait + read)",
-    "access": "write",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "text",
-        "type": "str",
-        "required": true,
-        "positional": true,
-        "help": "Prompt to send"
-      },
-      {
-        "name": "timeout",
-        "type": "int",
-        "default": 30,
-        "required": false,
-        "help": "Max seconds to wait for response (default: 30)"
-      }
-    ],
-    "columns": [
-      "Role",
-      "Text"
-    ],
-    "type": "js",
-    "modulePath": "cursor/ask.js",
-    "sourceFile": "cursor/ask.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "cursor",
-    "name": "composer",
-    "description": "Send a prompt directly into Cursor Composer (Cmd+I shortcut)",
-    "access": "write",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "text",
-        "type": "str",
-        "required": true,
-        "positional": true,
-        "help": "Text to send into Composer"
-      }
-    ],
-    "columns": [
-      "Status",
-      "InjectedText"
-    ],
-    "type": "js",
-    "modulePath": "cursor/composer.js",
-    "sourceFile": "cursor/composer.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "cursor",
-    "name": "dump",
-    "description": "Dump the DOM and Accessibility tree of cursor for reverse-engineering",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "action",
-      "files"
-    ],
-    "type": "js",
-    "modulePath": "cursor/dump.js",
-    "sourceFile": "cursor/dump.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "cursor",
-    "name": "export",
-    "description": "Export the current cursor conversation to a Markdown file",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "output",
-        "type": "str",
-        "required": false,
-        "help": "Output file (default: /tmp/cursor-export.md)"
-      }
-    ],
-    "columns": [
-      "Status",
-      "File",
-      "Messages"
-    ],
-    "type": "js",
-    "modulePath": "cursor/export.js",
-    "sourceFile": "cursor/export.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "cursor",
-    "name": "extract-code",
-    "description": "Extract multi-line code blocks from the current Cursor conversation",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Code"
-    ],
-    "type": "js",
-    "modulePath": "cursor/extract-code.js",
-    "sourceFile": "cursor/extract-code.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "cursor",
-    "name": "history",
-    "description": "List recent chat sessions from the Cursor sidebar",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Index",
-      "Title"
-    ],
-    "type": "js",
-    "modulePath": "cursor/history.js",
-    "sourceFile": "cursor/history.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "cursor",
-    "name": "model",
-    "description": "Get or switch the currently active AI model in Cursor",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "model-name",
-        "type": "str",
-        "required": false,
-        "positional": true,
-        "help": "The ID of the model to switch to (e.g. claude-3.5-sonnet)"
-      }
-    ],
-    "columns": [
-      "Status",
-      "Model"
-    ],
-    "type": "js",
-    "modulePath": "cursor/model.js",
-    "sourceFile": "cursor/model.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "cursor",
-    "name": "new",
-    "description": "Start a new Cursor chat or Composer session",
-    "access": "write",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Status"
-    ],
-    "type": "js",
-    "modulePath": "cursor/new.js",
-    "sourceFile": "cursor/new.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "cursor",
-    "name": "read",
-    "description": "Read the current Cursor chat/composer conversation history",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Role",
-      "Text"
-    ],
-    "type": "js",
-    "modulePath": "cursor/read.js",
-    "sourceFile": "cursor/read.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "cursor",
-    "name": "screenshot",
-    "description": "Capture a snapshot of the current cursor window (DOM + Accessibility tree)",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "output",
-        "type": "str",
-        "required": false,
-        "help": "Output file path (default: /tmp/cursor-snapshot.txt)"
-      }
-    ],
-    "columns": [
-      "Status",
-      "File"
-    ],
-    "type": "js",
-    "modulePath": "cursor/screenshot.js",
-    "sourceFile": "cursor/screenshot.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "cursor",
-    "name": "send",
-    "description": "Send a prompt directly into Cursor Composer/Chat",
-    "access": "write",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "text",
-        "type": "str",
-        "required": true,
-        "positional": true,
-        "help": "Text to send into Cursor"
-      }
-    ],
-    "columns": [
-      "Status",
-      "InjectedText"
-    ],
-    "type": "js",
-    "modulePath": "cursor/send.js",
-    "sourceFile": "cursor/send.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "cursor",
-    "name": "status",
-    "description": "Check active CDP connection to Cursor AI Editor",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Status",
-      "Url",
-      "Title"
-    ],
-    "type": "js",
-    "modulePath": "cursor/status.js",
-    "sourceFile": "cursor/status.js",
-    "navigateBefore": true
-  },
-  {
     "site": "dblp",
     "name": "author",
     "description": "List dblp publications by a given author (newest first; resolves to top PID match)",
     "access": "read",
     "domain": "dblp.org",
     "strategy": "public",
-    "browser": false,
+    "browser": true,
     "args": [
       {
         "name": "author",
@@ -9909,7 +7899,8 @@
     ],
     "type": "js",
     "modulePath": "dblp/author.js",
-    "sourceFile": "dblp/author.js"
+    "sourceFile": "dblp/author.js",
+    "navigateBefore": false
   },
   {
     "site": "dblp",
@@ -9922,7 +7913,7 @@
     "access": "read",
     "domain": "dblp.org",
     "strategy": "public",
-    "browser": false,
+    "browser": true,
     "args": [
       {
         "name": "key",
@@ -9946,7 +7937,8 @@
     ],
     "type": "js",
     "modulePath": "dblp/paper.js",
-    "sourceFile": "dblp/paper.js"
+    "sourceFile": "dblp/paper.js",
+    "navigateBefore": false
   },
   {
     "site": "dblp",
@@ -9955,7 +7947,7 @@
     "access": "read",
     "domain": "dblp.org",
     "strategy": "public",
-    "browser": false,
+    "browser": true,
     "args": [
       {
         "name": "query",
@@ -9985,7 +7977,8 @@
     ],
     "type": "js",
     "modulePath": "dblp/search.js",
-    "sourceFile": "dblp/search.js"
+    "sourceFile": "dblp/search.js",
+    "navigateBefore": false
   },
   {
     "site": "dblp",
@@ -9994,7 +7987,7 @@
     "access": "read",
     "domain": "dblp.org",
     "strategy": "public",
-    "browser": false,
+    "browser": true,
     "args": [
       {
         "name": "query",
@@ -10020,7 +8013,8 @@
     ],
     "type": "js",
     "modulePath": "dblp/venue.js",
-    "sourceFile": "dblp/venue.js"
+    "sourceFile": "dblp/venue.js",
+    "navigateBefore": false
   },
   {
     "site": "deepseek",
@@ -10055,9 +8049,8 @@
       {
         "name": "model",
         "type": "str",
-        "default": "instant",
         "required": false,
-        "help": "Model to use: instant, expert, or vision",
+        "help": "Explicitly select a model; omitted uses the current DeepSeek model",
         "choices": [
           "instant",
           "expert",
@@ -10789,361 +8782,6 @@
     "type": "js",
     "modulePath": "dictionary/synonyms.js",
     "sourceFile": "dictionary/synonyms.js"
-  },
-  {
-    "site": "discord-app",
-    "name": "channels",
-    "description": "List channels in the current Discord server",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Index",
-      "Channel",
-      "Type",
-      "guild_id",
-      "channel_id",
-      "url"
-    ],
-    "type": "js",
-    "modulePath": "discord-app/channels.js",
-    "sourceFile": "discord-app/channels.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "discord-app",
-    "name": "delete",
-    "description": "Delete a message by its ID in the active Discord channel",
-    "access": "write",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "message_id",
-        "type": "string",
-        "required": true,
-        "positional": true,
-        "help": "The ID of the message to delete (visible via Developer Mode or the read command)"
-      }
-    ],
-    "columns": [
-      "status",
-      "message"
-    ],
-    "type": "js",
-    "modulePath": "discord-app/delete.js",
-    "sourceFile": "discord-app/delete.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "discord-app",
-    "name": "goto",
-    "description": "Open a Discord channel by id/name/url without sending messages",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "guild",
-        "type": "str",
-        "required": false,
-        "help": "Guild/server id or visible name"
-      },
-      {
-        "name": "channel",
-        "type": "str",
-        "required": false,
-        "help": "Channel id or visible name"
-      },
-      {
-        "name": "url",
-        "type": "str",
-        "required": false,
-        "help": "Discord channel URL"
-      },
-      {
-        "name": "timeout",
-        "type": "str",
-        "default": "8",
-        "required": false,
-        "help": "Seconds to wait for Discord to show the route (default: 8)"
-      }
-    ],
-    "columns": [
-      "Status",
-      "guild_id",
-      "channel_id",
-      "url"
-    ],
-    "type": "js",
-    "modulePath": "discord-app/goto.js",
-    "sourceFile": "discord-app/goto.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "discord-app",
-    "name": "members",
-    "description": "List online members in the current Discord channel",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Index",
-      "Name",
-      "Status"
-    ],
-    "type": "js",
-    "modulePath": "discord-app/members.js",
-    "sourceFile": "discord-app/members.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "discord-app",
-    "name": "read",
-    "description": "Read recent messages from the active or targeted Discord channel",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "count",
-        "type": "str",
-        "default": "20",
-        "required": false,
-        "help": "Number of messages to read (default: 20)"
-      },
-      {
-        "name": "guild",
-        "type": "str",
-        "required": false,
-        "help": "Guild/server id or visible name for targeted reads"
-      },
-      {
-        "name": "channel",
-        "type": "str",
-        "required": false,
-        "help": "Channel id or visible name for targeted reads"
-      },
-      {
-        "name": "url",
-        "type": "str",
-        "required": false,
-        "help": "Discord channel URL to open before reading"
-      }
-    ],
-    "columns": [
-      "Author",
-      "Time",
-      "Message",
-      "channel_id",
-      "message_id"
-    ],
-    "type": "js",
-    "modulePath": "discord-app/read.js",
-    "sourceFile": "discord-app/read.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "discord-app",
-    "name": "search",
-    "description": "Search messages in the current Discord server/channel (Cmd+F)",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "query",
-        "type": "str",
-        "required": true,
-        "positional": true,
-        "help": "Search query"
-      }
-    ],
-    "columns": [
-      "Index",
-      "Author",
-      "Message"
-    ],
-    "type": "js",
-    "modulePath": "discord-app/search.js",
-    "sourceFile": "discord-app/search.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "discord-app",
-    "name": "send",
-    "description": "Send a message in the active Discord channel",
-    "access": "write",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "text",
-        "type": "str",
-        "required": true,
-        "positional": true,
-        "help": "Message to send"
-      }
-    ],
-    "columns": [
-      "Status"
-    ],
-    "type": "js",
-    "modulePath": "discord-app/send.js",
-    "sourceFile": "discord-app/send.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "discord-app",
-    "name": "servers",
-    "description": "List all Discord servers (guilds) in the sidebar",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Index",
-      "Server",
-      "guild_id",
-      "url"
-    ],
-    "type": "js",
-    "modulePath": "discord-app/servers.js",
-    "sourceFile": "discord-app/servers.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "discord-app",
-    "name": "status",
-    "description": "Check active CDP connection to Discord Desktop",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Status",
-      "Url",
-      "Title"
-    ],
-    "type": "js",
-    "modulePath": "discord-app/status.js",
-    "sourceFile": "discord-app/status.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "discord-app",
-    "name": "thread-read",
-    "description": "Read recent messages from a Discord thread/post by id or URL",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "thread",
-        "type": "str",
-        "required": false,
-        "help": "Thread/post id, or a full Discord thread/post URL"
-      },
-      {
-        "name": "count",
-        "type": "str",
-        "default": "20",
-        "required": false,
-        "help": "Number of messages to read (default: 20)"
-      },
-      {
-        "name": "guild",
-        "type": "str",
-        "required": false,
-        "help": "Parent guild/server id or visible name"
-      },
-      {
-        "name": "channel",
-        "type": "str",
-        "required": false,
-        "help": "Parent forum/channel id or visible name"
-      },
-      {
-        "name": "url",
-        "type": "str",
-        "required": false,
-        "help": "Discord thread/post URL"
-      }
-    ],
-    "columns": [
-      "Author",
-      "Time",
-      "Message",
-      "channel_id",
-      "message_id"
-    ],
-    "type": "js",
-    "modulePath": "discord-app/thread-read.js",
-    "sourceFile": "discord-app/thread-read.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "discord-app",
-    "name": "threads",
-    "description": "List visible Discord forum/thread posts in the active or targeted channel",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "limit",
-        "type": "str",
-        "default": "30",
-        "required": false,
-        "help": "Maximum thread/post cards to return (default: 30)"
-      },
-      {
-        "name": "guild",
-        "type": "str",
-        "required": false,
-        "help": "Guild/server id or visible name for targeted thread listing"
-      },
-      {
-        "name": "channel",
-        "type": "str",
-        "required": false,
-        "help": "Forum/channel id or visible name for targeted thread listing"
-      },
-      {
-        "name": "url",
-        "type": "str",
-        "required": false,
-        "help": "Discord forum/channel URL to open before listing threads"
-      }
-    ],
-    "columns": [
-      "Index",
-      "Thread",
-      "Author",
-      "Updated",
-      "Preview",
-      "guild_id",
-      "channel_id",
-      "thread_id",
-      "url"
-    ],
-    "type": "js",
-    "modulePath": "discord-app/threads.js",
-    "sourceFile": "discord-app/threads.js",
-    "navigateBefore": true
   },
   {
     "site": "dockerhub",
@@ -12155,162 +9793,6 @@
     "siteSession": "persistent"
   },
   {
-    "site": "doubao-app",
-    "name": "ask",
-    "description": "Send a message to Doubao desktop app and wait for the AI response",
-    "access": "write",
-    "domain": "doubao-app",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "text",
-        "type": "str",
-        "required": true,
-        "positional": true,
-        "help": "Prompt to send"
-      },
-      {
-        "name": "timeout",
-        "type": "int",
-        "default": 30,
-        "required": false,
-        "help": "Max seconds to wait for response"
-      }
-    ],
-    "columns": [
-      "Role",
-      "Text"
-    ],
-    "type": "js",
-    "modulePath": "doubao-app/ask.js",
-    "sourceFile": "doubao-app/ask.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "doubao-app",
-    "name": "dump",
-    "description": "Dump Doubao desktop app DOM and snapshot to /tmp for debugging",
-    "access": "read",
-    "domain": "doubao-app",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Status",
-      "File"
-    ],
-    "type": "js",
-    "modulePath": "doubao-app/dump.js",
-    "sourceFile": "doubao-app/dump.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "doubao-app",
-    "name": "new",
-    "description": "Start a new chat in Doubao desktop app",
-    "access": "read",
-    "domain": "doubao-app",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Status"
-    ],
-    "type": "js",
-    "modulePath": "doubao-app/new.js",
-    "sourceFile": "doubao-app/new.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "doubao-app",
-    "name": "read",
-    "description": "Read chat history from Doubao desktop app",
-    "access": "read",
-    "domain": "doubao-app",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Role",
-      "Text"
-    ],
-    "type": "js",
-    "modulePath": "doubao-app/read.js",
-    "sourceFile": "doubao-app/read.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "doubao-app",
-    "name": "screenshot",
-    "description": "Capture a screenshot of the Doubao desktop app window",
-    "access": "read",
-    "domain": "doubao-app",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "output",
-        "type": "str",
-        "required": false,
-        "help": "Output file path (default: /tmp/doubao-screenshot.png)"
-      }
-    ],
-    "columns": [
-      "Status",
-      "File"
-    ],
-    "type": "js",
-    "modulePath": "doubao-app/screenshot.js",
-    "sourceFile": "doubao-app/screenshot.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "doubao-app",
-    "name": "send",
-    "description": "Send a message to Doubao desktop app",
-    "access": "write",
-    "domain": "doubao-app",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "text",
-        "type": "str",
-        "required": true,
-        "positional": true,
-        "help": "Message text to send"
-      }
-    ],
-    "columns": [
-      "Status",
-      "Text"
-    ],
-    "type": "js",
-    "modulePath": "doubao-app/send.js",
-    "sourceFile": "doubao-app/send.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "doubao-app",
-    "name": "status",
-    "description": "Check CDP connection to Doubao desktop app",
-    "access": "read",
-    "domain": "doubao-app",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Status",
-      "Url",
-      "Title"
-    ],
-    "type": "js",
-    "modulePath": "doubao-app/status.js",
-    "sourceFile": "doubao-app/status.js",
-    "navigateBefore": true
-  },
-  {
     "site": "douyin",
     "name": "activities",
     "description": "官方活动列表",
@@ -12381,6 +9863,46 @@
     "sourceFile": "douyin/delete.js",
     "navigateBefore": "https://creator.douyin.com",
     "siteSession": "persistent"
+  },
+  {
+    "site": "douyin",
+    "name": "detail",
+    "description": "单条视频全解（短链/链接/ID → 文案、互动数据、作者、下载地址、图文图集）",
+    "access": "read",
+    "example": "opencli douyin detail \"https://v.douyin.com/xxxx/\" -f yaml",
+    "domain": "www.douyin.com",
+    "strategy": "cookie",
+    "browser": true,
+    "args": [
+      {
+        "name": "target",
+        "type": "str",
+        "required": true,
+        "positional": true,
+        "help": "分享短链 / 视频链接 / 纯数字 ID"
+      }
+    ],
+    "columns": [
+      "aweme_id",
+      "desc",
+      "author",
+      "author_sec_uid",
+      "digg",
+      "comment",
+      "collect",
+      "share",
+      "created",
+      "duration_s",
+      "music",
+      "play_url",
+      "cover",
+      "images",
+      "share_url"
+    ],
+    "type": "js",
+    "modulePath": "douyin/detail.js",
+    "sourceFile": "douyin/detail.js",
+    "navigateBefore": "https://www.douyin.com"
   },
   {
     "site": "douyin",
@@ -19967,12 +17489,13 @@
       "following",
       "posts",
       "verified",
-      "bio"
+      "bio",
+      "avatar_url"
     ],
     "type": "js",
     "modulePath": "instagram/profile.js",
     "sourceFile": "instagram/profile.js",
-    "navigateBefore": "https://www.instagram.com"
+    "navigateBefore": false
   },
   {
     "site": "instagram",
@@ -20115,12 +17638,13 @@
       "name",
       "verified",
       "private",
-      "url"
+      "url",
+      "avatar_url"
     ],
     "type": "js",
     "modulePath": "instagram/search.js",
     "sourceFile": "instagram/search.js",
-    "navigateBefore": "https://www.instagram.com"
+    "navigateBefore": false
   },
   {
     "site": "instagram",
@@ -20285,7 +17809,7 @@
     "type": "js",
     "modulePath": "instagram/user.js",
     "sourceFile": "instagram/user.js",
-    "navigateBefore": "https://www.instagram.com"
+    "navigateBefore": false
   },
   {
     "site": "instagram",
@@ -27135,7 +24659,7 @@
     "name": "login",
     "description": "Open notebooklm login and wait until the browser session is authenticated",
     "access": "write",
-    "domain": "google.com",
+    "domain": "notebooklm.google.com",
     "strategy": "cookie",
     "browser": true,
     "args": [
@@ -27406,7 +24930,7 @@
     "name": "whoami",
     "description": "Show the current logged-in notebooklm account",
     "access": "read",
-    "domain": "google.com",
+    "domain": "notebooklm.google.com",
     "strategy": "cookie",
     "browser": true,
     "args": [],
@@ -29345,6 +26869,46 @@
     "sourceFile": "paperreview/submit.js"
   },
   {
+    "site": "pinduoduo",
+    "name": "search",
+    "description": "拼多多商品搜索（H5 首屏，需要登录态）",
+    "access": "read",
+    "domain": "mobile.yangkeduo.com",
+    "strategy": "cookie",
+    "browser": true,
+    "args": [
+      {
+        "name": "query",
+        "type": "str",
+        "required": true,
+        "positional": true,
+        "help": "搜索关键词"
+      },
+      {
+        "name": "limit",
+        "type": "int",
+        "default": 10,
+        "required": false,
+        "help": "返回条数 (1-20，首屏上限)"
+      }
+    ],
+    "columns": [
+      "rank",
+      "title",
+      "price",
+      "price_label",
+      "group_price",
+      "sales",
+      "tags",
+      "goods_id",
+      "url"
+    ],
+    "type": "js",
+    "modulePath": "pinduoduo/search.js",
+    "sourceFile": "pinduoduo/search.js",
+    "navigateBefore": false
+  },
+  {
     "site": "pinterest",
     "name": "board-create",
     "description": "Create a new board on your account",
@@ -30305,7 +27869,7 @@
         "type": "str",
         "required": true,
         "positional": true,
-        "help": "Illustration ID"
+        "help": "Illustration ID or Pixiv artwork URL"
       },
       {
         "name": "output",
@@ -30953,6 +28517,118 @@
     "modulePath": "producthunt/today.js",
     "sourceFile": "producthunt/today.js",
     "navigateBefore": true
+  },
+  {
+    "site": "proton",
+    "name": "inbox",
+    "description": "List sender-filtered inbox metadata via API; optionally read the newest message for a code",
+    "access": "read",
+    "example": "opencli proton inbox --from ifood --read-code -f json",
+    "domain": "mail.proton.me",
+    "strategy": "cookie",
+    "browser": true,
+    "args": [
+      {
+        "name": "from",
+        "type": "str",
+        "required": false,
+        "help": "Case-insensitive substring of the sender name or address"
+      },
+      {
+        "name": "limit",
+        "type": "int",
+        "default": 20,
+        "required": false,
+        "help": "Maximum matching messages (1..100)"
+      },
+      {
+        "name": "since",
+        "type": "int",
+        "default": 0,
+        "required": false,
+        "help": "Only messages at or after this Unix timestamp (seconds)"
+      },
+      {
+        "name": "read-code",
+        "type": "bool",
+        "default": false,
+        "required": false,
+        "help": "Open the newest match and extract a code; may mark that message read"
+      },
+      {
+        "name": "timeout",
+        "type": "int",
+        "default": 30,
+        "required": false,
+        "help": "Seconds to wait for selected message decryption (1..900)"
+      }
+    ],
+    "columns": [
+      "id",
+      "sender",
+      "subject",
+      "time",
+      "code"
+    ],
+    "type": "js",
+    "modulePath": "proton/inbox.js",
+    "sourceFile": "proton/inbox.js",
+    "navigateBefore": false,
+    "siteSession": "persistent"
+  },
+  {
+    "site": "proton",
+    "name": "login",
+    "description": "Open proton login and wait until the browser session is authenticated",
+    "access": "write",
+    "domain": "mail.proton.me",
+    "strategy": "cookie",
+    "browser": true,
+    "args": [
+      {
+        "name": "timeout",
+        "type": "int",
+        "default": 300,
+        "required": false,
+        "help": "Maximum seconds to wait for the user to finish login"
+      }
+    ],
+    "columns": [
+      "status",
+      "logged_in",
+      "site",
+      "id",
+      "username",
+      "email"
+    ],
+    "type": "js",
+    "modulePath": "proton/login.js",
+    "sourceFile": "proton/login.js",
+    "navigateBefore": false,
+    "siteSession": "persistent",
+    "defaultWindowMode": "foreground"
+  },
+  {
+    "site": "proton",
+    "name": "whoami",
+    "description": "Show the Proton account verified by the authenticated Mail API",
+    "access": "read",
+    "domain": "mail.proton.me",
+    "strategy": "cookie",
+    "browser": true,
+    "args": [],
+    "columns": [
+      "logged_in",
+      "site",
+      "id",
+      "username",
+      "email"
+    ],
+    "type": "js",
+    "modulePath": "proton/whoami.js",
+    "sourceFile": "proton/whoami.js",
+    "navigateBefore": false,
+    "siteSession": "persistent"
   },
   {
     "site": "pubmed",
@@ -31619,402 +29295,6 @@
     "type": "js",
     "modulePath": "pypi/package.js",
     "sourceFile": "pypi/package.js"
-  },
-  {
-    "site": "qoder",
-    "name": "account",
-    "description": "Click the account button (username) in the Qoder sidebar and return the visible account dropdown items.",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "username",
-        "type": "str",
-        "required": false,
-        "help": "Username text shown in the sidebar (default: tries common short labels)"
-      }
-    ],
-    "columns": [
-      "Field",
-      "Value"
-    ],
-    "type": "js",
-    "modulePath": "qoder/ui.js",
-    "sourceFile": "qoder/ui.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "qoder",
-    "name": "add-workspace",
-    "description": "Click \"Add Workspace\" — opens the folder picker. Note: this opens a system file-picker dialog that Qoder controls; the actual folder selection must be done in the UI by the user.",
-    "access": "write",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Status"
-    ],
-    "type": "js",
-    "modulePath": "qoder/ui.js",
-    "sourceFile": "qoder/ui.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "qoder",
-    "name": "ask",
-    "description": "Send a prompt to Qoder and wait up to --timeout seconds for the reply (best-effort: polls for the chat turn count to grow + stabilize).",
-    "access": "write",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "text",
-        "type": "str",
-        "required": true,
-        "positional": true,
-        "help": "Prompt text"
-      },
-      {
-        "name": "timeout",
-        "type": "int",
-        "default": 120,
-        "required": false,
-        "help": "Max seconds to wait"
-      }
-    ],
-    "columns": [
-      "Role",
-      "Text",
-      "WaitedSeconds"
-    ],
-    "type": "js",
-    "modulePath": "qoder/quest.js",
-    "sourceFile": "qoder/quest.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "qoder",
-    "name": "credits",
-    "description": "Click \"Credits Usage\" and return the credits-usage display text.",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Field",
-      "Value"
-    ],
-    "type": "js",
-    "modulePath": "qoder/ui.js",
-    "sourceFile": "qoder/ui.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "qoder",
-    "name": "history",
-    "description": "List Quests visible in the Qoder sidebar. Returns title + visible metadata.",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "limit",
-        "type": "int",
-        "default": 50,
-        "required": false,
-        "help": ""
-      }
-    ],
-    "columns": [
-      "Index",
-      "Title"
-    ],
-    "type": "js",
-    "modulePath": "qoder/history.js",
-    "sourceFile": "qoder/history.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "qoder",
-    "name": "knowledge",
-    "description": "Open the Knowledge view (Qoder's personal/team knowledge base).",
-    "access": "write",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Status"
-    ],
-    "type": "js",
-    "modulePath": "qoder/ui.js",
-    "sourceFile": "qoder/ui.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "qoder",
-    "name": "marketplace",
-    "description": "Open the Qoder Marketplace.",
-    "access": "write",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Status"
-    ],
-    "type": "js",
-    "modulePath": "qoder/ui.js",
-    "sourceFile": "qoder/ui.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "qoder",
-    "name": "more-actions",
-    "description": "Click the \"More Actions\" button and list its menu items.",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Index",
-      "Item"
-    ],
-    "type": "js",
-    "modulePath": "qoder/ui.js",
-    "sourceFile": "qoder/ui.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "qoder",
-    "name": "new",
-    "description": "Start a new Qoder Quest (conversation). Clicks the \"New Quest\" button in the sidebar (or its ⌘N variant).",
-    "access": "write",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Status"
-    ],
-    "type": "js",
-    "modulePath": "qoder/quest.js",
-    "sourceFile": "qoder/quest.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "qoder",
-    "name": "open-editor",
-    "description": "Click \"Open Editor\" — opens the current draft in a full editor pane.",
-    "access": "write",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Status"
-    ],
-    "type": "js",
-    "modulePath": "qoder/composer.js",
-    "sourceFile": "qoder/composer.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "qoder",
-    "name": "open-panel",
-    "description": "Open / close the Qoder bottom panel (Output / Terminal / Debug Console). ⌥⌘B equivalent.",
-    "access": "write",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Status"
-    ],
-    "type": "js",
-    "modulePath": "qoder/ui.js",
-    "sourceFile": "qoder/ui.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "qoder",
-    "name": "prompt-enhance",
-    "description": "Click \"Prompt Enhance\" — Qoder rewrites the current composer draft for better LLM consumption.",
-    "access": "write",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Status"
-    ],
-    "type": "js",
-    "modulePath": "qoder/composer.js",
-    "sourceFile": "qoder/composer.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "qoder",
-    "name": "read",
-    "description": "Read messages in the current Qoder Quest. Returns role + text for each visible turn.",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "limit",
-        "type": "int",
-        "default": 30,
-        "required": false,
-        "help": ""
-      }
-    ],
-    "columns": [
-      "Index",
-      "Role",
-      "Text"
-    ],
-    "type": "js",
-    "modulePath": "qoder/read.js",
-    "sourceFile": "qoder/read.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "qoder",
-    "name": "search",
-    "description": "Open Qoder Search palette (⌘P), type a query, return matched options.",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "query",
-        "type": "str",
-        "required": true,
-        "positional": true,
-        "help": "Search text"
-      },
-      {
-        "name": "limit",
-        "type": "int",
-        "default": 20,
-        "required": false,
-        "help": ""
-      }
-    ],
-    "columns": [
-      "Index",
-      "Item"
-    ],
-    "type": "js",
-    "modulePath": "qoder/ui.js",
-    "sourceFile": "qoder/ui.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "qoder",
-    "name": "send",
-    "description": "Type text into the Qoder composer and click \"Send message\" (fire-and-forget).",
-    "access": "write",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "text",
-        "type": "str",
-        "required": true,
-        "positional": true,
-        "help": "Text to send"
-      }
-    ],
-    "columns": [
-      "Status",
-      "Length"
-    ],
-    "type": "js",
-    "modulePath": "qoder/quest.js",
-    "sourceFile": "qoder/quest.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "qoder",
-    "name": "settings",
-    "description": "Click the Settings button in the Qoder sidebar.",
-    "access": "write",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Status"
-    ],
-    "type": "js",
-    "modulePath": "qoder/ui.js",
-    "sourceFile": "qoder/ui.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "qoder",
-    "name": "sidebar-toggle",
-    "description": "Collapse / Expand the Qoder Quest List sidebar (⌘B).",
-    "access": "write",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Status"
-    ],
-    "type": "js",
-    "modulePath": "qoder/ui.js",
-    "sourceFile": "qoder/ui.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "qoder",
-    "name": "status",
-    "description": "Check Qoder CDP connection and report the current renderer URL + title.",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Status",
-      "Url",
-      "Title"
-    ],
-    "type": "js",
-    "modulePath": "qoder/status.js",
-    "sourceFile": "qoder/status.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "qoder",
-    "name": "view-all",
-    "description": "Click \"View all\" to show all Quests.",
-    "access": "write",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Status"
-    ],
-    "type": "js",
-    "modulePath": "qoder/ui.js",
-    "sourceFile": "qoder/ui.js",
-    "navigateBefore": true
   },
   {
     "site": "quark",
@@ -32972,6 +30252,13 @@
         "default": 2,
         "required": false,
         "help": "Max expansion passes when --expand-more is on (1–5; each round can fan out new \"more\" stubs)"
+      },
+      {
+        "name": "allow-partial",
+        "type": "bool",
+        "default": false,
+        "required": false,
+        "help": "With --expand-more: if Reddit denies /api/morechildren (HTTP 401/403, network-security block, or rate limit), keep the comments already loaded and append a NOTICE row instead of failing"
       }
     ],
     "columns": [
@@ -33089,7 +30376,7 @@
     "name": "search",
     "description": "Search Reddit Posts",
     "access": "read",
-    "domain": "reddit.com",
+    "domain": "www.reddit.com",
     "strategy": "cookie",
     "browser": true,
     "args": [
@@ -38432,7 +35719,7 @@
   {
     "site": "tiktok",
     "name": "user",
-    "description": "Get recent videos from a TikTok user via page-context APIs",
+    "description": "Get recent videos from a TikTok user from page-rendered responses",
     "access": "read",
     "domain": "www.tiktok.com",
     "strategy": "cookie",
@@ -38471,7 +35758,7 @@
     "type": "js",
     "modulePath": "tiktok/user.js",
     "sourceFile": "tiktok/user.js",
-    "navigateBefore": "https://www.tiktok.com"
+    "navigateBefore": false
   },
   {
     "site": "tiktok",
@@ -38648,1336 +35935,6 @@
     "sourceFile": "toutiao/auth.js",
     "navigateBefore": false,
     "siteSession": "persistent"
-  },
-  {
-    "site": "trae-cn",
-    "name": "activity",
-    "description": "Read the current Trae CN task/activity state, including in-progress steps when visible",
-    "access": "read",
-    "example": "OPENCLI_CDP_ENDPOINT=http://127.0.0.1:39240 OPENCLI_CDP_TARGET=talk opencli trae-cn activity --max-chars 1200 -f json",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "max-chars",
-        "type": "int",
-        "default": 1200,
-        "required": false,
-        "help": "Max chars per text field; 0 returns full text (default: 1200)"
-      }
-    ],
-    "columns": [
-      "Status",
-      "Workspace",
-      "Model",
-      "Agent",
-      "LatestRole",
-      "TurnIndex",
-      "MessageId",
-      "Progress",
-      "ActiveStep",
-      "CompletedSteps",
-      "PendingSteps",
-      "TotalSteps",
-      "ApprovalPending",
-      "ApprovalKind",
-      "ApprovalButton",
-      "Thinking",
-      "LatestText",
-      "TextChars",
-      "UpdatedAt"
-    ],
-    "type": "js",
-    "modulePath": "trae-cn/activity.js",
-    "sourceFile": "trae-cn/activity.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "trae-cn",
-    "name": "approve",
-    "description": "Approve visible Trae CN permission prompts such as terminal-run, high-risk command, or delete confirmations",
-    "access": "write",
-    "example": "OPENCLI_CDP_ENDPOINT=http://127.0.0.1:39240 OPENCLI_CDP_TARGET=talk opencli trae-cn approve --approve-kinds terminal,delete -f json",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "approve-kinds",
-        "type": "string",
-        "default": "terminal,delete",
-        "required": false,
-        "help": "Comma-separated approval categories: terminal,delete,keep,all (default: terminal,delete; keep is not default)"
-      },
-      {
-        "name": "limit",
-        "type": "int",
-        "default": 1,
-        "required": false,
-        "help": "Max visible prompts to approve in this pass (default: 1)"
-      },
-      {
-        "name": "max-chars",
-        "type": "int",
-        "default": 600,
-        "required": false,
-        "help": "Max chars to return from prompt text; 0 returns full text (default: 600)"
-      },
-      {
-        "name": "dry-run",
-        "type": "boolean",
-        "default": false,
-        "required": false,
-        "help": "Detect matching prompts without clicking them (default: false)"
-      }
-    ],
-    "columns": [
-      "Status",
-      "Kind",
-      "Button",
-      "Prompt",
-      "Selector",
-      "Action"
-    ],
-    "type": "js",
-    "modulePath": "trae-cn/approve.js",
-    "sourceFile": "trae-cn/approve.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "trae-cn",
-    "name": "ask",
-    "description": "Send a prompt to Trae CN, wait for the assistant result without treating approval cards as final, and return it",
-    "access": "write",
-    "example": "OPENCLI_CDP_ENDPOINT=http://127.0.0.1:39240 OPENCLI_CDP_TARGET=talk opencli trae-cn ask \"请只回复 OK\" --timeout 120 -f json",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "text",
-        "type": "str",
-        "required": true,
-        "positional": true,
-        "help": "Prompt to send into Trae CN"
-      },
-      {
-        "name": "timeout",
-        "type": "int",
-        "default": 60,
-        "required": false,
-        "help": "Max seconds to wait for response (default: 60)"
-      },
-      {
-        "name": "max-chars",
-        "type": "int",
-        "default": 12000,
-        "required": false,
-        "help": "Max chars to return from the assistant response; 0 returns full text (default: 12000)"
-      },
-      {
-        "name": "auto-approve",
-        "type": "boolean",
-        "default": false,
-        "required": false,
-        "help": "While waiting, approve visible terminal/delete prompts, including high-risk terminal confirmation layers (default: false)"
-      },
-      {
-        "name": "approve-kinds",
-        "type": "string",
-        "default": "terminal,delete",
-        "required": false,
-        "help": "Comma-separated approval categories for --auto-approve: terminal,delete,keep,all (default: terminal,delete; keep is not default)"
-      }
-    ],
-    "columns": [
-      "Role",
-      "Text",
-      "TextChars",
-      "Truncated",
-      "TurnIndex",
-      "MessageId"
-    ],
-    "type": "js",
-    "modulePath": "trae-cn/ask.js",
-    "sourceFile": "trae-cn/ask.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "trae-cn",
-    "name": "dump",
-    "description": "Dump the DOM and Accessibility tree of trae-cn for reverse-engineering",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "action",
-      "files"
-    ],
-    "type": "js",
-    "modulePath": "trae-cn/dump.js",
-    "sourceFile": "trae-cn/dump.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "trae-cn",
-    "name": "export",
-    "description": "Export the current Trae CN conversation to Markdown",
-    "access": "read",
-    "example": "OPENCLI_CDP_ENDPOINT=http://127.0.0.1:39240 OPENCLI_CDP_TARGET=talk opencli trae-cn export --limit 20 --output /tmp/trae-cn-export.md",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "output",
-        "type": "str",
-        "required": false,
-        "help": "Output file (default: /tmp/trae-cn-export.md)"
-      },
-      {
-        "name": "limit",
-        "type": "int",
-        "default": 50,
-        "required": false,
-        "help": "Max recent turns to export (default: 50)"
-      }
-    ],
-    "columns": [
-      "Status",
-      "File",
-      "Messages"
-    ],
-    "type": "js",
-    "modulePath": "trae-cn/export.js",
-    "sourceFile": "trae-cn/export.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "trae-cn",
-    "name": "model",
-    "description": "Read the model label currently shown in the Trae CN chat input",
-    "access": "read",
-    "example": "OPENCLI_CDP_ENDPOINT=http://127.0.0.1:39240 OPENCLI_CDP_TARGET=talk opencli trae-cn model -f json",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Model",
-      "Agent",
-      "Workspace"
-    ],
-    "type": "js",
-    "modulePath": "trae-cn/model.js",
-    "sourceFile": "trae-cn/model.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "trae-cn",
-    "name": "new",
-    "description": "Start a new Trae CN task in the current workspace, optionally sending the first prompt",
-    "access": "write",
-    "example": "OPENCLI_CDP_ENDPOINT=http://127.0.0.1:39240 OPENCLI_CDP_TARGET=talk opencli trae-cn new \"请执行你的任务\" -f json",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "prompt",
-        "type": "str",
-        "required": false,
-        "positional": true,
-        "help": "Optional first prompt to send after creating the task"
-      },
-      {
-        "name": "timeout",
-        "type": "int",
-        "default": 10,
-        "required": false,
-        "help": "Max seconds to wait for a fresh task composer (default: 10)"
-      }
-    ],
-    "columns": [
-      "Status",
-      "Action",
-      "Workspace",
-      "Model",
-      "Agent",
-      "FreshTaskConfirmed",
-      "TurnsBeforeSubmit",
-      "Turns",
-      "ComposerReady",
-      "SubmitMode"
-    ],
-    "type": "js",
-    "modulePath": "trae-cn/new.js",
-    "sourceFile": "trae-cn/new.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "trae-cn",
-    "name": "read",
-    "description": "Read the current Trae CN chat conversation",
-    "access": "read",
-    "example": "OPENCLI_CDP_ENDPOINT=http://127.0.0.1:39240 OPENCLI_CDP_TARGET=talk opencli trae-cn read --limit 5 --max-chars 12000 -f json",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "limit",
-        "type": "int",
-        "default": 20,
-        "required": false,
-        "help": "Max recent turns to return (default: 20)"
-      },
-      {
-        "name": "max-chars",
-        "type": "int",
-        "default": 6000,
-        "required": false,
-        "help": "Max chars per turn; 0 returns full text (default: 6000)"
-      }
-    ],
-    "columns": [
-      "Role",
-      "Text",
-      "TextChars",
-      "Truncated",
-      "TurnIndex",
-      "MessageId"
-    ],
-    "type": "js",
-    "modulePath": "trae-cn/read.js",
-    "sourceFile": "trae-cn/read.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "trae-cn",
-    "name": "screenshot",
-    "description": "Capture a snapshot of the current Trae CN window (DOM + Accessibility tree)",
-    "access": "read",
-    "example": "OPENCLI_CDP_ENDPOINT=http://127.0.0.1:39240 OPENCLI_CDP_TARGET=talk opencli trae-cn screenshot --output /tmp/trae-cn-snapshot.txt",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "output",
-        "type": "str",
-        "required": false,
-        "help": "Output file path (default: /tmp/trae-cn-snapshot.txt)"
-      }
-    ],
-    "columns": [
-      "Status",
-      "File"
-    ],
-    "type": "js",
-    "modulePath": "trae-cn/screenshot.js",
-    "sourceFile": "trae-cn/screenshot.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "trae-cn",
-    "name": "select-model",
-    "description": "Select a model in the current Trae CN chat input",
-    "access": "write",
-    "example": "OPENCLI_CDP_ENDPOINT=http://127.0.0.1:39240 OPENCLI_CDP_TARGET=talk opencli trae-cn select-model \"GPT 5.4\" -f json",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "name",
-        "type": "str",
-        "required": true,
-        "positional": true,
-        "help": "Model label, for example GPT 5.4 or GPT-5.4"
-      }
-    ],
-    "columns": [
-      "Status",
-      "Requested",
-      "Selected",
-      "Workspace",
-      "Agent"
-    ],
-    "type": "js",
-    "modulePath": "trae-cn/select-model.js",
-    "sourceFile": "trae-cn/select-model.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "trae-cn",
-    "name": "send",
-    "description": "Send a prompt into the current Trae CN chat input",
-    "access": "write",
-    "example": "OPENCLI_CDP_ENDPOINT=http://127.0.0.1:39240 OPENCLI_CDP_TARGET=talk opencli trae-cn send \"请执行你的任务\" -f json",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "text",
-        "type": "str",
-        "required": true,
-        "positional": true,
-        "help": "Text to send into Trae CN"
-      }
-    ],
-    "columns": [
-      "Status",
-      "InjectedText",
-      "SubmitMode"
-    ],
-    "type": "js",
-    "modulePath": "trae-cn/send.js",
-    "sourceFile": "trae-cn/send.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "trae-cn",
-    "name": "setup",
-    "description": "Show local setup commands for controlling Trae CN with OpenCLI",
-    "access": "read",
-    "example": "opencli trae-cn setup -f table",
-    "strategy": "local",
-    "browser": false,
-    "args": [],
-    "columns": [
-      "Step",
-      "Command",
-      "Purpose"
-    ],
-    "type": "js",
-    "modulePath": "trae-cn/setup.js",
-    "sourceFile": "trae-cn/setup.js"
-  },
-  {
-    "site": "trae-cn",
-    "name": "status",
-    "description": "Check active CDP connection to Trae CN and summarize the current workspace/model",
-    "access": "read",
-    "example": "OPENCLI_CDP_ENDPOINT=http://127.0.0.1:39240 OPENCLI_CDP_TARGET=talk opencli trae-cn status -f json",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Status",
-      "Title",
-      "Workspace",
-      "Model",
-      "Agent",
-      "Turns",
-      "ComposerReady",
-      "Url"
-    ],
-    "type": "js",
-    "modulePath": "trae-cn/status.js",
-    "sourceFile": "trae-cn/status.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "trae-cn",
-    "name": "targets",
-    "description": "List Trae CN CDP targets and show which workspace/window is waiting",
-    "access": "read",
-    "example": "OPENCLI_CDP_ENDPOINT=http://127.0.0.1:39240 opencli trae-cn targets -f table",
-    "strategy": "local",
-    "browser": false,
-    "args": [
-      {
-        "name": "endpoint",
-        "type": "string",
-        "required": false,
-        "help": "CDP endpoint (default: OPENCLI_CDP_ENDPOINT)"
-      },
-      {
-        "name": "probe-activity",
-        "type": "boolean",
-        "default": true,
-        "required": false,
-        "help": "Probe each target for Trae activity state (default: true)"
-      },
-      {
-        "name": "max-chars",
-        "type": "int",
-        "default": 240,
-        "required": false,
-        "help": "Max chars for approval prompt/activity snippets (default: 240)"
-      }
-    ],
-    "columns": [
-      "Index",
-      "SelectedHint",
-      "RecommendedTarget",
-      "Title",
-      "Workspace",
-      "Status",
-      "ApprovalPending",
-      "ApprovalKind",
-      "ApprovalButton",
-      "Model",
-      "Agent",
-      "Type",
-      "Url"
-    ],
-    "type": "js",
-    "modulePath": "trae-cn/targets.js",
-    "sourceFile": "trae-cn/targets.js"
-  },
-  {
-    "site": "trae-cn",
-    "name": "watch",
-    "description": "Sample Trae CN activity over time to monitor long-running tasks; optionally approve visible terminal/delete prompts",
-    "access": "write",
-    "example": "OPENCLI_CDP_ENDPOINT=http://127.0.0.1:39240 OPENCLI_CDP_TARGET=talk opencli trae-cn watch --stream true --duration 120",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "duration",
-        "type": "int",
-        "default": 30,
-        "required": false,
-        "help": "Seconds to observe (default: 30)"
-      },
-      {
-        "name": "interval",
-        "type": "int",
-        "default": 2,
-        "required": false,
-        "help": "Seconds between samples (default: 2)"
-      },
-      {
-        "name": "max-chars",
-        "type": "int",
-        "default": 600,
-        "required": false,
-        "help": "Max chars per text field; 0 returns full text (default: 600)"
-      },
-      {
-        "name": "timeout",
-        "type": "int",
-        "default": 86400,
-        "required": false,
-        "help": "Max seconds for the overall watch command (default: 86400)"
-      },
-      {
-        "name": "stream",
-        "type": "boolean",
-        "default": false,
-        "required": false,
-        "help": "Write each sample immediately as JSONL and skip result rendering (default: false)"
-      },
-      {
-        "name": "stop-on-complete",
-        "type": "boolean",
-        "default": true,
-        "required": false,
-        "help": "Stop watching after the first completed sample (default: true)"
-      },
-      {
-        "name": "auto-approve",
-        "type": "boolean",
-        "default": false,
-        "required": false,
-        "help": "Approve visible terminal/delete prompts before each sample, including high-risk terminal confirmation layers (default: false)"
-      },
-      {
-        "name": "approve-kinds",
-        "type": "string",
-        "default": "terminal,delete",
-        "required": false,
-        "help": "Comma-separated approval categories for --auto-approve: terminal,delete,keep,all (default: terminal,delete; keep is not default)"
-      }
-    ],
-    "columns": [
-      "Sample",
-      "ElapsedSec",
-      "Changed",
-      "Status",
-      "Progress",
-      "ActiveStep",
-      "ApprovalPending",
-      "ApprovalKind",
-      "ApprovalButton",
-      "AutoApproved",
-      "LatestRole",
-      "TurnIndex",
-      "MessageId",
-      "TextChars",
-      "LatestText",
-      "UpdatedAt"
-    ],
-    "type": "js",
-    "modulePath": "trae-cn/watch.js",
-    "sourceFile": "trae-cn/watch.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "trae-solo",
-    "name": "automation-list",
-    "description": "List Trae SOLO Automation tab content. Default tab is \"Configured\"; pass --tab to switch.",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "tab",
-        "type": "str",
-        "default": "configured",
-        "required": false,
-        "help": "Tab to view: configured / run-history / task-template"
-      },
-      {
-        "name": "limit",
-        "type": "int",
-        "default": 50,
-        "required": false,
-        "help": ""
-      }
-    ],
-    "columns": [
-      "Index",
-      "Title",
-      "Summary"
-    ],
-    "type": "js",
-    "modulePath": "trae-solo/automation.js",
-    "sourceFile": "trae-solo/automation.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "trae-solo",
-    "name": "cookies",
-    "description": "List cookies on the Trae SOLO renderer (JS-visible via document.cookie; httpOnly cookies not shown).",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Index",
-      "Key",
-      "Bytes",
-      "Name",
-      "Preview",
-      "Database",
-      "Version"
-    ],
-    "type": "js",
-    "modulePath": "trae-solo/renderer-storage.js",
-    "sourceFile": "trae-solo/renderer-storage.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "trae-solo",
-    "name": "extensions-list",
-    "description": "List VSCode extensions installed in Trae SOLO (~/.trae/extensions/extensions.json). Works while Trae is closed.",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "local",
-    "browser": false,
-    "args": [],
-    "columns": [
-      "Index",
-      "Workspace Id",
-      "Kind",
-      "Target",
-      "Modified",
-      "Id",
-      "Version",
-      "Source",
-      "Installed"
-    ],
-    "type": "js",
-    "modulePath": "trae-solo/workspaces-fs.js",
-    "sourceFile": "trae-solo/workspaces-fs.js"
-  },
-  {
-    "site": "trae-solo",
-    "name": "history",
-    "description": "List Trae SOLO projects and the tasks within each (from the project-list view sidebar).",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "project",
-        "type": "str",
-        "required": false,
-        "help": "Filter by project name (substring, case-insensitive)"
-      },
-      {
-        "name": "limit",
-        "type": "int",
-        "default": 100,
-        "required": false,
-        "help": "Max tasks per project"
-      }
-    ],
-    "columns": [
-      "Project",
-      "Task Index",
-      "Task"
-    ],
-    "type": "js",
-    "modulePath": "trae-solo/history.js",
-    "sourceFile": "trae-solo/history.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "trae-solo",
-    "name": "idb-list",
-    "description": "List IndexedDB databases on the Trae SOLO renderer. Trae ships an @byted/ve-rtc DB used by the Volcengine RTC voice/video infrastructure.",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Index",
-      "Key",
-      "Bytes",
-      "Name",
-      "Preview",
-      "Database",
-      "Version"
-    ],
-    "type": "js",
-    "modulePath": "trae-solo/renderer-storage.js",
-    "sourceFile": "trae-solo/renderer-storage.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "trae-solo",
-    "name": "mode",
-    "description": "Read or switch TRAE SOLO between Code mode and Work mode.",
-    "access": "write",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "target",
-        "type": "str",
-        "required": false,
-        "positional": true,
-        "help": "Target mode: code or work. Omit to read current."
-      }
-    ],
-    "columns": [
-      "Status",
-      "Mode"
-    ],
-    "type": "js",
-    "modulePath": "trae-solo/mode.js",
-    "sourceFile": "trae-solo/mode.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "trae-solo",
-    "name": "model",
-    "description": "Read or switch the current AI model in TRAE SOLO. Without arguments, reports the current model. With <name> argument (substring, case-insensitive), switches to a matching model. Pass --list to enumerate available models.",
-    "access": "write",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "name",
-        "type": "str",
-        "required": false,
-        "positional": true,
-        "help": "Target model name (substring match, case-insensitive). Omit to read current."
-      },
-      {
-        "name": "list",
-        "type": "boolean",
-        "default": false,
-        "required": false,
-        "help": "List all available models (does not switch)"
-      }
-    ],
-    "columns": [
-      "Status",
-      "Model"
-    ],
-    "type": "js",
-    "modulePath": "trae-solo/model.js",
-    "sourceFile": "trae-solo/model.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "trae-solo",
-    "name": "recent-workspaces",
-    "description": "Show Trae SOLO's recently-opened workspaces (the File → Open Recent menu, stored under key \"history.recentlyOpenedPathsList\" in state.vscdb).",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "local",
-    "browser": false,
-    "args": [
-      {
-        "name": "limit",
-        "type": "int",
-        "default": 20,
-        "required": false,
-        "help": ""
-      }
-    ],
-    "columns": [
-      "Index",
-      "Key",
-      "Kind",
-      "Path"
-    ],
-    "type": "js",
-    "modulePath": "trae-solo/state-fs.js",
-    "sourceFile": "trae-solo/state-fs.js"
-  },
-  {
-    "site": "trae-solo",
-    "name": "settings-read",
-    "description": "Parse and pretty-print Trae SOLO user settings.json (~/Library/Application Support/TRAE SOLO/User/settings.json). Handles VSCode JSONC syntax (line comments + trailing commas).",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "local",
-    "browser": false,
-    "args": [],
-    "columns": [
-      "Field",
-      "Value"
-    ],
-    "type": "js",
-    "modulePath": "trae-solo/settings.js",
-    "sourceFile": "trae-solo/settings.js"
-  },
-  {
-    "site": "trae-solo",
-    "name": "skill-category",
-    "description": "Filter Skills Marketplace by category. Pass --list to see categories.",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "name",
-        "type": "str",
-        "required": false,
-        "positional": true,
-        "help": "Category name (substring; case-insensitive). Common: All / Developer Tools / Data Analysis / UI Design / Content Creation / Productivity"
-      },
-      {
-        "name": "list",
-        "type": "boolean",
-        "default": false,
-        "required": false,
-        "help": "List available categories"
-      },
-      {
-        "name": "limit",
-        "type": "int",
-        "default": 100,
-        "required": false,
-        "help": ""
-      }
-    ],
-    "columns": [
-      "Index",
-      "Name",
-      "Description"
-    ],
-    "type": "js",
-    "modulePath": "trae-solo/skill.js",
-    "sourceFile": "trae-solo/skill.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "trae-solo",
-    "name": "skill-fs-installed",
-    "description": "List INSTALLED Trae SOLO skills (managedSkills entry in ~/.trae/skill-config.json).",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "local",
-    "browser": false,
-    "args": [],
-    "columns": [
-      "Index",
-      "Name",
-      "Description",
-      "Source"
-    ],
-    "type": "js",
-    "modulePath": "trae-solo/skill-fs.js",
-    "sourceFile": "trae-solo/skill-fs.js"
-  },
-  {
-    "site": "trae-solo",
-    "name": "skill-fs-list",
-    "description": "List all Trae SOLO skills present on disk under ~/.trae/skills/. Reads SKILL.md front-matter for descriptions. Works while Trae is closed.",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "local",
-    "browser": false,
-    "args": [
-      {
-        "name": "limit",
-        "type": "int",
-        "default": 200,
-        "required": false,
-        "help": "Max rows"
-      }
-    ],
-    "columns": [
-      "Index",
-      "Name",
-      "Description",
-      "Source"
-    ],
-    "type": "js",
-    "modulePath": "trae-solo/skill-fs.js",
-    "sourceFile": "trae-solo/skill-fs.js"
-  },
-  {
-    "site": "trae-solo",
-    "name": "skill-fs-show",
-    "description": "Print a skill's SKILL.md content + on-disk path.",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "local",
-    "browser": false,
-    "args": [
-      {
-        "name": "name",
-        "type": "str",
-        "required": true,
-        "positional": true,
-        "help": "Skill name (folder under ~/.trae/skills/)"
-      }
-    ],
-    "columns": [
-      "Field",
-      "Value"
-    ],
-    "type": "js",
-    "modulePath": "trae-solo/skill-fs.js",
-    "sourceFile": "trae-solo/skill-fs.js"
-  },
-  {
-    "site": "trae-solo",
-    "name": "skill-list",
-    "description": "List Trae SOLO Skills — by default the Marketplace; pass --installed to list installed ones.",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "installed",
-        "type": "boolean",
-        "default": false,
-        "required": false,
-        "help": "List installed skills instead of the marketplace"
-      },
-      {
-        "name": "limit",
-        "type": "int",
-        "default": 100,
-        "required": false,
-        "help": "Max rows to return"
-      }
-    ],
-    "columns": [
-      "Index",
-      "Name",
-      "Description"
-    ],
-    "type": "js",
-    "modulePath": "trae-solo/skill.js",
-    "sourceFile": "trae-solo/skill.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "trae-solo",
-    "name": "skill-search",
-    "description": "Filter Skills Marketplace by keyword.",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "keyword",
-        "type": "str",
-        "required": true,
-        "positional": true,
-        "help": "Search keyword (substring)"
-      },
-      {
-        "name": "limit",
-        "type": "int",
-        "default": 50,
-        "required": false,
-        "help": "Max rows"
-      }
-    ],
-    "columns": [
-      "Index",
-      "Name",
-      "Description"
-    ],
-    "type": "js",
-    "modulePath": "trae-solo/skill.js",
-    "sourceFile": "trae-solo/skill.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "trae-solo",
-    "name": "state-get",
-    "description": "Read a single key from Trae SOLO's globalStorage state.vscdb. Pass --workspace <ws-id> to query a per-workspace DB instead. Returns parsed JSON if the value is JSON.",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "local",
-    "browser": false,
-    "args": [
-      {
-        "name": "key",
-        "type": "str",
-        "required": true,
-        "positional": true,
-        "help": "State key (use state-keys to discover)"
-      },
-      {
-        "name": "workspace",
-        "type": "str",
-        "required": false,
-        "help": "Workspace id (from workspaces-list) to query a per-workspace DB"
-      },
-      {
-        "name": "max-bytes",
-        "type": "int",
-        "default": 8000,
-        "required": false,
-        "help": "Truncate value to this many bytes"
-      }
-    ],
-    "columns": [
-      "Field",
-      "Value"
-    ],
-    "type": "js",
-    "modulePath": "trae-solo/state-fs.js",
-    "sourceFile": "trae-solo/state-fs.js"
-  },
-  {
-    "site": "trae-solo",
-    "name": "state-keys",
-    "description": "List all keys present in Trae SOLO's globalStorage state.vscdb (VSCode-style UI/agent state). Pass --workspace <ws-id> to query a per-workspace DB instead. Use state-get to read a specific value. (See renderer storage-keys for browser-side LS/SS.)",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "local",
-    "browser": false,
-    "args": [
-      {
-        "name": "filter",
-        "type": "str",
-        "required": false,
-        "help": "Case-insensitive substring filter over keys"
-      },
-      {
-        "name": "workspace",
-        "type": "str",
-        "required": false,
-        "help": "Workspace id (from workspaces-list) to query a per-workspace DB"
-      },
-      {
-        "name": "limit",
-        "type": "int",
-        "default": 200,
-        "required": false,
-        "help": ""
-      }
-    ],
-    "columns": [
-      "Index",
-      "Key",
-      "Kind",
-      "Path"
-    ],
-    "type": "js",
-    "modulePath": "trae-solo/state-fs.js",
-    "sourceFile": "trae-solo/state-fs.js"
-  },
-  {
-    "site": "trae-solo",
-    "name": "status",
-    "description": "Check active CDP connection to Trae SOLO Desktop",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [],
-    "columns": [
-      "Status",
-      "Url",
-      "Title"
-    ],
-    "type": "js",
-    "modulePath": "trae-solo/status.js",
-    "sourceFile": "trae-solo/status.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "trae-solo",
-    "name": "storage-get",
-    "description": "Read a single localStorage / sessionStorage value on the Trae SOLO renderer.",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "key",
-        "type": "str",
-        "required": true,
-        "positional": true,
-        "help": "Storage key (use storage-keys to discover)"
-      },
-      {
-        "name": "storage",
-        "type": "str",
-        "default": "local",
-        "required": false,
-        "help": "\"local\" or \"session\""
-      },
-      {
-        "name": "max-bytes",
-        "type": "int",
-        "default": 4000,
-        "required": false,
-        "help": "Truncate value to this many chars"
-      }
-    ],
-    "columns": [
-      "Field",
-      "Value"
-    ],
-    "type": "js",
-    "modulePath": "trae-solo/renderer-storage.js",
-    "sourceFile": "trae-solo/renderer-storage.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "trae-solo",
-    "name": "storage-keys",
-    "description": "List localStorage / sessionStorage keys on the Trae SOLO renderer (CDP). For the on-disk VSCode state.vscdb, see state-keys.",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "ui",
-    "browser": true,
-    "args": [
-      {
-        "name": "storage",
-        "type": "str",
-        "default": "local",
-        "required": false,
-        "help": "\"local\" or \"session\""
-      },
-      {
-        "name": "filter",
-        "type": "str",
-        "required": false,
-        "help": "Case-insensitive substring filter"
-      },
-      {
-        "name": "limit",
-        "type": "int",
-        "default": 100,
-        "required": false,
-        "help": "Max rows to return"
-      }
-    ],
-    "columns": [
-      "Index",
-      "Key",
-      "Bytes",
-      "Name",
-      "Preview",
-      "Database",
-      "Version"
-    ],
-    "type": "js",
-    "modulePath": "trae-solo/renderer-storage.js",
-    "sourceFile": "trae-solo/renderer-storage.js",
-    "navigateBefore": true
-  },
-  {
-    "site": "trae-solo",
-    "name": "task-fs-list",
-    "description": "List Trae SOLO task ids from disk (snapshot/<uuid> + agentconfig/<uuid>.json). Works while Trae is closed.",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "local",
-    "browser": false,
-    "args": [
-      {
-        "name": "limit",
-        "type": "int",
-        "default": 100,
-        "required": false,
-        "help": ""
-      }
-    ],
-    "columns": [
-      "Index",
-      "Task Id",
-      "Has Snapshot",
-      "Has Config",
-      "Modified",
-      "Phase",
-      "Turn Id",
-      "Commit"
-    ],
-    "type": "js",
-    "modulePath": "trae-solo/task-fs.js",
-    "sourceFile": "trae-solo/task-fs.js"
-  },
-  {
-    "site": "trae-solo",
-    "name": "task-fs-show",
-    "description": "Show the workspace tree at a given chat-turn ref (via git ls-tree). Pass --turn <turn-id> to pick a turn; otherwise the latest after-chat-turn ref.",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "local",
-    "browser": false,
-    "args": [
-      {
-        "name": "task-id",
-        "type": "str",
-        "required": true,
-        "positional": true,
-        "help": "Task UUID"
-      },
-      {
-        "name": "turn",
-        "type": "str",
-        "required": false,
-        "help": "Specific turn id (omit for latest after-chat-turn)"
-      },
-      {
-        "name": "limit",
-        "type": "int",
-        "default": 50,
-        "required": false,
-        "help": ""
-      }
-    ],
-    "columns": [
-      "Mode",
-      "Path",
-      "Size"
-    ],
-    "type": "js",
-    "modulePath": "trae-solo/task-fs.js",
-    "sourceFile": "trae-solo/task-fs.js"
-  },
-  {
-    "site": "trae-solo",
-    "name": "task-fs-turns",
-    "description": "Show the chat-turn timeline for a Trae SOLO task as git tags (before-chat-turn-* / after-chat-turn-*).",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "local",
-    "browser": false,
-    "args": [
-      {
-        "name": "task-id",
-        "type": "str",
-        "required": true,
-        "positional": true,
-        "help": "Task UUID (folder name under snapshot/)"
-      },
-      {
-        "name": "limit",
-        "type": "int",
-        "default": 50,
-        "required": false,
-        "help": ""
-      }
-    ],
-    "columns": [
-      "Index",
-      "Task Id",
-      "Has Snapshot",
-      "Has Config",
-      "Modified",
-      "Phase",
-      "Turn Id",
-      "Commit"
-    ],
-    "type": "js",
-    "modulePath": "trae-solo/task-fs.js",
-    "sourceFile": "trae-solo/task-fs.js"
-  },
-  {
-    "site": "trae-solo",
-    "name": "user-rules",
-    "description": "Print Trae SOLO user rules (~/.trae/user_rules.md).",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "local",
-    "browser": false,
-    "args": [],
-    "columns": [
-      "Field",
-      "Value"
-    ],
-    "type": "js",
-    "modulePath": "trae-solo/user-rules.js",
-    "sourceFile": "trae-solo/user-rules.js"
-  },
-  {
-    "site": "trae-solo",
-    "name": "workspaces-list",
-    "description": "List Trae SOLO workspaceStorage entries (~/Library/.../TRAE SOLO/User/workspaceStorage/<uuid>/), resolving each workspace.json to its single-folder path or multi-folder workspace target. Works while Trae is closed.",
-    "access": "read",
-    "domain": "localhost",
-    "strategy": "local",
-    "browser": false,
-    "args": [
-      {
-        "name": "limit",
-        "type": "int",
-        "default": 100,
-        "required": false,
-        "help": ""
-      }
-    ],
-    "columns": [
-      "Index",
-      "Workspace Id",
-      "Kind",
-      "Target",
-      "Modified",
-      "Id",
-      "Version",
-      "Source",
-      "Installed"
-    ],
-    "type": "js",
-    "modulePath": "trae-solo/workspaces-fs.js",
-    "sourceFile": "trae-solo/workspaces-fs.js"
   },
   {
     "site": "trip",
@@ -40789,7 +36746,8 @@
       "url",
       "has_media",
       "media_urls",
-      "media_posters"
+      "media_posters",
+      "media_durations"
     ],
     "type": "js",
     "modulePath": "twitter/bookmark-folder.js",
@@ -40876,7 +36834,8 @@
       "url",
       "has_media",
       "media_urls",
-      "media_posters"
+      "media_posters",
+      "media_durations"
     ],
     "type": "js",
     "modulePath": "twitter/bookmarks.js",
@@ -41132,7 +37091,8 @@
     "columns": [
       "screen_name",
       "name",
-      "bio"
+      "bio",
+      "verified"
     ],
     "type": "js",
     "modulePath": "twitter/followers.js",
@@ -41167,7 +37127,8 @@
       "screen_name",
       "name",
       "bio",
-      "followers"
+      "followers",
+      "verified"
     ],
     "type": "js",
     "modulePath": "twitter/following.js",
@@ -41293,7 +37254,8 @@
       "url",
       "has_media",
       "media_urls",
-      "media_posters"
+      "media_posters",
+      "media_durations"
     ],
     "type": "js",
     "modulePath": "twitter/likes.js",
@@ -41474,6 +37436,43 @@
   },
   {
     "site": "twitter",
+    "name": "list-members",
+    "description": "List the member accounts of a Twitter/X list",
+    "access": "read",
+    "domain": "x.com",
+    "strategy": "cookie",
+    "browser": true,
+    "args": [
+      {
+        "name": "listId",
+        "type": "string",
+        "required": true,
+        "positional": true,
+        "help": "Numeric ID of a Twitter/X list (e.g. from `opencli twitter lists`)"
+      },
+      {
+        "name": "limit",
+        "type": "int",
+        "default": 100,
+        "required": false,
+        "help": "Maximum number of members to return (default 100). Must be a positive integer."
+      }
+    ],
+    "columns": [
+      "screen_name",
+      "name",
+      "bio",
+      "followers",
+      "verified",
+      "user_id"
+    ],
+    "type": "js",
+    "modulePath": "twitter/list-members.js",
+    "sourceFile": "twitter/list-members.js",
+    "navigateBefore": "https://x.com"
+  },
+  {
+    "site": "twitter",
     "name": "list-remove",
     "description": "Remove a user from a Twitter/X list you own (toggles via UI; no-op if not currently a member)",
     "access": "write",
@@ -41592,16 +37591,19 @@
     "columns": [
       "id",
       "author",
+      "author_avatar",
       "bio",
       "text",
       "likes",
       "retweets",
       "replies",
+      "views",
       "created_at",
       "url",
       "has_media",
       "media_urls",
       "media_posters",
+      "media_durations",
       "card",
       "quoted_tweet"
     ],
@@ -42052,17 +38054,22 @@
     "columns": [
       "id",
       "author",
+      "author_avatar",
       "bio",
       "text",
       "created_at",
       "likes",
+      "retweets",
+      "replies",
       "views",
       "url",
       "has_media",
       "media_urls",
       "media_posters",
+      "media_durations",
       "card",
-      "quoted_tweet"
+      "quoted_tweet",
+      "author_verified"
     ],
     "type": "js",
     "modulePath": "twitter/search.js",
@@ -42103,16 +38110,20 @@
     "columns": [
       "id",
       "author",
+      "author_avatar",
       "bio",
       "text",
       "likes",
       "retweets",
+      "views",
       "url",
       "has_media",
       "media_urls",
       "media_posters",
+      "media_durations",
       "card",
-      "quoted_tweet"
+      "quoted_tweet",
+      "author_verified"
     ],
     "type": "js",
     "modulePath": "twitter/thread.js",
@@ -42168,8 +38179,10 @@
       "has_media",
       "media_urls",
       "media_posters",
+      "media_durations",
       "card",
-      "quoted_tweet"
+      "quoted_tweet",
+      "author_verified"
     ],
     "type": "js",
     "modulePath": "twitter/timeline.js",
@@ -42255,6 +38268,7 @@
       "has_media",
       "media_urls",
       "media_posters",
+      "media_durations",
       "quoted_tweet"
     ],
     "type": "js",
@@ -43872,6 +39886,13 @@
         "default": true,
         "required": false,
         "help": "Download images locally"
+      },
+      {
+        "name": "verification-timeout",
+        "type": "int",
+        "default": 15,
+        "required": false,
+        "help": "Seconds to wait for the WeChat captcha to auto-resolve before failing (0 disables the wait)"
       }
     ],
     "columns": [
@@ -45711,6 +41732,89 @@
   },
   {
     "site": "xiaohongshu",
+    "name": "comment",
+    "description": "在小红书笔记下发表评论（走页面自带的已签名请求层，需 --execute 才会真的发出）",
+    "access": "write",
+    "domain": "www.xiaohongshu.com",
+    "strategy": "cookie",
+    "browser": true,
+    "args": [
+      {
+        "name": "note",
+        "type": "str",
+        "required": true,
+        "positional": true,
+        "help": "Full note URL with xsec_token (preferred), or a 24-char hex note ID"
+      },
+      {
+        "name": "text",
+        "type": "str",
+        "required": true,
+        "positional": true,
+        "help": "Comment text to post"
+      },
+      {
+        "name": "execute",
+        "type": "boolean",
+        "required": false,
+        "help": "Actually post the comment. Without it the command refuses to write."
+      }
+    ],
+    "columns": [
+      "status",
+      "comment_id",
+      "url",
+      "message",
+      "verified"
+    ],
+    "type": "js",
+    "modulePath": "xiaohongshu/comment.js",
+    "sourceFile": "xiaohongshu/comment.js",
+    "navigateBefore": false
+  },
+  {
+    "site": "xiaohongshu",
+    "name": "comment-delete",
+    "description": "删除自己在小红书笔记下的评论（走页面自带的已签名请求层，需 --execute 才会真的删除）",
+    "access": "write",
+    "domain": "www.xiaohongshu.com",
+    "strategy": "cookie",
+    "browser": true,
+    "args": [
+      {
+        "name": "note",
+        "type": "str",
+        "required": true,
+        "positional": true,
+        "help": "Full note URL with xsec_token (preferred), or a 24-char hex note ID"
+      },
+      {
+        "name": "comment-id",
+        "type": "str",
+        "required": true,
+        "positional": true,
+        "help": "The comment ID to delete (as printed by `xiaohongshu comment`)"
+      },
+      {
+        "name": "execute",
+        "type": "boolean",
+        "required": false,
+        "help": "Actually delete the comment. Without it the command refuses to write."
+      }
+    ],
+    "columns": [
+      "status",
+      "comment_id",
+      "note_id",
+      "url"
+    ],
+    "type": "js",
+    "modulePath": "xiaohongshu/comment-delete.js",
+    "sourceFile": "xiaohongshu/comment-delete.js",
+    "navigateBefore": false
+  },
+  {
+    "site": "xiaohongshu",
     "name": "comments",
     "description": "获取小红书笔记评论（支持楼中楼子回复）",
     "access": "read",
@@ -46562,7 +42666,14 @@
         "type": "int",
         "default": 15,
         "required": false,
-        "help": "Number of notes to return"
+        "help": "Number of notes to return (1-1000)"
+      },
+      {
+        "name": "timeout",
+        "type": "int",
+        "default": 300,
+        "required": false,
+        "help": "Maximum loading time in seconds (1-1800)"
       }
     ],
     "columns": [
@@ -47990,7 +44101,7 @@
         "type": "str",
         "required": true,
         "positional": true,
-        "help": "Channel ID (UCxxxx) or handle (@name)"
+        "help": "Channel ID (UCxxxx) or handle (@name or name)"
       },
       {
         "name": "limit",
@@ -48008,6 +44119,48 @@
     "modulePath": "youtube/channel.js",
     "sourceFile": "youtube/channel.js",
     "navigateBefore": "https://www.youtube.com"
+  },
+  {
+    "site": "youtube",
+    "name": "comment",
+    "description": "Post a top-level comment on a YouTube video (requires --execute)",
+    "access": "write",
+    "domain": "www.youtube.com",
+    "strategy": "cookie",
+    "browser": true,
+    "args": [
+      {
+        "name": "url",
+        "type": "str",
+        "required": true,
+        "positional": true,
+        "help": "YouTube video URL or video ID"
+      },
+      {
+        "name": "text",
+        "type": "str",
+        "required": true,
+        "positional": true,
+        "help": "Comment text to post"
+      },
+      {
+        "name": "execute",
+        "type": "boolean",
+        "required": false,
+        "help": "Actually post the comment. Without it the command refuses to write."
+      }
+    ],
+    "columns": [
+      "status",
+      "comment_id",
+      "url",
+      "message",
+      "verified"
+    ],
+    "type": "js",
+    "modulePath": "youtube/comment.js",
+    "sourceFile": "youtube/comment.js",
+    "navigateBefore": false
   },
   {
     "site": "youtube",
@@ -48067,6 +44220,7 @@
       "rank",
       "title",
       "channel",
+      "channel_avatar",
       "video_id",
       "views",
       "duration",
@@ -48251,6 +44405,8 @@
       "rank",
       "title",
       "channel",
+      "channel_avatar",
+      "video_id",
       "views",
       "duration",
       "published",

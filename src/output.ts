@@ -2,8 +2,10 @@
  * Output formatting: table, JSON, Markdown, CSV, YAML.
  */
 
+import { emitResult } from './command-output.js';
 import Table from 'cli-table3';
 import yaml from 'js-yaml';
+import { normalizeOutputFormat } from './output-format.js';
 
 export interface RenderOptions {
   fmt?: string;
@@ -27,17 +29,9 @@ function resolveColumns(rows: Record<string, unknown>[], opts: RenderOptions): s
 }
 
 export function render(data: unknown, opts: RenderOptions = {}): void {
-  let fmt = opts.fmt ?? 'table';
-  // Non-TTY auto-downgrade only when format was NOT explicitly passed by user.
-  if (!opts.fmtExplicit) {
-    if (fmt === 'table' && !process.stdout.isTTY) fmt = 'yaml';
-  }
-  if (data === null || data === undefined) {
-    console.log(data);
-    return;
-  }
+  const fmt = normalizeOutputFormat(opts.fmt ?? 'json');
+  if (fmt === 'json') { emitResult(data); return; }
   switch (fmt) {
-    case 'json': renderJson(data); break;
     case 'plain': renderPlain(data); break;
     case 'md': case 'markdown': renderMarkdown(data, opts); break;
     case 'csv': renderCsv(data, opts); break;
@@ -77,9 +71,6 @@ function renderTable(data: unknown, opts: RenderOptions): void {
   console.log(footer.join(' · '));
 }
 
-function renderJson(data: unknown): void {
-  console.log(JSON.stringify(data, null, 2));
-}
 function renderPlain(data: unknown): void {
   const rows = normalizeRows(data);
   if (!rows.length) return;
@@ -107,6 +98,12 @@ function renderPlain(data: unknown): void {
 }
 
 
+function markdownCell(value: unknown): string {
+  return String(value ?? '').replace(/\|/g, '\\|')
+    // Any embedded line break would split the physical table row.
+    .replace(/\r\n?|\n/g, '<br>');
+}
+
 function renderMarkdown(data: unknown, opts: RenderOptions): void {
   const rows = normalizeRows(data);
   if (!rows.length) return;
@@ -121,27 +118,26 @@ function renderMarkdown(data: unknown, opts: RenderOptions): void {
     }
   }
   const columns = resolveColumns(rows, opts);
-  console.log('| ' + columns.join(' | ') + ' |');
+  console.log('| ' + columns.map(markdownCell).join(' | ') + ' |');
   console.log('| ' + columns.map(() => '---').join(' | ') + ' |');
   for (const row of rows) {
-    console.log('| ' + columns.map(c => String((row as Record<string, unknown>)[c] ?? '')
-      .replace(/\|/g, '\\|')
-      // Any embedded line break would split the physical table row.
-      .replace(/\r\n?|\n/g, '<br>')).join(' | ') + ' |');
+    console.log('| ' + columns.map(c => markdownCell((row as Record<string, unknown>)[c])).join(' | ') + ' |');
   }
+}
+
+function csvCell(value: unknown): string {
+  const text = String(value ?? '');
+  return text.includes(',') || text.includes('"') || text.includes('\n') || text.includes('\r')
+    ? `"${text.replace(/"/g, '""')}"` : text;
 }
 
 function renderCsv(data: unknown, opts: RenderOptions): void {
   const rows = normalizeRows(data);
   if (!rows.length) return;
   const columns = resolveColumns(rows, opts);
-  console.log(columns.join(','));
+  console.log(columns.map(csvCell).join(','));
   for (const row of rows) {
-    console.log(columns.map(c => {
-      const v = String((row as Record<string, unknown>)[c] ?? '');
-      return v.includes(',') || v.includes('"') || v.includes('\n') || v.includes('\r')
-        ? `"${v.replace(/"/g, '""')}"` : v;
-    }).join(','));
+    console.log(columns.map(c => csvCell((row as Record<string, unknown>)[c])).join(','));
   }
 }
 

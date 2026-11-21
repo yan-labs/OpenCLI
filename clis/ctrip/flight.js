@@ -16,24 +16,10 @@ const MIN_LIMIT = 1;
 const MAX_LIMIT = 50;
 const DEFAULT_LIMIT = 20;
 const CAPTURE_PATTERN = '/international/search/api/search/batchSearch';
-const CAPTURE_TIMEOUT_SECONDS = 12;
-const WAIT_FOR_BATCH_CAPTURE_JS = `
-  new Promise((resolve) => {
-    const detect = () => {
-      if (location.pathname.includes('captcha') || /验证码|verify the human|安全验证/i.test(document.body?.innerText || '')) return 'captcha';
-      if (document.querySelector('.flight-item')) return 'content';
-      return null;
-    };
-    const found = detect();
-    if (found) return resolve(found);
-    const observer = new MutationObserver(() => {
-      const result = detect();
-      if (result) { observer.disconnect(); resolve(result); }
-    });
-    observer.observe(document.documentElement, { childList: true, subtree: true });
-    setTimeout(() => { observer.disconnect(); resolve('timeout'); }, ${CAPTURE_TIMEOUT_SECONDS * 1000});
-  })
-`;
+const CAPTURE_TIMEOUT_SECONDS = 25;
+const CHECK_CAPTCHA_JS = `(() => {
+  return location.pathname.includes('captcha') || /验证码|verify the human|安全验证/i.test(document.body?.innerText || '') ? 'captcha' : 'ready';
+})()`;
 
 function parseFlightLimit(raw) {
     return parseStrictIntegerRange('limit', raw, DEFAULT_LIMIT, MIN_LIMIT, MAX_LIMIT);
@@ -58,12 +44,22 @@ function parseBatchSearchCaptures(entries) {
     if (!Array.isArray(entries)) {
         throw new CommandExecutionError('Ctrip flight network capture returned malformed entries');
     }
-    const captured = entries.filter((entry) => String(entry?.url || '').includes(CAPTURE_PATTERN));
+    const captured = entries.filter((entry) => {
+        try {
+            const url = new URL(entry?.url);
+            return url.protocol === 'https:' && url.hostname === 'flights.ctrip.com' && url.pathname === CAPTURE_PATTERN;
+        } catch { return false; }
+    });
     if (captured.length === 0) return null;
 
     const byId = new Map();
     let finished = false;
+    let pending = false;
     for (const entry of captured) {
+        if (entry.captureComplete === false || (entry.captureComplete !== true && typeof entry.responsePreview !== 'string')) {
+            pending = true;
+            continue;
+        }
         const status = Number(entry?.responseStatus || 0);
         if (status === 401 || status === 403) {
             throw new AuthRequiredError('flights.ctrip.com', `Ctrip flight API returned HTTP ${status}; complete any verification in the browser and retry`);
@@ -79,7 +75,8 @@ function parseBatchSearchCaptures(entries) {
         }
         let payload;
         try {
-            payload = JSON.parse(entry.responsePreview);
+            const body = entry.responsePreview.startsWith('base64:') ? Buffer.from(entry.responsePreview.slice(7), 'base64').toString('utf8') : entry.responsePreview;
+            payload = JSON.parse(body);
         }
         catch {
             throw new CommandExecutionError('Ctrip flight API returned invalid JSON');
@@ -98,9 +95,7 @@ function parseBatchSearchCaptures(entries) {
         }
         finished = payload.data.context.finished;
     }
-    if (!finished) {
-        throw new CommandExecutionError('Ctrip flight batchSearch ended before the upstream search reported completion');
-    }
+    if (!finished || pending) return null;
     return [...byId.values()];
 }
 
@@ -151,6 +146,7 @@ cli({
     strategy: Strategy.INTERCEPT,
     browser: true,
     navigateBefore: false,
+    defaultWindowMode: 'foreground',
     args: [
         { name: 'from', required: true, positional: true, help: 'Departure IATA code (e.g. BJS / PEK)' },
         { name: 'to', required: true, positional: true, help: 'Arrival IATA code (e.g. SHA / PVG)' },
@@ -182,18 +178,32 @@ cli({
             !await page.startNetworkCapture(CAPTURE_PATTERN)) {
             throw new CommandExecutionError('Ctrip flight requires browser response interception');
         }
-        await page.readNetworkCapture();
+        // Retaining reads never wait indefinitely for an in-flight response body.
+        await page.readNetworkCapture({ retainIncomplete: true });
+        const startedAt = Date.now();
         await page.goto(searchUrl);
-        // The initial document can finish before the large batchSearch body.
-        // The first rendered card is only a readiness signal; row data still
-        // comes exclusively from the structured response below.
-        const readiness = await page.evaluate(WAIT_FOR_BATCH_CAPTURE_JS);
-        if (readiness === 'captcha') {
-            throw new AuthRequiredError('flights.ctrip.com', 'Ctrip is asking for a captcha; complete it in your browser session and retry');
+        const deadline = Date.now() + CAPTURE_TIMEOUT_SECONDS * 1000;
+        const captured = new Map();
+        let itineraries = null;
+        for (let attempt = 0; attempt <= CAPTURE_TIMEOUT_SECONDS; attempt++) {
+            if (await page.evaluate(CHECK_CAPTCHA_JS) === 'captcha') {
+                throw new AuthRequiredError('flights.ctrip.com', 'Ctrip is asking for a captcha; complete it in your browser session and retry');
+            }
+            const entries = await page.readNetworkCapture({ retainIncomplete: true });
+            if (!Array.isArray(entries)) throw new CommandExecutionError('Ctrip flight network capture returned malformed entries');
+            for (const entry of entries) {
+                if (entry?.timestamp && entry.timestamp < startedAt) continue;
+                // A later read can replace an incomplete snapshot of this request.
+                captured.set(entry?.requestId || entry, entry);
+            }
+            itineraries = parseBatchSearchCaptures([...captured.values()]);
+            if (itineraries) break;
+            if (attempt === CAPTURE_TIMEOUT_SECONDS || Date.now() >= deadline) break;
+            await page.wait({ time: Math.max(0, Math.min(1, (deadline - Date.now()) / 1000)) });
         }
-        const itineraries = parseBatchSearchCaptures(await page.readNetworkCapture());
         if (!itineraries) {
-            throw new TimeoutError('Ctrip flight API capture', CAPTURE_TIMEOUT_SECONDS, 'No batchSearch response was observed after opening the results page.');
+            throw new TimeoutError('Ctrip flight API capture', CAPTURE_TIMEOUT_SECONDS,
+                'No completed batchSearch result was captured; keep the browser window visible and complete any verification, then retry.');
         }
         if (itineraries.length === 0) {
             throw new EmptyResultError('ctrip flight', `No flights for ${fromCode}→${toCode} on ${date}`);

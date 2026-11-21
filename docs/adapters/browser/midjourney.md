@@ -133,7 +133,9 @@ opencli midjourney download <video-job> --kind video-social --index 1
 opencli midjourney download <video-job> --kind gif --index 1
 ```
 
-Downloads use atomic writes and validate media bytes before accepting a file. Existing non-empty files are reused only when their magic bytes match the expected format; use `--force` to redownload.
+Downloads use atomic writes and validate media bytes before accepting a file. Existing non-empty files are reused only when their magic bytes match the expected format (for images, only the `.png` original counts); use `--force` to redownload.
+
+Image originals are PNG. A lower-quality JPEG or WebP is saved only when the PNG is confirmed missing (HTTP 404/410/422), and the command warns when that happens. The CDN sits behind a Cloudflare challenge, so `download` fetches from a tab on `cdn.midjourney.com` and retries a blocked request (HTTP 403, 429, or 5xx) after 2, 5, and 10 seconds. If it is still blocked, the command fails with the HTTP status and the `download` command to re-run; it never falls back to a lower-quality file. Because `generate` downloads after the paid job completes, re-run `download`, not `generate`, after such a failure.
 
 ## Quota interpretation
 

@@ -4,13 +4,6 @@ import { ArgumentError } from '@jackwener/opencli/errors';
 import { buildListDeleteRow } from './list-delete.js';
 
 describe('twitter list-delete registration', () => {
-    it('registers the list-delete command with explicit confirmation', () => {
-        const cmd = getRegistry().get('twitter/list-delete');
-        expect(cmd?.func).toBeTypeOf('function');
-        expect(cmd?.columns).toEqual(['listId', 'name', 'members', 'status', 'message']);
-        expect(cmd?.args?.find((a) => a.name === 'confirm')?.default).toBe(false);
-        expect(cmd?.args?.find((a) => a.name === 'timeout')?.default).toBe(300);
-    });
 
     it('rejects deletion when confirm is not true before navigation', async () => {
         const cmd = getRegistry().get('twitter/list-delete');

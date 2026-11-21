@@ -17,19 +17,6 @@ function createPageMock(evaluateResult = []) {
 }
 
 describe('google images', () => {
-    it('registers as a browser-backed public Google command', () => {
-        expect(command).toBeDefined();
-        expect(command.site).toBe('google');
-        expect(command.name).toBe('images');
-        expect(command.access).toBe('read');
-        expect(command.browser).toBe(true);
-        expect(command.strategy).toBe('public');
-        expect(command.columns).toEqual(['rank', 'title', 'imageUrl', 'thumbnailUrl', 'sourceUrl', 'source', 'width', 'height']);
-        expect(command.args.find(arg => arg.name === 'resolve')).toMatchObject({
-            type: 'bool',
-            default: true,
-        });
-    });
 
     it('rejects empty query and invalid limits before navigation', async () => {
         const page = createPageMock();

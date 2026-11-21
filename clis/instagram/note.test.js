@@ -10,12 +10,7 @@ describe('instagram note registration', () => {
     afterEach(() => {
         vi.restoreAllMocks();
     });
-    it('registers the note command with a required positional content arg', () => {
-        const cmd = getRegistry().get('instagram/note');
-        expect(cmd).toBeDefined();
-        expect(cmd?.browser).toBe(true);
-        expect(cmd?.args.some((arg) => arg.name === 'content' && arg.positional && arg.required)).toBe(true);
-    });
+
     it('rejects missing note content before browser work', async () => {
         const page = createPageMock();
         const cmd = getRegistry().get('instagram/note');

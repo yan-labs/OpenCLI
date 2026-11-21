@@ -1,10 +1,11 @@
 {
   "name": "@jackwener/opencli",
-  "version": "1.15.0",
+  "version": "2.0.3-yan.1",
   "publishConfig": {
-    "access": "public"
+    "access": "public",
+    "provenance": true
   },
-  "description": "Make any website or Electron App your CLI. AI-powered.",
+  "description": "Make any website your CLI. AI-powered.",
   "engines": {
     "node": ">=20.18.1"
   },
@@ -20,7 +21,6 @@
     "./types": "./dist/src/types.js",
     "./utils": "./dist/src/utils.js",
     "./logger": "./dist/src/logger.js",
-    "./launcher": "./dist/src/launcher.js",
     "./browser/cdp": "./dist/src/browser/cdp.js",
     "./browser/page": "./dist/src/browser/page.js",
     "./browser/utils": "./dist/src/browser/utils.js",
@@ -45,7 +45,7 @@
     "dev": "tsx src/main.ts",
     "dev:bun": "bun src/main.ts",
     "build": "npm run clean-dist && npm run build-manifest",
-    "prebuild-manifest": "tsc --build && node -e \"require('fs').cpSync('src/browser/native', 'dist/src/browser/native', {recursive:true}); require('fs').chmodSync('dist/src/main.js', 0o755)\"",
+    "prebuild-manifest": "tsc --build && node -e \"require('fs').chmodSync('dist/src/main.js', 0o755)\"",
     "build-manifest": "tsx src/build-manifest.ts",
     "clean-dist": "node scripts/clean-dist.cjs",
     "start": "node dist/src/main.js",
@@ -65,8 +65,7 @@
     "check:typed-error-lint": "node scripts/check-typed-error-lint.mjs",
     "docs:dev": "vitepress dev docs",
     "docs:build": "vitepress build docs",
-    "docs:preview": "vitepress preview docs",
-    "test:e2e-window": "node scripts/e2e-window-modes.mjs"
+    "docs:preview": "vitepress preview docs"
   },
   "keywords": [
     "cli",
@@ -78,16 +77,17 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/jackwener/opencli.git"
+    "url": "git+https://github.com/yan-labs/OpenCLI.git"
   },
   "dependencies": {
     "@mozilla/readability": "^0.6.0",
+    "acorn": "^8.19.0",
     "cli-table3": "^0.6.5",
     "commander": "^14.0.3",
     "js-yaml": "^4.3.2",
     "turndown": "^7.2.2",
     "turndown-plugin-gfm": "^1.0.2",
-    "undici": "7.29.0",
+    "undici": "7.30.1",
     "ws": "^8.18.0"
   },
   "devDependencies": {

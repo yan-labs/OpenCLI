@@ -27,13 +27,7 @@ describe('instagram story registration', () => {
     afterEach(() => {
         vi.restoreAllMocks();
     });
-    it('registers the story command with a required-value media arg', () => {
-        const cmd = getRegistry().get('instagram/story');
-        expect(cmd).toBeDefined();
-        expect(cmd?.browser).toBe(true);
-        expect(cmd?.args.some((arg) => arg.name === 'media' && !arg.required && arg.valueRequired)).toBe(true);
-        expect(cmd?.args.some((arg) => arg.name === 'content')).toBe(false);
-    });
+
     it('rejects missing --media before browser work', async () => {
         const page = createPageMock();
         const cmd = getRegistry().get('instagram/story');

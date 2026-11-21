@@ -10,6 +10,16 @@ import { cli, Strategy } from '@jackwener/opencli/registry';
 import { CliError } from '@jackwener/opencli/errors';
 import { JOBS_ORIGIN, requirePage, navigateTo, parseCompanyJobCard } from './utils.js';
 
+export function normalizeCompanyId(value) {
+    const encCoId = String(value ?? '').trim();
+    if (!encCoId) throw new CliError('INVALID_ARGUMENT', 'encCoId is required');
+    // Encrypted company IDs use URL-safe characters, including hyphens.
+    if (!/^[A-Za-z0-9_-]+$/.test(encCoId)) {
+        throw new CliError('INVALID_ARGUMENT', 'encCoId must contain only letters, digits, underscores or hyphens');
+    }
+    return encCoId;
+}
+
 cli({
     site: '51job',
     name: 'company',
@@ -31,11 +41,7 @@ cli({
     ],
     func: async (page, kwargs) => {
         requirePage(page);
-        const encCoId = String(kwargs.encCoId ?? '').trim();
-        if (!encCoId) throw new CliError('INVALID_ARGUMENT', 'encCoId is required');
-        if (!/^[A-Za-z0-9_]+$/.test(encCoId)) {
-            throw new CliError('INVALID_ARGUMENT', `encCoId must be alphanumeric/underscore, got "${encCoId}"`);
-        }
+        const encCoId = normalizeCompanyId(kwargs.encCoId);
         const limit = Math.max(1, Math.min(Number(kwargs.limit) || 20, 50));
 
         const url = `${JOBS_ORIGIN}/all/co${encCoId}.html`;

@@ -14,13 +14,6 @@ function makePage(result) {
 describe('reddit subreddit-info command', () => {
     const command = getRegistry().get('reddit/subreddit-info');
 
-    it('registers with the expected shape', () => {
-        expect(command).toBeDefined();
-        expect(command.access).toBe('read');
-        expect(command.browser).toBe(true);
-        expect(command.columns).toEqual(['field', 'value']);
-    });
-
     it('parseSubredditName strips prefixes and validates the name shape', () => {
         expect(parseSubredditName('python')).toBe('python');
         expect(parseSubredditName('r/python')).toBe('python');
@@ -67,6 +60,8 @@ describe('reddit subreddit-info command', () => {
                     const result = await (new Function('fetch', `return (${script})`))(vi.fn(async () => ({
                         status,
                         ok: false,
+                        headers: { get: () => 'application/json; charset=UTF-8' },
+                        text: async () => JSON.stringify({ message: 'Forbidden', error: status }),
                     })));
                     scriptResults.push(result);
                     return result;

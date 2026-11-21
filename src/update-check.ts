@@ -19,6 +19,7 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { PKG_VERSION } from './version.js';
+import { compareVersions } from './browser/daemon-version.js';
 
 const CACHE_DIR = path.join(os.homedir(), '.opencli');
 const CACHE_FILE = path.join(CACHE_DIR, 'update-check.json');
@@ -73,15 +74,7 @@ function writeCacheMerge(updates: Partial<UpdateCache>): void {
 
 /** Compare semver strings. Returns true if `a` is strictly newer than `b`. */
 function isNewer(a: string, b: string): boolean {
-  const parse = (v: string) => v.replace(/^v/, '').split('-')[0].split('.').map(Number);
-  const pa = parse(a);
-  const pb = parse(b);
-  if (pa.some(isNaN) || pb.some(isNaN)) return false;
-  const [aMaj, aMin, aPat] = pa;
-  const [bMaj, bMin, bPat] = pb;
-  if (aMaj !== bMaj) return aMaj > bMaj;
-  if (aMin !== bMin) return aMin > bMin;
-  return aPat > bPat;
+  return (compareVersions(a, b) ?? 0) > 0;
 }
 
 function isCI(): boolean {
@@ -106,7 +99,7 @@ function buildUpdateNotices({ cliVersion, cache, now }: NoticeInputs): NoticeLin
   if (cache.forkLatestVersion && isNewer(cache.forkLatestVersion, cliVersion)) {
     lines.cli =
       `\n  Update available: v${cliVersion} → v${cache.forkLatestVersion}\n` +
-      `  Run: cd ${SOURCE_ROOT} && git pull && npm run build\n`;
+      `  Run: cd ${SOURCE_ROOT} && git pull && pnpm build\n`;
   }
   const { currentExtensionVersion, forkLatestExtensionVersion, extensionLastSeenAt } = cache;
   if (

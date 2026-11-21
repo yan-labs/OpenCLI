@@ -1,8 +1,8 @@
 # dblp
 
-**Mode**: 🌐 Public · **Domain**: `dblp.org`
+**Mode**: 🌐 Public data via Browser Bridge · **Domain**: `dblp.org`
 
-[dblp](https://dblp.org) is the comprehensive computer-science bibliography maintained by Schloss Dagstuhl, indexing 7M+ publications across conferences, journals, books, and theses. Both commands hit the public API directly — no auth, no browser.
+[dblp](https://dblp.org) is the comprehensive computer-science bibliography maintained by Schloss Dagstuhl, indexing 7M+ publications across conferences, journals, books, and theses. All four commands read the public XML APIs from a browser session. No DBLP account is required, but the site may require browser verification.
 
 ## Commands
 
@@ -83,5 +83,6 @@ The `type` column is a single-token simplification of dblp's verbose type string
 
 ## Prerequisites
 
-- No browser required — uses the public dblp API at `https://dblp.org`.
-- The adapter sets a polite `User-Agent` per [dblp's API guidance](https://dblp.org/faq/How+to+use+the+dblp+search+API.html).
+- A connected Browser Bridge or supported direct CDP browser is required.
+- The adapter opens `https://dblp.org` and allows up to 15 seconds for normal page verification to settle. If verification remains, it returns `SECURITY_BLOCK`; resolve it in your browser before retrying.
+- API requests use XML in the same browser session. Challenge HTML, unexpected redirects and malformed XML are errors, not empty results. HTTP 429 stops without an automatic request retry.

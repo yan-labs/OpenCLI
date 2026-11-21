@@ -29,19 +29,6 @@ function createPageMock(evaluateResult, overrides = {}) {
 }
 
 describe('gov-policy commands — registration', () => {
-    it('registers search and recent as public browser commands', () => {
-        const search = getRegistry().get('gov-policy/search');
-        const recent = getRegistry().get('gov-policy/recent');
-
-        expect(search).toBeDefined();
-        expect(recent).toBeDefined();
-        expect(search.browser).toBe(true);
-        expect(recent.browser).toBe(true);
-        expect(search.strategy).toBe('public');
-        expect(recent.strategy).toBe('public');
-        expect(search.columns).toEqual(['rank', 'title', 'description', 'date', 'url']);
-        expect(recent.columns).toEqual(['rank', 'title', 'date', 'source', 'url']);
-    });
 
     it('rejects empty search queries before browser navigation', async () => {
         const search = getRegistry().get('gov-policy/search');

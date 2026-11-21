@@ -8,11 +8,10 @@ import {
   isUnknownOutcomeError,
   requestDaemonShutdown,
   sendCommand,
-  sendCommandFull,
   setDaemonCommandTimeoutSeconds,
   setDaemonRunContext,
-  setDaemonWindowPlacement,
 } from './daemon-client.js';
+import { SessionBusyError } from '../errors.js';
 import * as daemonLifecycle from './daemon-lifecycle.js';
 
 describe('daemon-client', () => {
@@ -24,7 +23,6 @@ describe('daemon-client', () => {
     vi.restoreAllMocks();
     vi.unstubAllEnvs();
     setDaemonRunContext(null);
-    setDaemonWindowPlacement(null);
   });
 
   it('fetchDaemonStatus sends the shared status request and returns parsed data', async () => {
@@ -293,27 +291,33 @@ describe('daemon-client', () => {
     expect(body.access).toBeUndefined();
   });
 
-  it('waits locally on session_busy and then runs without surfacing a retryable error', async () => {
-    vi.mocked(fetch)
-      .mockResolvedValueOnce({
-        status: 409,
-        json: () => Promise.resolve({
-          id: 'server',
-          ok: false,
-          errorCode: 'session_busy',
-          error: 'Session "site:chatgpt" is busy: chatgpt ask (pid 111) has been driving it for 42s.',
-          retryAfterMs: 10,
-        }),
-      } as Response)
-      .mockResolvedValueOnce({
-        status: 200,
-        json: () => Promise.resolve({ id: 'server', ok: true, data: 'ok' }),
-      } as Response);
+  it('throws a terminal SessionBusyError on a session_busy response without retrying', async () => {
+    vi.mocked(fetch).mockResolvedValue({
+      status: 409,
+      json: () => Promise.resolve({
+        id: 'server',
+        ok: false,
+        errorCode: 'session_busy',
+        error: 'Session "site:chatgpt" is busy: chatgpt ask (pid 111) has been driving it for 42s.',
+        errorHint: 'Wait for it to finish, or stop it with `kill 111` if it is stuck. Read-only commands are not blocked.',
+      }),
+    } as Response);
 
     await expect(
       sendCommand('exec', { code: '1 + 1', surface: 'adapter', session: 'site:chatgpt', siteSession: 'persistent' }),
-    ).resolves.toBe('ok');
-    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
+    ).rejects.toBeInstanceOf(SessionBusyError);
+    // Terminal: no ensure-bridge / re-dispatch — exactly one request went out.
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['slot_wait_timeout', 'slot_conflict'])('treats %s as a terminal SessionBusyError', async (errorCode) => {
+    vi.mocked(fetch).mockResolvedValue({
+      status: 503,
+      json: () => Promise.resolve({ id: 'server', ok: false, errorCode, error: 'Slot admission rejected.' }),
+    } as Response);
+
+    await expect(sendCommand('slot-acquire', { site: 'xiaohongshu', runId: 'run_1_1_1', poolSize: 1 })).rejects.toBeInstanceOf(SessionBusyError);
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1);
   });
 
   it('sendCommand forwards OPENCLI_PROFILE as a hard contextId requirement', async () => {
@@ -371,211 +375,43 @@ describe('daemon-client', () => {
     expect(body.windowMode).toBe('background');
   });
 
-  function mockOkResponse(): void {
+  it('sendCommand forwards OPENCLI_BROWSER_IDLE_TIMEOUT (seconds) as idleTimeout', async () => {
+    vi.stubEnv('OPENCLI_BROWSER_IDLE_TIMEOUT', '300');
     vi.mocked(fetch).mockResolvedValue({
       status: 200,
       json: () => Promise.resolve({ id: 'server', ok: true, data: 'ok' }),
     } as Response);
-  }
 
-  function lastRequestBody(): Record<string, unknown> {
-    const calls = vi.mocked(fetch).mock.calls;
-    return JSON.parse(String(calls[calls.length - 1][1]?.body)) as Record<string, unknown>;
-  }
+    await sendCommand('exec', { code: '1 + 1' });
 
-  describe('OPENCLI_WINDOW env fallback — all five modes', () => {
-    it.each(['foreground', 'active', 'background', 'isolated', 'dedicated'])('recognizes %s', async (mode) => {
-      vi.stubEnv('OPENCLI_WINDOW', mode);
-      mockOkResponse();
-
-      await sendCommand('exec', { code: '1' });
-
-      expect(lastRequestBody().windowMode).toBe(mode);
-    });
-
-    it('throws naming OPENCLI_WINDOW on an invalid value', async () => {
-      vi.stubEnv('OPENCLI_WINDOW', 'sideways');
-      mockOkResponse();
-
-      await expect(sendCommand('exec', { code: '1' })).rejects.toThrow(/OPENCLI_WINDOW must be one of.*Received: "sideways"/);
-    });
-
-    it('does not throw when OPENCLI_WINDOW is unset and an explicit windowMode is given', async () => {
-      vi.stubEnv('OPENCLI_WINDOW', '');
-      mockOkResponse();
-
-      await expect(sendCommand('exec', { code: '1', windowMode: 'background' })).resolves.toBe('ok');
-    });
+    const body = JSON.parse(String(vi.mocked(fetch).mock.calls[0][1]?.body)) as { idleTimeout?: number };
+    expect(body.idleTimeout).toBe(300);
   });
 
-  describe('dedicated-window placement attachment', () => {
-    it('attaches windowSlot/windowBounds/windowDisplay/autoSelect/foreignTabPolicy only when windowMode is dedicated', async () => {
-      vi.stubEnv('OPENCLI_WINDOW_SLOT', 'semrush');
-      vi.stubEnv('OPENCLI_WINDOW_BOUNDS', '0,0,1280,900');
-      vi.stubEnv('OPENCLI_WINDOW_DISPLAY', 'virtual');
-      vi.stubEnv('OPENCLI_WINDOW_AUTOSELECT', 'off');
-      vi.stubEnv('OPENCLI_DEDICATED_FOREIGN_TABS', 'tolerate');
-      mockOkResponse();
+  it('sendCommand uses explicit idleTimeout before OPENCLI_BROWSER_IDLE_TIMEOUT env fallback', async () => {
+    vi.stubEnv('OPENCLI_BROWSER_IDLE_TIMEOUT', '300');
+    vi.mocked(fetch).mockResolvedValue({
+      status: 200,
+      json: () => Promise.resolve({ id: 'server', ok: true, data: 'ok' }),
+    } as Response);
 
-      await sendCommand('exec', { code: '1', windowMode: 'dedicated' });
+    await sendCommand('exec', { code: '1 + 1', idleTimeout: 45 });
 
-      const body = lastRequestBody();
-      expect(body.windowSlot).toBe('semrush');
-      expect(body.windowBounds).toEqual({ left: 0, top: 0, width: 1280, height: 900 });
-      expect(body.windowDisplay).toBe('virtual');
-      expect(body.autoSelect).toBe(false);
-      expect(body.foreignTabPolicy).toBe('tolerate');
-    });
+    const body = JSON.parse(String(vi.mocked(fetch).mock.calls[0][1]?.body)) as { idleTimeout?: number };
+    expect(body.idleTimeout).toBe(45);
+  });
 
-    it('does NOT attach placement fields for a non-dedicated windowMode, even with every env var set', async () => {
-      vi.stubEnv('OPENCLI_WINDOW_SLOT', 'semrush');
-      vi.stubEnv('OPENCLI_WINDOW_BOUNDS', '0,0,1280,900');
-      vi.stubEnv('OPENCLI_WINDOW_DISPLAY', 'virtual');
-      vi.stubEnv('OPENCLI_WINDOW_AUTOSELECT', 'off');
-      vi.stubEnv('OPENCLI_DEDICATED_FOREIGN_TABS', 'tolerate');
-      mockOkResponse();
+  it.each(['0', '-5', '1.5', 'abc', ''])('sendCommand ignores invalid OPENCLI_BROWSER_IDLE_TIMEOUT=%j', async (raw) => {
+    vi.stubEnv('OPENCLI_BROWSER_IDLE_TIMEOUT', raw);
+    vi.mocked(fetch).mockResolvedValue({
+      status: 200,
+      json: () => Promise.resolve({ id: 'server', ok: true, data: 'ok' }),
+    } as Response);
 
-      await sendCommand('exec', { code: '1', windowMode: 'background' });
+    await sendCommand('exec', { code: '1 + 1' });
 
-      const body = lastRequestBody();
-      expect(body.windowSlot).toBeUndefined();
-      expect(body.windowBounds).toBeUndefined();
-      expect(body.windowDisplay).toBeUndefined();
-      expect(body.autoSelect).toBeUndefined();
-      expect(body.foreignTabPolicy).toBeUndefined();
-    });
-
-    it('does NOT attach placement fields when nothing (no override, no env) resolves a value, even in dedicated mode', async () => {
-      mockOkResponse();
-
-      await sendCommand('exec', { code: '1', windowMode: 'dedicated' });
-
-      const body = lastRequestBody();
-      expect(body).not.toHaveProperty('windowSlot');
-      expect(body).not.toHaveProperty('windowBounds');
-      expect(body).not.toHaveProperty('windowDisplay');
-      expect(body).not.toHaveProperty('autoSelect');
-      expect(body).not.toHaveProperty('foreignTabPolicy');
-    });
-
-    it('a setDaemonWindowPlacement override wins over env for a dedicated command', async () => {
-      vi.stubEnv('OPENCLI_WINDOW_SLOT', 'from-env');
-      setDaemonWindowPlacement({ slot: 'from-override' });
-      mockOkResponse();
-
-      await sendCommand('exec', { code: '1', windowMode: 'dedicated' });
-
-      expect(lastRequestBody().windowSlot).toBe('from-override');
-    });
-
-    it('explicit params passed to sendCommand win over both the override and env', async () => {
-      vi.stubEnv('OPENCLI_WINDOW_SLOT', 'from-env');
-      setDaemonWindowPlacement({ slot: 'from-override' });
-      mockOkResponse();
-
-      await sendCommand('exec', { code: '1', windowMode: 'dedicated', windowSlot: 'from-params' });
-
-      expect(lastRequestBody().windowSlot).toBe('from-params');
-    });
-
-    it('always attaches placement fields for the sessions window-status op, regardless of windowMode', async () => {
-      vi.stubEnv('OPENCLI_WINDOW_SLOT', 'semrush');
-      mockOkResponse();
-
-      await sendCommand('sessions', { op: 'window-status' });
-
-      expect(lastRequestBody().windowSlot).toBe('semrush');
-    });
-
-    it('always attaches placement fields for the sessions window-ensure op, regardless of windowMode', async () => {
-      vi.stubEnv('OPENCLI_WINDOW_BOUNDS', '10,20,300,400');
-      mockOkResponse();
-
-      await sendCommand('sessions', { op: 'window-ensure' });
-
-      expect(lastRequestBody().windowBounds).toEqual({ left: 10, top: 20, width: 300, height: 400 });
-    });
-
-    it('does not attach placement fields for an unrelated sessions op (list/cleanup)', async () => {
-      vi.stubEnv('OPENCLI_WINDOW_SLOT', 'semrush');
-      mockOkResponse();
-
-      await sendCommand('sessions', { op: 'list' });
-
-      expect(lastRequestBody()).not.toHaveProperty('windowSlot');
-    });
-
-    it('always attaches placement fields for the sessions window-list op, regardless of windowMode', async () => {
-      vi.stubEnv('OPENCLI_WINDOW_SLOT', 'semrush');
-      mockOkResponse();
-
-      await sendCommand('sessions', { op: 'window-list' });
-
-      expect(lastRequestBody().windowSlot).toBe('semrush');
-    });
-
-    it('always attaches placement fields for the sessions window-close op, regardless of windowMode', async () => {
-      vi.stubEnv('OPENCLI_WINDOW_SLOT', 'semrush');
-      mockOkResponse();
-
-      await sendCommand('sessions', { op: 'window-close' });
-
-      expect(lastRequestBody().windowSlot).toBe('semrush');
-    });
-
-    it('OPENCLI_DEDICATED_IDLE_MS reaches the command as dedicatedIdleMs on a dedicated-mode command', async () => {
-      vi.stubEnv('OPENCLI_DEDICATED_IDLE_MS', '60000');
-      mockOkResponse();
-
-      await sendCommand('exec', { code: '1', windowMode: 'dedicated' });
-
-      expect(lastRequestBody().dedicatedIdleMs).toBe(60_000);
-    });
-
-    it('OPENCLI_DEDICATED_IDLE_MS reaches the command on the session-independent window ops too', async () => {
-      vi.stubEnv('OPENCLI_DEDICATED_IDLE_MS', '45000');
-      mockOkResponse();
-
-      await sendCommand('sessions', { op: 'window-list' });
-
-      expect(lastRequestBody().dedicatedIdleMs).toBe(45_000);
-    });
-
-    it('does NOT attach dedicatedIdleMs for a non-dedicated, non-window-op command even when the env var is set', async () => {
-      vi.stubEnv('OPENCLI_DEDICATED_IDLE_MS', '60000');
-      mockOkResponse();
-
-      await sendCommand('exec', { code: '1', windowMode: 'background' });
-
-      expect(lastRequestBody()).not.toHaveProperty('dedicatedIdleMs');
-    });
-
-    it('silently drops a bogus OPENCLI_DEDICATED_IDLE_MS instead of throwing or attaching it', async () => {
-      vi.stubEnv('OPENCLI_DEDICATED_IDLE_MS', 'not-a-number');
-      mockOkResponse();
-
-      await expect(sendCommand('exec', { code: '1', windowMode: 'dedicated' })).resolves.toBe('ok');
-      expect(lastRequestBody()).not.toHaveProperty('dedicatedIdleMs');
-    });
-
-    it('an explicit dedicatedIdleMs param wins over the env var', async () => {
-      vi.stubEnv('OPENCLI_DEDICATED_IDLE_MS', '60000');
-      mockOkResponse();
-
-      await sendCommand('exec', { code: '1', windowMode: 'dedicated', dedicatedIdleMs: 15_000 });
-
-      expect(lastRequestBody().dedicatedIdleMs).toBe(15_000);
-    });
-
-    it('throws naming OPENCLI_WINDOW_BOUNDS on a malformed value, only when placement is actually resolved', async () => {
-      vi.stubEnv('OPENCLI_WINDOW_BOUNDS', 'garbage');
-      mockOkResponse();
-
-      await expect(sendCommand('exec', { code: '1', windowMode: 'dedicated' }))
-        .rejects.toThrow(/OPENCLI_WINDOW_BOUNDS must be/);
-      // The same bad env var must not break an unrelated, non-dedicated command.
-      await expect(sendCommand('exec', { code: '1', windowMode: 'background' })).resolves.toBe('ok');
-    });
+    const body = JSON.parse(String(vi.mocked(fetch).mock.calls[0][1]?.body)) as { idleTimeout?: number };
+    expect(body.idleTimeout).toBeUndefined();
   });
 
   it('sendCommand retries executor-transient errors ONCE with a NEW id (re-execution is a new logical attempt)', async () => {
@@ -639,7 +475,7 @@ describe('daemon-client', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  function mockEnsureReady(extensionVersion?: string) {
+  function mockEnsureReady(extensionVersion?: string, extensionCompatRange: string | null = '>=1.7.0') {
     return vi.spyOn(daemonLifecycle, 'ensureBrowserBridgeReady').mockResolvedValue({
       state: 'ready',
       status: {
@@ -648,6 +484,7 @@ describe('daemon-client', () => {
         uptime: 1,
         extensionConnected: true,
         ...(extensionVersion && { extensionVersion }),
+        ...(extensionCompatRange && { extensionCompatRange }),
         pending: 0,
         memoryMB: 0,
         port: 19825,
@@ -733,6 +570,26 @@ describe('daemon-client', () => {
       name: 'BrowserCommandError',
       code: 'command_result_unknown',
     } satisfies Partial<BrowserCommandError>);
+
+    expect(ensureSpy).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('sendCommand does NOT resend a post-connect drop on the legacy extension version line', async () => {
+    const ensureSpy = mockEnsureReady('1.7.2', null);
+    const reset = new TypeError('fetch failed');
+    (reset as { cause?: unknown }).cause = Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' });
+    vi.mocked(fetch)
+      .mockRejectedValueOnce(reset)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({ id: 'server', ok: true, data: 'executed again' }),
+      } as Response);
+
+    await expect(sendCommand('navigate', { url: 'https://example.com' })).rejects.toMatchObject({
+      code: 'command_result_unknown',
+    });
 
     expect(ensureSpy).toHaveBeenCalledTimes(1);
     expect(fetch).toHaveBeenCalledTimes(1);
@@ -839,41 +696,6 @@ describe('daemon-client', () => {
     const body = JSON.parse(String(fetchMock.mock.calls[0][1]?.body)) as { timeout?: number };
     // 240s extension wait + 15s margin
     expect(body.timeout).toBe(255);
-  });
-
-  it('sendCommandFull forwards navigate timeoutMs in the request body and extends body.timeout past it', async () => {
-    const fetchMock = vi.mocked(fetch);
-    fetchMock.mockResolvedValueOnce({
-      ok: true,
-      status: 200,
-      json: () => Promise.resolve({ id: 'server', ok: true, data: { url: 'https://example.com', timedOut: false } }),
-    } as Response);
-
-    await sendCommandFull('navigate', { url: 'https://example.com', timeoutMs: 200_000 });
-
-    const body = JSON.parse(String(fetchMock.mock.calls[0][1]?.body)) as { timeout?: number; timeoutMs?: number; action?: string; url?: string };
-    expect(body.action).toBe('navigate');
-    expect(body.url).toBe('https://example.com');
-    // The navigate command's own timeoutMs field must reach the extension unchanged...
-    expect(body.timeoutMs).toBe(200_000);
-    // ...and the daemon-side deadline must be extended past it (200s nav + 15s
-    // margin = 215s, which exceeds the 120s default so it wins the max()).
-    expect(body.timeout).toBe(215);
-  });
-
-  it('sendCommandFull omits timeoutMs from the request body when navigate is called without it (old-CLI-shaped call)', async () => {
-    const fetchMock = vi.mocked(fetch);
-    fetchMock.mockResolvedValueOnce({
-      ok: true,
-      status: 200,
-      json: () => Promise.resolve({ id: 'server', ok: true, data: { url: 'https://example.com', timedOut: false } }),
-    } as Response);
-
-    await sendCommandFull('navigate', { url: 'https://example.com' });
-
-    const body = JSON.parse(String(fetchMock.mock.calls[0][1]?.body)) as { timeout?: number; timeoutMs?: number };
-    expect(body.timeoutMs).toBeUndefined();
-    expect(body.timeout).toBe(120);
   });
 
   it('setDaemonCommandTimeoutSeconds raises the transport deadline for the user --timeout', async () => {

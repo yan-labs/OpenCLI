@@ -2,12 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { getRegistry } from '@jackwener/opencli/registry';
 import './answer.js';
 describe('zhihu answer', () => {
-    it('registers as a cookie browser command', () => {
-        const cmd = getRegistry().get('zhihu/answer');
-        expect(cmd).toBeDefined();
-        expect(cmd.strategy).toBe('cookie');
-        expect(cmd.browser).toBe(true);
-    });
+
     it('creates an answer via API and returns result', async () => {
         const cmd = getRegistry().get('zhihu/answer');
         const page = {

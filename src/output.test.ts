@@ -14,13 +14,25 @@ describe('output TTY detection', () => {
     logSpy.mockRestore();
   });
 
-  it('outputs YAML in non-TTY when format is default table', () => {
+  it('rejects unsupported render formats even for empty output', () => {
+    expect(() => render(null, { fmt: 'bogus' })).toThrow('--format must be one of');
+    expect(logSpy).not.toHaveBeenCalled();
+  });
+
+  it.each([['yml', 'yaml'], ['markdown', 'md']])('preserves the %s alias', (alias, canonical) => {
+    render([{ value: 'hello' }], { fmt: alias });
+    const aliasOutput = logSpy.mock.calls.map((call: unknown[]) => call[0]);
+    logSpy.mockClear();
+    render([{ value: 'hello' }], { fmt: canonical });
+    expect(logSpy.mock.calls.map((call: unknown[]) => call[0])).toEqual(aliasOutput);
+  });
+
+  it('defaults to a JSON envelope in non-TTY', () => {
     Object.defineProperty(process.stdout, 'isTTY', { value: false, writable: true });
     // commanderAdapter always passes fmt:'table' as default — this must still trigger downgrade
-    render([{ name: 'alice', score: 10 }], { fmt: 'table', columns: ['name', 'score'] });
+    render([{ name: 'alice', score: 10 }], { columns: ['name', 'score'] });
     const out = logSpy.mock.calls.map((c: unknown[]) => c[0]).join('\n');
-    expect(out).toContain('name: alice');
-    expect(out).toContain('score: 10');
+    expect(JSON.parse(out)).toEqual({ok:true,data:[{name:'alice',score:10}]});
   });
 
   it('outputs table in TTY when format is default table', () => {
@@ -34,7 +46,7 @@ describe('output TTY detection', () => {
     Object.defineProperty(process.stdout, 'isTTY', { value: false, writable: true });
     render([{ name: 'alice', note: 'line 1\nline 2' }], { fmt: 'json' });
     const out = logSpy.mock.calls.map((c: unknown[]) => c[0]).join('\n');
-    expect(JSON.parse(out)).toEqual([{ name: 'alice', note: 'line 1\nline 2' }]);
+    expect(JSON.parse(out)).toEqual({ok:true,data:[{ name: 'alice', note: 'line 1\nline 2' }]});
   });
 
   it('shows elapsed time when elapsed is 0', () => {
@@ -83,5 +95,38 @@ describe('output TTY detection', () => {
     const out = logSpy.mock.calls.map((c: unknown[]) => c[0]).join('\n');
 
     expect(out).toContain('| a\\|b | 10 |');
+  });
+
+  it('escapes CSV headers with the same field rules as data cells', () => {
+    const columns = ['name,alias', 'quoted"name', 'line\nbreak', 'carriage\rreturn', 'plain'];
+    const values = ['a,b', 'a"b', 'a\nb', 'a\rb', 'unchanged'];
+    render([Object.fromEntries(columns.map((key, index) => [key, values[index]]))], { fmt: 'csv', columns });
+
+    expect(logSpy.mock.calls.map((call: unknown[]) => call[0])).toEqual([
+      '"name,alias","quoted""name","line\nbreak","carriage\rreturn",plain',
+      '"a,b","a""b","a\nb","a\rb",unchanged',
+    ]);
+  });
+
+  it('escapes inferred CSV headers while preserving column order and nullish cells', () => {
+    render([{ 'first,name': 'Ada', 'other"name': null, plain: undefined, count: 0, enabled: false }], { fmt: 'csv' });
+
+    expect(logSpy.mock.calls.map((call: unknown[]) => call[0])).toEqual([
+      '"first,name","other""name",plain,count,enabled',
+      'Ada,,,0,false',
+    ]);
+  });
+
+  it('keeps Markdown headers on one physical row and escapes their pipe separators', () => {
+    const columns = ['name|alias', 'line\r\nbreak\n\nlast\rtail', 'plain'];
+    render([Object.fromEntries(columns.map((key) => [key, 'value']))], { fmt: 'md', columns });
+
+    const lines = logSpy.mock.calls.map((call: unknown[]) => String(call[0]));
+    expect(lines).toEqual([
+      '| name\\|alias | line<br>break<br><br>last<br>tail | plain |',
+      '| --- | --- | --- |',
+      '| value | value | value |',
+    ]);
+    expect(lines.every((line: string) => !/[\r\n]/.test(line))).toBe(true);
   });
 });

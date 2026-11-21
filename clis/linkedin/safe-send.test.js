@@ -105,12 +105,6 @@ describe('linkedin safe-send helpers', () => {
 });
 
 describe('linkedin safe-send command', () => {
-  it('registers as a write command with safe output columns', () => {
-    const command = getRegistry().get('linkedin/safe-send');
-    expect(command).toBeDefined();
-    expect(command.access).toBe('write');
-    expect(command.columns).toEqual(expect.arrayContaining(['status', 'recipient', 'reason']));
-  });
 
   it('does not type or send when verification fails', async () => {
     const command = getRegistry().get('linkedin/safe-send');

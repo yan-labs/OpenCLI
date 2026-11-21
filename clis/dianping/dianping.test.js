@@ -45,25 +45,6 @@ function createPageMock(evaluateResult, overrides = {}) {
     };
 }
 
-describe('dianping adapter — registration', () => {
-    it('registers search and shop as cookie-browser read commands', () => {
-        const search = getRegistry().get('dianping/search');
-        const shop = getRegistry().get('dianping/shop');
-        const detail = getRegistry().get('dianping/detail');
-
-        expect(search).toBeDefined();
-        expect(search.browser).toBe(true);
-        expect(search.strategy).toBe('cookie');
-        expect(search.columns).toEqual(SEARCH_COLUMNS);
-
-        expect(shop).toBeDefined();
-        expect(shop.browser).toBe(true);
-        expect(shop.strategy).toBe('cookie');
-        expect(shop.columns).toEqual(SHOP_COLUMNS);
-        expect(detail).toBe(shop);
-    });
-});
-
 describe('dianping adapter — helpers', () => {
     it('validates search limit for direct func callers', () => {
         expect(requireSearchLimit(undefined)).toBe(15);

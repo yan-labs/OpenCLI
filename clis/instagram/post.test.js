@@ -366,14 +366,7 @@ describe('instagram post registration', () => {
     afterEach(() => {
         vi.restoreAllMocks();
     });
-    it('registers the post command with a required-value media arg', () => {
-        const cmd = getRegistry().get('instagram/post');
-        expect(cmd).toBeDefined();
-        expect(cmd?.browser).toBe(true);
-        expect(cmd?.args.some((arg) => arg.name === 'timeout' && arg.default === 300)).toBe(true);
-        expect(cmd?.args.some((arg) => arg.name === 'media' && !arg.required && arg.valueRequired)).toBe(true);
-        expect(cmd?.args.some((arg) => arg.name === 'content' && !arg.required && arg.positional)).toBe(true);
-    });
+
     it('prefers the private route by default and returns without touching UI upload steps when private publish succeeds', async () => {
         const imagePath = createTempImage('private-default.jpg');
         const privateSpy = vi.spyOn(privatePublish, 'publishImagesViaPrivateApi').mockResolvedValueOnce({

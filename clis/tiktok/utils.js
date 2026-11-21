@@ -143,7 +143,7 @@ export function looksTikTokAuthFailure(message) {
 }
 
 export function looksTikTokUpstreamFailure(message) {
-    return /\b(API failed|HTTP\s+\d+|invalid JSON|Failed to fetch|network|fetch)\b/i.test(String(message || ''));
+    return /\b(API failed|HTTP\s+\d+|invalid JSON|empty response|Failed to fetch|network|fetch)\b/i.test(String(message || ''));
 }
 
 export function throwTikTokPageContextError(error, { authMessage, emptyPattern, emptyTarget, failureMessage }) {
@@ -237,7 +237,7 @@ async function fetchJson(url) {
   if (!res.ok) {
     throw new Error('HTTP ' + res.status + ' from ' + requestUrl + ': ' + text.slice(0, 160));
   }
-  if (!text.trim()) return {};
+  if (!text.trim()) throw new Error('empty response from TikTok API');
   try {
     return JSON.parse(text);
   } catch (error) {

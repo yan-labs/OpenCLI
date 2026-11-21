@@ -9,7 +9,7 @@ const WHOAMI_PROBE = `(async () => {
     if (r.status === 401 || r.status === 403) return { kind: 'auth', detail: 'HF /api/whoami-v2 HTTP ' + r.status };
     if (!r.ok) return { kind: 'http', httpStatus: r.status };
     const d = await r.json();
-    if (!d || !d.name || d.type === undefined) return { kind: 'auth', detail: 'HF /api/whoami-v2 has no name — anonymous' };
+    if (!d || !d.name || d.type === undefined) return { kind: 'shape', detail: 'HF /api/whoami-v2 returned an unexpected account payload' };
     return { ok: true, username: String(d.name), fullname: String(d.fullname || ''), type: String(d.type || '') };
   } catch (e) {
     return { kind: 'exception', detail: String(e && e.message || e) };
@@ -19,6 +19,10 @@ const WHOAMI_PROBE = `(async () => {
 async function verifyHfIdentity(page) {
   await page.goto('https://huggingface.co/');
   await page.wait(1);
+  return probeHfIdentity(page);
+}
+
+async function probeHfIdentity(page) {
   const probe = await page.evaluate(WHOAMI_PROBE);
   if (probe?.kind === 'auth') throw new AuthRequiredError('huggingface.co', probe.detail);
   if (probe?.kind === 'http') throw new CommandExecutionError(`HTTP ${probe.httpStatus} from HF /api/whoami-v2`);
@@ -33,9 +37,5 @@ registerSiteAuthCommands({
   loginUrl: 'https://huggingface.co/login',
   columns: ['username', 'fullname', 'type'],
   verify: verifyHfIdentity,
-  poll: async (page) => {
-    const probe = await page.evaluate(WHOAMI_PROBE);
-    if (!probe?.ok) throw new AuthRequiredError('huggingface.co', 'Waiting for Hugging Face login');
-    return { username: probe.username, fullname: probe.fullname, type: probe.type };
-  },
+  poll: probeHfIdentity,
 });

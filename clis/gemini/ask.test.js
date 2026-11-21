@@ -128,10 +128,6 @@ function setupDiscoveryWithoutThinking(page, models = FIXTURE_MODELS) {
     vi.mocked(page.evaluate).mockResolvedValueOnce(undefined);
 }
 
-function setupFailedDiscovery(page, reason = 'Model picker button not found') {
-    vi.mocked(page.evaluate).mockResolvedValueOnce({ ok: false, reason });
-}
-
 function setupDiscoveryNonArray(page) {
     vi.mocked(page.evaluate).mockResolvedValueOnce({ ok: true });
     vi.mocked(page.evaluate).mockResolvedValueOnce({ not: 'an array' });
@@ -143,45 +139,6 @@ function setupDiscoveryEmpty(page) {
     vi.mocked(page.evaluate).mockResolvedValueOnce([]);
     vi.mocked(page.evaluate).mockResolvedValueOnce(undefined);
 }
-
-// ── Command registration ─────────────────────────────────────────────────
-
-describe('ask command registration', () => {
-    it('is registered with site=gemini and name=ask', () => {
-        expect(askCommand.site).toBe('gemini');
-        expect(askCommand.name).toBe('ask');
-    });
-
-    it('is access=write', () => {
-        expect(askCommand.access).toBe('write');
-    });
-
-    it('declares response as its output column', () => {
-        expect(askCommand.columns).toEqual(['response']);
-    });
-
-    it('includes --model as an optional string argument', () => {
-        const modelArg = askCommand.args.find((a) => a.name === 'model');
-        expect(modelArg).toBeDefined();
-        expect(modelArg.required).toBe(false);
-        expect(modelArg.type).toBe('string');
-    });
-
-    it('includes --thinking as an optional argument', () => {
-        const thinkingArg = askCommand.args.find((a) => a.name === 'thinking');
-        expect(thinkingArg).toBeDefined();
-        expect(thinkingArg.required).toBe(false);
-    });
-
-    it('still includes prompt, timeout, and new args', () => {
-        const names = askCommand.args.map((a) => a.name);
-        expect(names).toContain('prompt');
-        expect(names).toContain('timeout');
-        expect(names).toContain('new');
-        expect(names).toContain('model');
-        expect(names).toContain('thinking');
-    });
-});
 
 // ── validateAskModelValue ────────────────────────────────────────────────
 
@@ -294,9 +251,21 @@ describe('gemini ask orchestration', () => {
         mocks.waitForGeminiSubmission.mockResolvedValueOnce(submission);
         mocks.waitForGeminiResponse.mockResolvedValueOnce('');
 
-        await askCommand.func(page, { prompt: '请只回复：OK', timeout: 20, new: 'false' });
+        await expect(askCommand.func(page, { prompt: '请只回复：OK', timeout: 20, new: 'false' }))
+            .rejects.toMatchObject({ code: 'TIMEOUT', exitCode: 75 });
 
         expect(mocks.waitForGeminiResponse).toHaveBeenCalledWith(page, submission, '请只回复：OK', 0);
+    });
+
+    it('reports uncertain submission as a typed timeout and never sends twice', async () => {
+        const page = createPageMock();
+        mocks.readGeminiSnapshot.mockResolvedValueOnce(baseline);
+        mocks.sendGeminiMessage.mockResolvedValueOnce('button');
+        mocks.waitForGeminiSubmission.mockResolvedValueOnce(null);
+        await expect(askCommand.func(page, { prompt: 'test', timeout: 20, new: 'false' }))
+            .rejects.toMatchObject({ code: 'TIMEOUT', exitCode: 75 });
+        expect(mocks.sendGeminiMessage).toHaveBeenCalledTimes(1);
+        expect(mocks.waitForGeminiResponse).not.toHaveBeenCalled();
     });
 
     // ── Omitted --model (no model change) ────────────────────────────────
@@ -574,15 +543,6 @@ describe('gemini ask orchestration', () => {
 
         // selectGeminiModel is called exactly once (for selection, not restoration).
         expect(mocks.selectGeminiModel).toHaveBeenCalledTimes(1);
-    });
-
-    it('does not mutate other Gemini commands — only ask accepts --model', () => {
-        // Other Gemini commands (image, deep research, etc.) are in separate
-        // files and do not import model selection.  This test confirms ask
-        // is the only command that declares --model within gemini.
-        const modelArg = askCommand.args.find((a) => a.name === 'model');
-        expect(modelArg).toBeDefined();
-        // The model arg is on ask only; other commands are unchanged.
     });
 
     // ── Model selection + --new interaction ──────────────────────────────
@@ -1004,7 +964,6 @@ describe('gemini ask thinking selection', () => {
         expect(mocks.selectGeminiThinking).not.toHaveBeenCalled();
         expect(mocks.readGeminiSnapshot).not.toHaveBeenCalled();
     });
-
 
     it('does not treat global/current thinking controls as selected-model support when rows have no per-model data', async () => {
         vi.spyOn(Date, 'now')

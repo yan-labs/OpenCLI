@@ -8,13 +8,6 @@ const { normalizeJobUrl, decodeLinkedinRedirect, normalizeDetail } = await impor
 describe('linkedin job-detail adapter', () => {
   const command = getRegistry().get('linkedin/job-detail');
 
-  it('registers command shape', () => {
-    expect(command).toBeDefined();
-    expect(command.strategy).toBe('cookie');
-    expect(command.browser).toBe(true);
-    expect(command.columns).toContain('description');
-  });
-
   it('normalizes exact LinkedIn job urls', () => {
     expect(normalizeJobUrl('https://www.linkedin.com/jobs/view/123456?x=1')).toBe('https://www.linkedin.com/jobs/search/?currentJobId=123456');
   });

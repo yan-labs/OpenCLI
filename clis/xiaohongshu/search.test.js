@@ -20,6 +20,9 @@ function markVisible(el) {
 function createPageMock(evaluateResults) {
     const queuedResults = [...evaluateResults];
     const evaluate = vi.fn(async (script) => {
+        if (String(script).includes('search-icon')) {
+            return { status: 'ok' };
+        }
         if (String(script).includes('const requestedFilters =')) {
             return { status: 'ok' };
         }
@@ -94,9 +97,12 @@ const FILTER_FIXTURE = [
 ];
 
 function createFilterBehaviorPage(options = {}) {
+    const filterMarkup = options.layout === 'ai-chat'
+        ? '<div class="ai-chat-inner"><div class="filter ai-chat-filter"><span>筛选</span></div></div>'
+        : '<div class="search-layout__top"><div class="filter"><span>筛选</span></div></div>';
     const dom = new JSDOM(`
       <body>
-        <div class="search-layout__top"><div class="filter"><span>筛选</span></div></div>
+        ${filterMarkup}
         <div class="search-layout__main"><div class="feeds-container"></div></div>
       </body>
     `, { url: 'https://www.xiaohongshu.com/search_result?keyword=test' });
@@ -145,13 +151,18 @@ function createFilterBehaviorPage(options = {}) {
             container.className = 'tag-container';
             for (const choice of choices) {
                 if (options.missing === `${groupLabel}/${choice}`) continue;
-                const copies = options.ambiguous === `${groupLabel}/${choice}` ? 2 : 1;
+                const copies = options.ghosts || options.ambiguous === `${groupLabel}/${choice}` ? 2 : 1;
                 for (let copy = 0; copy < copies; copy++) {
                     const option = document.createElement('div');
                     option.className = `tags${state[groupLabel] === choice ? ' active' : ''}`;
                     const optionLabel = document.createElement('span');
                     optionLabel.textContent = choice;
                     option.append(optionLabel);
+                    if (options.ghosts && copy === 0) {
+                        if (options.ghosts !== 'opacity') option.setAttribute('aria-hidden', 'true');
+                        if (options.ghosts !== 'aria') option.style.opacity = '0.00001';
+                        option.addEventListener('click', () => clicks.push('GHOST'));
+                    }
                     option.addEventListener('click', (event) => {
                         event.stopPropagation();
                         clicks.push(`${groupLabel}/${choice}`);
@@ -196,6 +207,7 @@ function createFilterBehaviorPage(options = {}) {
     const page = createPageMock([]);
     page.evaluate.mockImplementation(async (script) => {
         const source = String(script);
+        if (source.includes('search-icon')) return { status: 'ok' };
         if (source.includes('findNoteCard')) return 'content';
         if (source.includes('const requestedFilters =')) {
             return Function(
@@ -242,24 +254,33 @@ async function runFilterCommand(page, args) {
     return outcome.value;
 }
 
-async function runHarvestFrames(frames, { target = frames.length, stallsBeforeAdvance = 0 } = {}) {
+async function runHarvestFrames(frames, { target = frames.length, stallsBeforeAdvance = 0, layout = 'classic' } = {}) {
     const dom = new JSDOM('<body></body>', {
         url: 'https://www.xiaohongshu.com/search_result?keyword=test',
     });
     const { document } = dom.window;
     const root = document.documentElement;
     const viewport = 600;
+    const innerScroller = layout === 'ai-chat' ? document.createElement('div') : null;
+    if (innerScroller) {
+        innerScroller.className = 'search-layout-wrapper';
+        innerScroller.style.overflowY = 'auto';
+        document.body.append(innerScroller);
+    }
     let frameIndex = 0;
     let scrollTop = 0;
     let scrollCalls = 0;
+    let rootScrollCalls = 0;
     const scrollDeltas = [];
 
     const currentFrame = () => frames[frameIndex];
     const render = () => {
         const frame = currentFrame();
-        document.body.innerHTML = frame.securityBlock
+        const markup = frame.securityBlock
             ? '<main>请求太频繁，请稍后再试</main>'
             : frame.cards.map(noteCard).join('');
+        if (innerScroller) innerScroller.innerHTML = markup;
+        else document.body.innerHTML = markup;
         for (const el of document.querySelectorAll('section.note-item')) markVisible(el);
     };
     render();
@@ -271,7 +292,7 @@ async function runHarvestFrames(frames, { target = frames.length, stallsBeforeAd
     for (const el of [root, document.body]) {
         Object.defineProperty(el, 'scrollHeight', {
             configurable: true,
-            get: () => currentFrame().height,
+            get: () => innerScroller ? viewport : currentFrame().height,
         });
         Object.defineProperty(el, 'scrollTop', {
             configurable: true,
@@ -279,14 +300,36 @@ async function runHarvestFrames(frames, { target = frames.length, stallsBeforeAd
             set: (value) => { scrollTop = Number(value) || 0; },
         });
     }
+    if (innerScroller) {
+        Object.defineProperty(innerScroller, 'scrollHeight', {
+            configurable: true,
+            get: () => currentFrame().height,
+        });
+        Object.defineProperty(innerScroller, 'clientHeight', { configurable: true, value: viewport });
+        Object.defineProperty(innerScroller, 'scrollTop', {
+            configurable: true,
+            get: () => scrollTop,
+            set: (value) => {
+                scrollTop = Number(value) || 0;
+                scrollCalls++;
+                scrollDeltas.push(scrollTop);
+                if (scrollCalls > stallsBeforeAdvance && frameIndex < frames.length - 1) {
+                    frameIndex++;
+                    scrollTop = Math.min(scrollTop, Math.max(0, currentFrame().height - viewport));
+                    render();
+                }
+            },
+        });
+    }
     Object.defineProperty(root, 'clientHeight', { configurable: true, value: viewport });
     Object.defineProperty(dom.window, 'innerHeight', { configurable: true, value: viewport });
     Object.defineProperty(dom.window, 'scrollY', { configurable: true, get: () => scrollTop });
     Object.defineProperty(dom.window, 'pageYOffset', { configurable: true, get: () => scrollTop });
     dom.window.scrollBy = (_x, delta) => {
+        rootScrollCalls++;
         scrollCalls++;
         scrollDeltas.push(delta);
-        if (scrollCalls > stallsBeforeAdvance && frameIndex < frames.length - 1) {
+        if (!innerScroller && scrollCalls > stallsBeforeAdvance && frameIndex < frames.length - 1) {
             frameIndex++;
             scrollTop = Math.min(scrollTop + delta, Math.max(0, currentFrame().height - viewport));
             render();
@@ -314,9 +357,275 @@ async function runHarvestFrames(frames, { target = frames.length, stallsBeforeAd
         dom.window.getComputedStyle.bind(dom.window),
         immediateTimeout,
     );
-    return { result, scrollDeltas };
+    return { result, scrollDeltas, rootScrollCalls };
 }
 describe('xiaohongshu search', () => {
+    it('submits the query through the visible search UI and waits for the SPA result layout', async () => {
+        vi.useFakeTimers();
+        try {
+            const dom = new JSDOM(`
+              <body>
+                <input id="search-input">
+                <button class="search-icon">Search</button>
+                <section class="note-item"><a href="/explore/old">Old result</a></section>
+              </body>
+            `, { url: 'https://www.xiaohongshu.com/explore' });
+            const { document } = dom.window;
+            const input = document.querySelector('#search-input');
+            const button = document.querySelector('.search-icon');
+            markVisible(input);
+            markVisible(button);
+            let inputEvents = 0;
+            let clicked = false;
+            input.addEventListener('input', () => inputEvents++);
+            button.addEventListener('click', () => {
+                clicked = true;
+                dom.window.history.pushState({}, '', '/search_result?keyword=测试');
+                const filter = document.createElement('div');
+                filter.className = 'filter ai-chat-filter';
+                document.body.append(filter);
+            });
+            const script = __test__.buildInSiteSearchJs('测试');
+            const pending = Function(
+                'document', 'location', 'HTMLInputElement', 'Event', 'setTimeout',
+                `return (${script})`,
+            )(document, dom.window.location, dom.window.HTMLInputElement, dom.window.Event, setTimeout);
+
+            await vi.runAllTimersAsync();
+            await expect(pending).resolves.toMatchObject({ status: 'ok', detail: '/search_result' });
+            expect(input.value).toBe('测试');
+            expect(inputEvents).toBe(1);
+            expect(clicked).toBe(true);
+        }
+        finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it.each([
+        ['hidden clones', 'ok'],
+        ['duplicate input', 'layout'],
+        ['duplicate button', 'layout'],
+        ['disabled button', 'layout'],
+        ['cards only', 'ok'],
+        ['login after click', 'auth'],
+        ['captcha after click', 'security_block'],
+        ['wrong query', 'timeout'],
+    ])('handles %s without unsafe or premature submission', async (scenario, expected) => {
+        vi.useFakeTimers();
+        const dom = new JSDOM('<input id="search-input"><button class="search-icon">Search</button>', {
+            url: 'https://www.xiaohongshu.com/explore',
+        });
+        try {
+            const { document } = dom.window;
+            const input = document.querySelector('input');
+            const button = document.querySelector('button');
+            markVisible(input);
+            markVisible(button);
+            const cloneClick = vi.fn();
+            if (scenario === 'hidden clones' || scenario.startsWith('duplicate')) {
+                const container = document.createElement('div');
+                if (scenario === 'hidden clones') container.style.opacity = '0';
+                for (const control of scenario === 'duplicate input' ? [input] : scenario === 'duplicate button' ? [button] : [input, button]) {
+                    const clone = control.cloneNode(true);
+                    markVisible(clone);
+                    clone.addEventListener('click', cloneClick);
+                    container.append(clone);
+                }
+                document.body.prepend(container);
+            }
+            if (scenario === 'disabled button') button.disabled = true;
+            const click = vi.fn(() => {
+                dom.window.history.pushState({}, '', scenario === 'captcha after click'
+                    ? '/website-login/captcha' : '/search_result?keyword=' + (scenario === 'wrong query' ? 'old' : '测试'));
+                const card = document.createElement('section');
+                card.className = 'note-item';
+                document.body.append(card);
+                if (scenario === 'login after click') {
+                    const login = document.createElement('button');
+                    login.id = 'login-btn';
+                    markVisible(login);
+                    document.body.append(login);
+                }
+            });
+            button.addEventListener('click', click);
+            const pending = Function('document', 'location', 'HTMLInputElement', 'Event', 'setTimeout',
+                `return (${__test__.buildInSiteSearchJs('测试')})`)(
+                document, dom.window.location, dom.window.HTMLInputElement, dom.window.Event, setTimeout,
+            );
+            await vi.runAllTimersAsync();
+            await expect(pending).resolves.toMatchObject({ status: expected });
+            expect(cloneClick).not.toHaveBeenCalled();
+            expect(click).toHaveBeenCalledTimes(expected === 'layout' ? 0 : 1);
+        }
+        finally {
+            dom.window.close();
+            vi.useRealTimers();
+        }
+    });
+
+    function createAiLayoutSearchDom({ routeKeyword = '测试' } = {}) {
+        // AI-search homepage: the classic input/button exist but render at 0x0; the live control is a
+        // textarea with a near-transparent honeypot clone stacked under it. Submit is Enter, and the
+        // SPA lands on /search_result_ai with the keyword percent-encoded twice.
+        const dom = new JSDOM(`
+          <body>
+            <input id="search-input">
+            <div class="search-icon"></div>
+            <div class="textarea-wrapper">
+              <textarea name="aiSearchTextarea" aria-hidden="true" tabindex="-1" style="opacity: 1e-05"></textarea>
+              <textarea id="search-input-in-feeds" name="aiSearchTextarea" data-hp-bound="1"></textarea>
+            </div>
+          </body>
+        `, { url: 'https://www.xiaohongshu.com/explore' });
+        const { document } = dom.window;
+        const [clone, textarea] = document.querySelectorAll('textarea');
+        markVisible(clone);
+        markVisible(textarea);
+        const classicClick = vi.fn();
+        document.querySelector('.search-icon').addEventListener('click', classicClick);
+        const cloneEvents = vi.fn();
+        for (const type of ['input', 'keydown', 'click']) clone.addEventListener(type, cloneEvents);
+        let inputEvents = 0;
+        textarea.addEventListener('input', () => inputEvents++);
+        const submit = vi.fn((event) => {
+            if (event.key !== 'Enter') return;
+            dom.window.history.pushState({}, '', `/search_result_ai?keyword=${encodeURIComponent(encodeURIComponent(routeKeyword))}&source=web_explore_feed`);
+            const filter = document.createElement('div');
+            filter.className = 'filter ai-chat-filter';
+            document.body.append(filter);
+        });
+        textarea.addEventListener('keydown', submit);
+        return { dom, document, textarea, classicClick, cloneEvents, submit, inputEvents: () => inputEvents };
+    }
+
+    function runInSiteSearch(dom, document, query) {
+        return Function('document', 'location', 'HTMLInputElement', 'Event', 'setTimeout',
+            `return (${__test__.buildInSiteSearchJs(query)})`)(
+            document, dom.window.location, dom.window.HTMLInputElement, dom.window.Event, setTimeout,
+        );
+    }
+
+    it('submits through the AI-layout textarea with Enter and accepts the double-encoded /search_result_ai route', async () => {
+        vi.useFakeTimers();
+        const fixture = createAiLayoutSearchDom();
+        try {
+            const pending = runInSiteSearch(fixture.dom, fixture.document, '测试');
+            await vi.runAllTimersAsync();
+            await expect(pending).resolves.toMatchObject({ status: 'ok', detail: '/search_result_ai' });
+            expect(fixture.textarea.value).toBe('测试');
+            expect(fixture.inputEvents()).toBe(1);
+            expect(fixture.submit).toHaveBeenCalledTimes(1);
+            expect(fixture.classicClick).not.toHaveBeenCalled();
+            expect(fixture.cloneEvents).not.toHaveBeenCalled();
+        }
+        finally {
+            fixture.dom.window.close();
+            vi.useRealTimers();
+        }
+    });
+
+    it('still times out when the AI route carries a different keyword', async () => {
+        vi.useFakeTimers();
+        const fixture = createAiLayoutSearchDom({ routeKeyword: '别的' });
+        try {
+            const pending = runInSiteSearch(fixture.dom, fixture.document, '测试');
+            await vi.runAllTimersAsync();
+            await expect(pending).resolves.toMatchObject({ status: 'timeout', detail: '/search_result_ai' });
+        }
+        finally {
+            fixture.dom.window.close();
+            vi.useRealTimers();
+        }
+    });
+
+    function runDirectLanding(url, body, query = '测试') {
+        const dom = new JSDOM(`<body>${body}</body>`, { url });
+        for (const card of dom.window.document.querySelectorAll('section')) markVisible(card);
+        const pending = Function('document', 'location', 'setTimeout',
+            `return (${__test__.buildAwaitDirectSearchJs(query)})`)(
+            dom.window.document, dom.window.location, setTimeout,
+        );
+        return { dom, pending };
+    }
+
+    it.each([
+        ['the classic result page for the query', 'https://www.xiaohongshu.com/search_result?keyword=%E6%B5%8B%E8%AF%95&source=web_search_result_notes', 'ok'],
+        ['a redirect back to the explore feed', 'https://www.xiaohongshu.com/explore', 'timeout'],
+        ['a result page for another keyword', 'https://www.xiaohongshu.com/search_result?keyword=%E5%88%AB%E7%9A%84', 'timeout'],
+        ['a captcha redirect', 'https://www.xiaohongshu.com/website-login/captcha?redirectPath=x', 'security_block'],
+    ])('direct landing check accepts only the result page for the query: %s', async (_name, url, expected) => {
+        vi.useFakeTimers();
+        // Explore feed cards also match the generic note-card selectors, so the
+        // route and keyword checks are what keep them out of search results.
+        const { dom, pending } = runDirectLanding(url, '<section class="note-item"><a href="/explore/68e90be80000000004022e66">feed</a></section>');
+        try {
+            await vi.runAllTimersAsync();
+            await expect(pending).resolves.toMatchObject({ status: expected });
+        }
+        finally {
+            dom.window.close();
+            vi.useRealTimers();
+        }
+    });
+
+    function createEntryPageMock({ inSite, direct, rows = [] }) {
+        const page = createPageMock(['content', harvestPayload(rows)]);
+        const queued = page.evaluate.getMockImplementation();
+        page.evaluate.mockImplementation(async (script) => {
+            const source = String(script);
+            if (source.includes('search-icon')) return inSite;
+            if (source.includes('decodedKeyword')) return direct;
+            return queued(script);
+        });
+        return page;
+    }
+
+    it.each([
+        'search_input_not_available',
+        'ambiguous_search_input',
+        'ambiguous_or_missing_search_button',
+    ])('falls back to the direct result URL when the homepage reports %s before submitting', async (detail) => {
+        const cmd = getRegistry().get('xiaohongshu/search');
+        const url = 'https://www.xiaohongshu.com/search_result/68e90be80000000004022e66?xsec_token=test-token&xsec_source=';
+        const page = createEntryPageMock({
+            inSite: { status: 'layout', detail },
+            direct: { status: 'ok', detail: '/search_result' },
+            rows: [{ title: '机器学习实习', author: '作者', likes: '9', url, author_url: '' }],
+        });
+
+        const result = await cmd.func(page, { query: '机器学习 实习', limit: 1 });
+        expect(page.goto.mock.calls.map(([target]) => target)).toEqual([
+            'https://www.xiaohongshu.com/explore',
+            'https://www.xiaohongshu.com/search_result?keyword=%E6%9C%BA%E5%99%A8%E5%AD%A6%E4%B9%A0%20%E5%AE%9E%E4%B9%A0&source=web_search_result_notes',
+        ]);
+        expect(result).toMatchObject([{ rank: 1, title: '机器学习实习', url }]);
+    });
+
+    it.each([
+        [{ status: 'timeout', detail: '/explore' }, 'TIMEOUT'],
+        [{ status: 'security_block', detail: '/website-login/captcha' }, 'SECURITY_BLOCK'],
+        [{ status: 'auth', detail: 'login_wall' }, 'AUTH_REQUIRED'],
+    ])('does not load the result URL after the homepage path ends in %o', async (inSite, code) => {
+        const cmd = getRegistry().get('xiaohongshu/search');
+        const page = createEntryPageMock({ inSite, direct: { status: 'ok', detail: '/search_result' } });
+
+        await expect(cmd.func(page, { query: '特斯拉', limit: 1 })).rejects.toMatchObject({ code });
+        expect(page.goto.mock.calls.map(([target]) => target)).toEqual(['https://www.xiaohongshu.com/explore']);
+    });
+
+    it.each([
+        [{ status: 'timeout', detail: '/explore' }, 'TIMEOUT', /direct result page/],
+        [{ status: 'security_block', detail: '/website-login/captcha' }, 'SECURITY_BLOCK', /security controls/],
+        [{ status: 'unexpected', detail: 'x' }, 'COMMAND_EXEC', /search_input_not_available.*direct result page did not load/],
+    ])('fails typed when the direct fallback lands on %o', async (direct, code, message) => {
+        const cmd = getRegistry().get('xiaohongshu/search');
+        const page = createEntryPageMock({ inSite: { status: 'layout', detail: 'search_input_not_available' }, direct });
+
+        await expect(cmd.func(page, { query: '特斯拉', limit: 1 })).rejects.toMatchObject({ code, message: expect.stringMatching(message) });
+        expect(page.goto).toHaveBeenCalledTimes(2);
+    });
+
     it('rejects invalid limit before browser navigation', async () => {
         const cmd = getRegistry().get('xiaohongshu/search');
         const page = createPageMock([]);
@@ -346,7 +655,7 @@ describe('xiaohongshu search', () => {
         ]);
         await expect(cmd.func(page, { query: '特斯拉', limit: 5 })).rejects.toThrow('Xiaohongshu search results are blocked behind a login wall');
         // No scroll-until / autoScroll call when a login wall is detected early.
-        expect(page.evaluate).toHaveBeenCalledTimes(1);
+        expect(page.evaluate).toHaveBeenCalledTimes(2);
         expect(page.autoScroll).not.toHaveBeenCalled();
     });
     it('unwraps a browser-bridge envelope before handling login-wall wait result', async () => {
@@ -359,7 +668,7 @@ describe('xiaohongshu search', () => {
             code: 'AUTH_REQUIRED',
             message: expect.stringContaining('blocked behind a login wall'),
         });
-        expect(page.evaluate).toHaveBeenCalledTimes(1);
+        expect(page.evaluate).toHaveBeenCalledTimes(2);
     });
     it('returns ranked results with search_result url and author_url preserved', async () => {
         const cmd = getRegistry().get('xiaohongshu/search');
@@ -382,7 +691,9 @@ describe('xiaohongshu search', () => {
             { session: 'site:xiaohongshu', data: harvestPayload(rows) },
         ]);
         const result = await cmd.func(page, { query: '特斯拉', limit: 1 });
-        // Should only do one goto (the search page itself), no per-note detail navigation
+        expect(page.goto).toHaveBeenCalledWith('https://www.xiaohongshu.com/explore');
+        expect(page.evaluate).toHaveBeenCalledWith(expect.stringContaining("getOwnPropertyDescriptor(Object.getPrototypeOf(input), 'value')"));
+        // Search does not navigate to individual note details.
         expect(page.goto.mock.calls).toHaveLength(1);
         expect(result).toEqual([
             {
@@ -473,8 +784,36 @@ describe('xiaohongshu search', () => {
         await expect(cmd.func(page, { query: '风控', limit: 5 })).rejects.toMatchObject({
             code: 'SECURITY_BLOCK',
         });
-        expect(page.evaluate).toHaveBeenCalledTimes(1);
+        expect(page.evaluate).toHaveBeenCalledTimes(2);
         expect(page.newTab).not.toHaveBeenCalled();
+    });
+    it('recognizes an English captcha redirect before the content timeout', async () => {
+        vi.useFakeTimers();
+        try {
+            const dom = new JSDOM('<body>Security Verification</body>', {
+                url: 'https://www.xiaohongshu.com/website-login/captcha',
+            });
+            const page = createPageMock([]);
+            page.evaluate.mockImplementation((script) => Function(
+                'document', 'location', 'MutationObserver', 'setTimeout',
+                `return (${String(script)})`,
+            )(
+                dom.window.document,
+                dom.window.location,
+                dom.window.MutationObserver,
+                setTimeout,
+            ));
+            const pending = getRegistry().get('xiaohongshu/search').func(page, { query: '验证码', limit: 5 }).then(
+                (value) => ({ value }),
+                (error) => ({ error }),
+            );
+
+            await vi.runAllTimersAsync();
+            expect((await pending).error).toMatchObject({ code: 'SECURITY_BLOCK' });
+        }
+        finally {
+            vi.useRealTimers();
+        }
     });
     it('filters out results with no title and respects the limit', async () => {
         const cmd = getRegistry().get('xiaohongshu/search');
@@ -524,7 +863,7 @@ describe('xiaohongshu search', () => {
         ]);
         await expect(cmd.func(page, { query: '测试等待', limit: 5 })).rejects.toMatchObject({ code: 'EMPTY_RESULT' });
         expect(page.goto).toHaveBeenCalledTimes(1);
-        expect(page.evaluate).toHaveBeenCalledTimes(3);
+        expect(page.evaluate).toHaveBeenCalledTimes(4);
         expect(page.newTab).not.toHaveBeenCalled();
     });
     it('maps an ordinary hydration timeout to TimeoutError without replacing the tab', async () => {
@@ -532,7 +871,7 @@ describe('xiaohongshu search', () => {
         const page = createPageMock(['timeout']);
 
         await expect(cmd.func(page, { query: '加载超时', limit: 5 })).rejects.toMatchObject({ code: 'TIMEOUT' });
-        expect(page.evaluate).toHaveBeenCalledTimes(1);
+        expect(page.evaluate).toHaveBeenCalledTimes(2);
         expect(page.newTab).not.toHaveBeenCalled();
     });
     it('replaces one proven-collapsed target and closes the old target after rebinding', async () => {
@@ -561,7 +900,7 @@ describe('xiaohongshu search', () => {
         expect(page.closeTab).toHaveBeenCalledWith('page-old');
         expect(page.newTab.mock.invocationCallOrder[0]).toBeLessThan(page.setActivePage.mock.invocationCallOrder[0]);
         expect(page.setActivePage.mock.invocationCallOrder[0]).toBeLessThan(page.closeTab.mock.invocationCallOrder[0]);
-        expect(page.closeTab.mock.invocationCallOrder[0]).toBeLessThan(page.evaluate.mock.invocationCallOrder[3]);
+        expect(page.closeTab.mock.invocationCallOrder[0]).toBeLessThan(page.evaluate.mock.invocationCallOrder[4]);
         expect(page.evaluate.mock.calls.filter(([script]) => String(script).includes('const requestedFilters ='))).toHaveLength(2);
         expect(page.getActivePage()).toBe('page-new');
     });
@@ -646,6 +985,19 @@ describe('xiaohongshu search', () => {
 });
 
 describe('xiaohongshu search filter behavior', () => {
+    it('ignores hidden overlapping clones for default and explicit filters without clicking them', async () => {
+        vi.useFakeTimers();
+        try {
+            for (const ghosts of ['aria', 'opacity', true]) {
+                const page = createFilterBehaviorPage({ ghosts });
+                await runFilterCommand(page, {});
+                await runFilterCommand(page, { sort: 'latest', 'note-type': 'video' });
+                expect(page.filterState).toMatchObject({ '排序依据': '最新', '笔记类型': '视频' });
+                expect(page.filterClicks).toEqual(['排序依据/最新', '笔记类型/视频']);
+            }
+        } finally { vi.useRealTimers(); }
+    });
+
     it('converges reused-tab state for filtered -> default and filter set A -> B', async () => {
         vi.useFakeTimers();
         try {
@@ -747,6 +1099,19 @@ describe('xiaohongshu search filter behavior', () => {
         try {
             const page = createFilterBehaviorPage({ unstableGeometry: true });
             await expect(runFilterCommand(page, { sort: 'latest' })).rejects.toMatchObject({ code: 'TIMEOUT' });
+        }
+        finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('applies requested filters in the AI-chat result layout', async () => {
+        vi.useFakeTimers();
+        try {
+            const page = createFilterBehaviorPage({ layout: 'ai-chat' });
+            await runFilterCommand(page, { sort: 'latest' });
+            expect(page.filterState['排序依据']).toBe('最新');
+            expect(page.filterClicks).toEqual(['排序依据/最新']);
         }
         finally {
             vi.useRealTimers();
@@ -923,7 +1288,7 @@ describe('buildScrollHarvestJs', () => {
         const a = '68e90be80000000004022e66';
         const b = '697f6c74000000002103de17';
         const c = '69b739f00000000000000000';
-        const { result, scrollDeltas } = await runHarvestFrames([
+        const { result, scrollDeltas, rootScrollCalls } = await runHarvestFrames([
             { height: 1200, cards: [{ id: a, title: '', likes: '0' }] },
             {
                 height: 1800,
@@ -964,6 +1329,17 @@ describe('buildScrollHarvestJs', () => {
 
         expect(result.rows).toHaveLength(1);
         expect(result.diag).toMatchObject({ usable: 1, stopReason: 'exhausted', rounds: 4 });
+    });
+    it('scrolls the AI-chat feed container when the document is not scrollable', async () => {
+        const { result, scrollDeltas, rootScrollCalls } = await runHarvestFrames([
+            { height: 1200, cards: [{ id: '68e90be80000000004022e66', title: '第一屏' }] },
+            { height: 1800, cards: [{ id: '697f6c74000000002103de17', title: '第二屏' }] },
+        ], { target: 2, layout: 'ai-chat' });
+
+        expect(result.rows.map((row) => row.title)).toEqual(['第一屏', '第二屏']);
+        expect(result.diag).toMatchObject({ usable: 2, stopReason: 'target' });
+        expect(scrollDeltas.length).toBeGreaterThan(0);
+        expect(rootScrollCalls).toBe(0);
     });
     it('detects a security block before spending the scroll budget', async () => {
         const { result } = await runHarvestFrames([
@@ -1052,5 +1428,61 @@ describe('noteIdToDate (ObjectID timestamp parsing)', () => {
     it('returns empty string when timestamp is out of range', () => {
         // All zeros → ts = 0
         expect(noteIdToDate('https://www.xiaohongshu.com/search_result/000000000000000000000000')).toBe('');
+    });
+});
+
+
+describe('search readiness before body creation', () => {
+    it.each(['initially missing', 'replaced'])('observes content when body is %s', async (mode) => {
+        const dom = new JSDOM('<html><body></body></html>', { runScripts: 'outside-only' });
+        const { window } = dom;
+        if (mode === 'initially missing') window.document.body.remove();
+        try {
+            const pending = window.eval(__test__.WAIT_FOR_CONTENT_JS);
+            const body = window.document.createElement('body');
+            body.innerHTML = '<section class="note-item">result</section>';
+            if (window.document.body) window.document.body.replaceWith(body);
+            else window.document.documentElement.append(body);
+            await expect(pending).resolves.toBe('content');
+        } finally { window.close(); }
+    });
+
+    it.each(['login_wall', 'security_block'])('does not let stale cards conceal %s', async (status) => {
+        const dom = new JSDOM('<section class="note-item">old result</section>', {
+            runScripts: 'outside-only',
+            url: status === 'security_block' ? 'https://www.xiaohongshu.com/website-login/captcha' : 'https://www.xiaohongshu.com/search_result',
+        });
+        try {
+            if (status === 'login_wall') {
+                const login = dom.window.document.createElement('button');
+                login.id = 'login-btn';
+                dom.window.document.body.append(login);
+            }
+            await expect(dom.window.eval(__test__.WAIT_FOR_CONTENT_JS)).resolves.toBe(status);
+        } finally { dom.window.close(); }
+    });
+
+    it('keeps the shared scroll helper bounded without a body', async () => {
+        const dom = new JSDOM('<html></html>', { runScripts: 'outside-only' });
+        dom.window.document.body.remove();
+        dom.window.scrollTo = vi.fn();
+        dom.window.setTimeout = callback => setTimeout(callback, 0);
+        try {
+            await expect(dom.window.eval(buildScrollUntilJs(1, 1))).resolves.toBe(0);
+        } finally { dom.window.close(); }
+    });
+
+    it('keeps a finite timeout when no body ever arrives', async () => {
+        const dom = new JSDOM('<html></html>', { runScripts: 'outside-only' });
+        dom.window.document.body.remove();
+        let expire;
+        dom.window.setTimeout = vi.fn(callback => { expire = callback; return 1; });
+        try {
+            const pending = dom.window.eval(__test__.WAIT_FOR_CONTENT_JS);
+            expect(dom.window.setTimeout).toHaveBeenCalledWith(expect.any(Function), 20_000);
+            expect(expire).toBeTypeOf('function');
+            expire();
+            await expect(pending).resolves.toBe('timeout');
+        } finally { dom.window.close(); }
     });
 });

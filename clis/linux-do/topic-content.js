@@ -1,6 +1,6 @@
 import { AuthRequiredError, CommandExecutionError, EmptyResultError } from '@jackwener/opencli/errors';
 import { cli, Strategy } from '@jackwener/opencli/registry';
-import { htmlToMarkdown, isRecord } from '@jackwener/opencli/utils';
+import { BROWSER_JSON_SNIFF_FN, htmlToMarkdown, isRecord, throwIfLoginWall } from '@jackwener/opencli/utils';
 import { toLocalTime } from './format.js';
 const LINUX_DO_DOMAIN = 'linux.do';
 const LINUX_DO_HOME = 'https://linux.do';
@@ -82,41 +82,39 @@ function extractTopicContent(payload, id) {
 }
 async function fetchTopicPayload(page, id) {
     const result = await page.evaluate(`(async () => {
+    ${BROWSER_JSON_SNIFF_FN}
     try {
-      const res = await fetch('/t/${id}.json?include_raw=true', { credentials: 'include' });
-      let data = null;
-      try {
-        data = await res.json();
-      } catch (_error) {
-        data = null;
-      }
-      return {
-        ok: res.ok,
-        status: res.status,
-        data,
-        error: data === null ? 'Response is not valid JSON' : '',
-      };
+      const payload = await fetchJsonOrLoginWall('/t/${id}.json?include_raw=true', { credentials: 'include' });
+      if (payload?.__loginWall) return { kind: 'login-wall', sentinel: payload };
+      if (payload?.error) return { kind: 'http', status: payload.error };
+      return { kind: 'ok', data: payload };
     } catch (error) {
-      return {
-        ok: false,
-        error: error instanceof Error ? error.message : String(error),
-      };
+      return { kind: 'exception', detail: error instanceof Error ? error.message : String(error) };
     }
   })()`);
     if (!result) {
         throw new CommandExecutionError('linux.do returned an empty browser response');
     }
-    if (result.status === 401 || result.status === 403) {
-        throw new AuthRequiredError(LINUX_DO_DOMAIN, 'linux.do requires an active signed-in browser session');
+    if (result.kind === 'login-wall') {
+        throwIfLoginWall(result.sentinel, { url: `/t/${id}.json?include_raw=true` });
     }
-    if (result.error === 'Response is not valid JSON') {
-        throw new AuthRequiredError(LINUX_DO_DOMAIN, 'linux.do requires an active signed-in browser session');
+    if (result.kind === 'http') {
+        if (typeof result.status !== 'number') {
+            throw new CommandExecutionError(`linux.do topic ${id} response reported a non-numeric HTTP status.`);
+        }
+        if (result.status === 401 || result.status === 403) {
+            throw new AuthRequiredError(LINUX_DO_DOMAIN, `linux.do returned HTTP ${result.status}`);
+        }
+        const hint = result.status === 429
+            ? 'Stop retrying this channel and wait for the channel cooldown.'
+            : undefined;
+        throw new CommandExecutionError(`linux.do topic ${id} request failed: HTTP ${result.status ?? 'unknown'}`, hint);
     }
-    if (!result.ok) {
-        throw new CommandExecutionError(result.error || `linux.do request failed: HTTP ${result.status ?? 'unknown'}`);
+    if (result.kind === 'exception') {
+        throw new CommandExecutionError(`linux.do topic ${id} request failed: ${result.detail}`);
     }
-    if (result.error) {
-        throw new CommandExecutionError(result.error, 'Please verify your linux.do session is still valid');
+    if (result.kind !== 'ok') {
+        throw new CommandExecutionError(`Unexpected linux.do topic response: ${JSON.stringify(result)}`);
     }
     return result.data;
 }

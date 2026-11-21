@@ -232,13 +232,4 @@ describe('linkedin people-search command', () => {
         expect(page.goto).not.toHaveBeenCalled();
     });
 
-    it('registers with the expected columns and arg shape', () => {
-        const cmd = getRegistry().get('linkedin/people-search');
-        expect(cmd?.columns).toEqual(['rank', 'name', 'headline', 'location', 'profile_url']);
-        expect(cmd?.access).toBe('read');
-        expect(cmd?.browser).toBe(true);
-        const keywordsArg = cmd?.args?.find((a) => a.name === 'keywords');
-        expect(keywordsArg?.positional).toBe(true);
-        expect(keywordsArg?.required).toBe(true);
-    });
 });

@@ -1,3 +1,4 @@
+import { CommandExecutionError } from '@jackwener/opencli/errors';
 import { cli } from '@jackwener/opencli/registry';
 import { fetchXueqiuJson } from './utils.js';
 cli({
@@ -16,7 +17,8 @@ cli({
         await page.goto('https://xueqiu.com');
         const url = `https://xueqiu.com/stock/search.json?code=${encodeURIComponent(String(kwargs.query))}&size=${kwargs.limit}`;
         const d = await fetchXueqiuJson(page, url);
-        return (d.stocks || []).slice(0, kwargs.limit).map((s) => {
+        if (!Array.isArray(d.stocks)) throw new CommandExecutionError('Xueqiu search response is missing the stocks array', 'Inspect the request in browser Network and share a sanitized response shape.');
+        return d.stocks.slice(0, kwargs.limit).map((s) => {
             let symbol = '';
             if (s.exchange === 'SH' || s.exchange === 'SZ' || s.exchange === 'BJ') {
                 symbol = s.code.startsWith(s.exchange) ? s.code : s.exchange + s.code;

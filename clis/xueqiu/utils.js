@@ -33,26 +33,44 @@ export function stripHtml(html) {
  * Page must already be navigated to xueqiu.com before calling this function.
  * Throws CliError on HTTP errors; otherwise returns the parsed JSON.
  */
+export function responseSummary(response) {
+    const json = response?.json;
+    const keys = json && typeof json === 'object' && !Array.isArray(json)
+        ? Object.keys(json).slice(0, 12).map(key => key.replace(/[^a-zA-Z0-9_]/g, '?').slice(0, 40)).join(',') : '';
+    const type = String(response?.contentType ?? '').split(';')[0].replace(/[^a-zA-Z0-9/+.-]/g, '').slice(0, 80);
+    return `HTTP ${Number(response?.status) || 0}; content-type=${type || 'unknown'}; JSON=${json === null ? 'null' : Array.isArray(json) ? 'array' : typeof json}; keys=[${keys}]`;
+}
+
 export async function fetchXueqiuJson(page, url) {
-    const result = await page.evaluate(`(async () => {
-    const res = await fetch(${JSON.stringify(url)}, { credentials: 'include' });
-    if (!res.ok) return { __xqErr: res.status };
+    let result;
     try {
-      return await res.json();
+        result = await page.evaluate(`(async () => {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), 30000);
+            try {
+                const res = await fetch(${JSON.stringify(url)}, { credentials: 'include', signal: controller.signal });
+                const text = await res.text();
+                let json = null;
+                try { json = JSON.parse(text); } catch {}
+                const contentType = res.headers.get('content-type') || '';
+                const html = contentType.includes('text/html') || /^\\s*</.test(text);
+                const challenge = html && /captcha|challenge|aliyun_waf|安全验证|验证码|请登录/i.test(text);
+                return { status: res.status, contentType, json, challenge };
+            } finally { clearTimeout(timer); }
+        })()`);
     } catch {
-      return { __xqErr: 'parse' };
+        throw new CommandExecutionError('Xueqiu page request failed (network, CSP or timeout)', 'Check the browser page and network; a working whoami does not prove this route is reachable.');
     }
-  })()`);
-    const r = result;
-    if (r?.__xqErr !== undefined) {
-        const code = r.__xqErr;
-        if (code === 401 || code === 403) {
-            throw new AuthRequiredError('xueqiu.com', '未登录或登录已过期');
-        }
-        if (code === 'parse') {
-            throw new CommandExecutionError('响应不是有效 JSON', '可能触发了风控，请检查登录状态或稍后重试');
-        }
-        throw new CommandExecutionError(`HTTP ${code}`, '请检查网络连接或登录状态');
+    if (result && typeof result === 'object' && 'session' in result && 'data' in result) result = result.data;
+    const summary = responseSummary(result);
+    if (result?.status === 401 || result?.status === 403 || result?.challenge) {
+        throw new AuthRequiredError('xueqiu.com', `Route requires login or challenge clearance (${summary})`);
     }
-    return result;
+    if (!result || result.status < 200 || result.status >= 300 || !Number.isFinite(result.status)) {
+        throw new CommandExecutionError(`Xueqiu request failed (${summary})`, 'For HTTP 429, wait before retrying.');
+    }
+    if (!result.json || typeof result.json !== 'object' || Array.isArray(result.json)) {
+        throw new CommandExecutionError(`Xueqiu response is not a JSON object (${summary})`, 'Inspect this request in browser Network; share only a sanitized response shape, without cookies or tokens.');
+    }
+    return result.json;
 }

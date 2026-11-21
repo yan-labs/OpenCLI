@@ -550,14 +550,15 @@ describe('updatePlugin', () => {
 
   it('refreshes local plugins without running git pull', () => {
     const localTarget = fs.mkdtempSync(path.join(os.tmpdir(), 'opencli-local-update-'));
-    const linkPath = path.join(PLUGINS_DIR, '__test-local-update__');
+    const pluginName = `__test-${path.basename(localTarget)}`;
+    const linkPath = path.join(PLUGINS_DIR, pluginName);
 
     fs.mkdirSync(PLUGINS_DIR, { recursive: true });
     fs.writeFileSync(path.join(localTarget, 'hello.js'), 'cli({ site: "test", name: "hello", access: "read" })');
     fs.symlinkSync(localTarget, linkPath, 'dir');
 
     const lock = _readLockFile();
-    lock['__test-local-update__'] = {
+    lock[pluginName] = {
       source: { kind: 'local', path: localTarget },
       commitHash: 'local',
       installedAt: '2025-01-01T00:00:00.000Z',
@@ -565,7 +566,7 @@ describe('updatePlugin', () => {
     _writeLockFile(lock);
 
     mockExecFileSync.mockClear();
-    updatePlugin('__test-local-update__');
+    updatePlugin(pluginName);
 
     expect(
       mockExecFileSync.mock.calls.some(
@@ -576,14 +577,14 @@ describe('updatePlugin', () => {
       ),
     ).toBe(false);
 
-    const updated = _readLockFile()['__test-local-update__'];
+    const updated = _readLockFile()[pluginName];
     expect(updated?.source).toEqual({ kind: 'local', path: path.resolve(localTarget) });
     expect(updated?.updatedAt).toBeDefined();
 
     try { fs.unlinkSync(linkPath); } catch {}
     try { fs.rmSync(localTarget, { recursive: true, force: true }); } catch {}
     const finalLock = _readLockFile();
-    delete finalLock['__test-local-update__'];
+    delete finalLock[pluginName];
     _writeLockFile(finalLock);
   });
 });

@@ -68,7 +68,6 @@ opencli CLI
 
 - `clis/` — built-in site adapters
 - `src/plugin.ts` / `src/plugin-manifest.ts` / `src/plugin-scaffold.ts` — plugin install, metadata, scaffold
-- `src/electron-apps.ts` — desktop / Electron app support
 
 ## Command Sources
 
@@ -76,7 +75,7 @@ OpenCLI merges commands from multiple places into one registry:
 
 | Source | Location | Examples |
 |---|---|---|
-| Built-in adapters | `clis/` | `twitter`, `bilibili`, `reddit`, `chatgpt-app` |
+| Built-in adapters | `clis/` | `twitter`, `bilibili`, `reddit`, `chatgpt` |
 | Generated / local adapters | `~/.opencli/clis/` | user-authored adapters |
 | Plugins | `~/.opencli/plugins/` | community-contributed commands |
 
@@ -103,13 +102,12 @@ This path is used for:
 
 ### Direct CDP mode
 
-Used when OpenCLI talks directly to a Chrome or Electron debugging endpoint through `OPENCLI_CDP_ENDPOINT`.
+Used when OpenCLI talks directly to a Chrome debugging endpoint through `OPENCLI_CDP_ENDPOINT`.
 
 Typical uses:
 
 - remote Chrome
 - headless Chrome
-- Electron desktop adapters
 
 ## Authentication / Access Strategies
 
@@ -125,7 +123,7 @@ OpenCLI currently uses these access strategies:
 The key distinction is operational:
 
 - `public` favors direct network access
-- `cookie`, `intercept`, `ui` depend on a live browser or desktop surface
+- `cookie`, `intercept`, `ui` depend on a live browser surface
 
 ## High-Risk Change Zones
 

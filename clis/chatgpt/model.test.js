@@ -21,11 +21,6 @@ beforeEach(() => {
 });
 
 describe('chatgpt model project routing', () => {
-    it('documents exact model targets alongside intelligence levels', () => {
-        expect(modelCommand.description).toContain('GPT-5.6 Pro');
-        expect(modelCommand.args[0].help).toContain('model or intelligence level');
-        expect(modelCommand.args[0].choices).toContain('gpt-5.6-pro');
-    });
 
     it('opens a project before selecting the requested model', async () => {
         const page = {};

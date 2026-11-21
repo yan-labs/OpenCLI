@@ -13,21 +13,6 @@ const {
 describe('linkedin profile-analytics adapter', () => {
   const command = getRegistry().get('linkedin/profile-analytics');
 
-  it('registers command shape', () => {
-    expect(command).toBeDefined();
-    expect(command.strategy).toBe('cookie');
-    expect(command.browser).toBe(true);
-    expect(command.columns).toEqual([
-      'profile_url',
-      'profile_views',
-      'post_impressions',
-      'search_appearances',
-      'followers',
-      'connections',
-      'raw_analytics',
-    ]);
-  });
-
   it('normalizes profile url default and explicit /in URL', () => {
     expect(normalizeProfileAnalyticsUrl(undefined)).toBe('https://www.linkedin.com/in/me/');
     expect(normalizeProfileAnalyticsUrl('https://www.linkedin.com/in/gauravsaxena1997/')).toBe('https://www.linkedin.com/in/gauravsaxena1997/');

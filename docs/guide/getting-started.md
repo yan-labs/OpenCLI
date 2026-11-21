@@ -1,23 +1,24 @@
 # Getting Started
 
-> **Make any website or Electron App your CLI.**
-> Zero risk · Reuse Chrome login · AI-powered discovery · Browser + Desktop automation
+> **Make any website your CLI.**
+> Zero risk · Reuse Chrome login · AI-powered discovery · Browser automation
 
 [![npm](https://img.shields.io/npm/v/@jackwener/opencli?style=flat-square)](https://www.npmjs.com/package/@jackwener/opencli)
 [![Node.js Version](https://img.shields.io/node/v/@jackwener/opencli?style=flat-square)](https://nodejs.org)
 [![License](https://img.shields.io/npm/l/@jackwener/opencli?style=flat-square)](https://github.com/jackwener/opencli/blob/main/LICENSE)
 
-OpenCLI turns **any website** or **Electron app** into a command-line interface — Bilibili, Zhihu, 小红书, Twitter/X, Reddit, YouTube, Antigravity, and [many more](/adapters/) — powered by browser session reuse and AI-native discovery.
+OpenCLI turns **any website** into a command-line interface — Bilibili, Zhihu, 小红书, Twitter/X, Reddit, YouTube, and [many more](/adapters/) — powered by browser session reuse and AI-native discovery.
+
+OpenCLI is a **general-purpose browser automation CLI** and an agent-browser alternative. Browse unfamiliar sites without adapters; use adapters for reusable site commands. See the [migration guide](./agent-browser-alternative).
 
 ## Highlights
 
-- **Desktop App Control** — Drive Electron apps (Cursor, Codex, ChatGPT, etc.) directly from the terminal via CDP.
 - **Browser Automation** — `browser` gives AI agents direct browser control: click, type/fill, extract, screenshot — fully scriptable.
 - **Website → CLI** — Turn any website into a deterministic CLI: 100+ site surfaces are already registered, or author your own with the `opencli-adapter-author` skill.
 - **Account-safe** — Reuses Chrome's logged-in state; your credentials never leave the browser.
-- **AI Agent ready** — `opencli browser *` primitives (`open` / `network` / `state` / `eval` / `init` / `verify`) drive the adapter-authoring loop.
-- **Zero LLM cost** — No tokens consumed at runtime. Run 10,000 times and pay nothing.
-- **Deterministic** — Same command, same output schema, every time. Pipeable, scriptable, CI-friendly.
+- **AI Agent ready** — `opencli browser *` primitives (`open` / `network` / `state` / `eval`) and `adapter init|check|test` drive the adapter-authoring loop.
+- **No built-in LLM dependency** — Commands run without LLM inference; an AI agent orchestrating actions still has its own model costs.
+- **Deterministic adapters** — Site commands provide structured output schemas. Pipeable, scriptable, CI-friendly.
 
 ## Quick Start
 
@@ -25,6 +26,24 @@ OpenCLI turns **any website** or **Electron app** into a command-line interface 
 
 ```bash
 npm install -g @jackwener/opencli
+```
+
+### Browse without a site adapter
+
+Set up [Browser Bridge](./browser-bridge), then run:
+
+```bash
+opencli doctor
+opencli browser --session work open https://example.com
+opencli browser --session work state
+opencli browser --session work extract
+opencli browser --session work close
+```
+
+Install the `opencli-browser` skill so your AI agent can use the same browser primitives:
+
+```bash
+npx skills add jackwener/opencli --skill opencli-browser
 ```
 
 ### Basic Usage
@@ -41,7 +60,7 @@ opencli zhihu hot -f json                 # JSON output
 All built-in commands support `--format` / `-f`:
 
 ```bash
-opencli bilibili hot -f table   # Default: rich terminal table
+opencli bilibili hot -f table   # Rich terminal table
 opencli bilibili hot -f json    # JSON (pipe to jq or LLMs)
 opencli bilibili hot -f yaml    # YAML (human-readable)
 opencli bilibili hot -f md      # Markdown
@@ -78,4 +97,3 @@ The completion includes:
 - [Plugins — extend with community adapters](/guide/plugins)
 - [All available adapters](/adapters/)
 - [For developers / AI agents](/developer/contributing)
-- [Add a new Electron app CLI](/guide/electron-app-cli)

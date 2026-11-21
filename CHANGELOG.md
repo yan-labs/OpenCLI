@@ -1,36 +1,81 @@
 # Changelog
 
-## [Unreleased]
+## [2.0.3](https://github.com/jackwener/opencli/compare/v2.0.2...v2.0.3) (2026-11-08)
 
-Default browser window placement changes from `background` to `dedicated`, and `dedicated` grows a pool, a dynamic layout, and window-management subcommands.
-
-### ⚠ BREAKING CHANGES
-
-* **browser window** — the default window mode for both `opencli browser <session> <cmd>` and every site-adapter command changes from `background` to `dedicated`. `background` never opened a window of its own — it borrows whichever window you are currently using and drops the session's tab into a labelled tab group there, following you if you switch windows (its tab has always reported `visibilityState: hidden`); that borrowing is what made plain calls disturb the window you were in. `dedicated` instead opens the session in an OpenCLI-owned automation window, off to the side and created unfocused, while still rendering `visible`. Explicit `--window <mode>` and `OPENCLI_WINDOW` continue to override the default, so callers that want the old borrowing behavior pass `--window background` / `OPENCLI_WINDOW=background` explicitly.
+Includes Chrome extension **1.0.27**. Update the extension for loopback connectivity, native keyboard input, and browser-window recovery fixes.
 
 ### Features
 
-* **browser window** — adapt the dedicated pool limit to the sum of all automation displays’ natural capacities, with a minimum of 4, replacing the fixed limit of 40. Capacity is recalculated from current displays for acquisition and window status/list.
+- Add Pinduoduo search and Twitter list-members commands.
+- Include replies and retweets in Twitter search results, and suggest site login commands on authentication failures.
 
-* **browser window** — add `--half` for mobile/H5 layouts: dedicated windows keep a full grid slot but use its left half, restore full width when returned to the pool, and report `half` in window status/list.
+### Fixes
 
-* **browser window** — on macOS, dedicated windows avoid the display under the mouse (falling back to the front application focused window); single-display and helper-unavailable setups retain the existing placement fallback.
+- Agree on a reachable loopback address across the daemon, CLI, and extension; avoid replacing a newer daemon with an older CLI.
+- Aim browser clicks at the resolved element, detect sibling occlusion, send complete native keyboard events, and recover owned idle windows after restart.
+- Fall back to DataTransfer uploads when the file chooser does not open; safely replace stale plugin host junctions on Windows.
+- Preserve JavaScript pipes and quoted expressions in pipelines, append query parameters before URL fragments, and escape CSV/Markdown headers.
+- Isolate concurrent download temporary files, preserve article code blocks, and honor yt-dlp failure exit status.
+- Improve LinkedIn experience, activity, and job parsing; wait for Weixin verification and article rendering; fix Ctrip train navigation.
+- Improve Twitter identity, Facebook search, Reddit blocked-page handling, JD login detection, Gemini conversation extraction, Grok session/text extraction, and YouTube login detection.
+- Update Xiaohongshu search and creator-note extraction, and report unloaded interaction counts as errors rather than zero.
+- Update undici to 7.30.1 for published security advisories.
 
-* **browser window** — raise the dedicated pool limit to 40; reap idle windows after 15 seconds by default using a lease-release timeout, the existing alarm, and checks before window acquisition/creation. A full pool reclaims its oldest idle windows first and reports `dedicated-pool-exhausted` only when every window has an active lease. `OPENCLI_DEDICATED_IDLE_MS` still overrides the TTL.
+## [2.0.2](https://github.com/jackwener/opencli/compare/v2.0.1...v2.0.2) (2026-10-20)
 
-* **browser window** — extension 1.4.0: the `dedicated` pool is now capped at 40 windows (`pool.capacity`) instead of the number that fit without overlap on one display; `pool.naturalCapacity` keeps the non-overlapping count. With secondary/virtual displays attached, automation windows use only those displays (`pool.automationDisplays`), tiling across all of them without overlap and cascading only after every display is full; with no secondary display the primary one is used as before. `dedicated-pool-exhausted` now appears only when 40 windows are live and all are busy.
+### Fixes
 
-* **browser window** — `dedicated` windows are now pooled instead of one-per-session: anonymous `pool-1`, `pool-2`, … windows are borrowed for the duration of a command's lease and returned to the pool when it ends, so a run of one-shot commands reuses one window instead of accumulating one per session. `--window-slot <name>` still pins a named window for callers that want a stable one.
-* **browser window** — dynamic, non-overlapping tile layout: window size is computed from the automation display's work area and the number of automation windows live right now (1280×900 for a single window, shrinking to a 900×620 floor as more windows share the display) instead of a fixed grid that could wrap around and stack windows on top of each other — Chrome reports a fully covered window as `hidden`, which was silently corrupting scrapes.
-* **browser window** — idle `dedicated` windows are reaped automatically: an automation window with no live lease is closed by the extension after 15 seconds by default, overridable per command via `OPENCLI_DEDICATED_IDLE_MS` (milliseconds).
-* **browser window** — with no `--window-display` / `--window-bounds`, the extension now auto-picks the automation display: a secondary display when one exists (preferring a non-internal, i.e. external or virtual, display), else the only display. Automation windows are always created unfocused and never raised.
-* **browser window** — two new subcommands: `opencli browser <session> window list` (every automation window plus pool capacity/live/idle/free counts and the idle TTL) and `opencli browser <session> window close [--slot <name>] [--force]` (closes one window, or all when `--slot` is omitted; refuses a window still held by a live lease unless `--force`).
+- Publish through npm Trusted Publishing (GitHub Actions OIDC), with provenance required by default (#2622).
+- Verify the published tarball, provenance source identity, signatures, and a clean mise installation before announcing a release. Release retries also verify any existing version instead of silently accepting it.
+- Keep Chrome extension **1.0.26** unchanged; this release repairs npm publishing evidence. Earlier package versions are immutable and do not gain provenance retroactively.
 
-### Bug Fixes
+## [2.0.1](https://github.com/jackwener/opencli/compare/v2.0.0...v2.0.1) (2026-10-20)
 
-* **browser window** — relocate explicit bounds overlapping the current user display (primary fallback) to the automatic grid, preserve caller width/height up to the automation display work area, and report `placement.relocatedFrom` with a warning; dedicated CLI requests now detect the current display even with bounds. Reused windows synchronize their size with relocated bounds. Preserved-size positions are clamped within the automation display; reused windows only synchronize dimensions while their center remains on that display. 迁移日志同 slot 同矩形只记一次。
+Includes Chrome extension **1.0.26**. Update the extension to receive the navigation fix.
 
-* **browser window** — a `dedicated` command that would overlap another window on the automation display now fails closed with a `dedicated-pool-exhausted:` error telling the caller to wait or free a slot, instead of stacking a window nobody can see while `window status` still reported `onDisplay: true`.
+### Features
+
+- Add a validated Douyin single-content detail reader (#2667).
+
+### Fixes
+
+- Avoid duplicate browser navigations during extension tab lease creation, which can cause Chromium's `Navigation rejected.` error without `--trace` (#2487, #2679).
+- Reject native input on hidden pages without replaying the action (#2664).
+- Wait for complete Ctrip flight captures in the foreground (#2663).
+- Capture page-owned TikTok profile responses and the current identity (#2662).
+- Locate LinkedIn activity cards from post permalinks (#2661).
+- Bound Xiaohongshu lazy user pagination while retaining collected results (#2666).
+- Classify Xueqiu page failures and expose response shape (#2668).
+- Classify Instagram read failures and navigate target profiles (#2669).
+
+## [2.0.0](https://github.com/jackwener/opencli/compare/v1.8.8...v2.0.0) (2026-10-17)
+
+A major release focused on agent experience: a smaller CLI surface, predictable JSON results, native Chrome APIs, and evidence-driven adapter development. Includes Chrome extension **1.0.25**.
+
+### Breaking changes and migration
+
+- Browser sessions are explicit options: use `opencli browser <command> ... --session research` instead of positional session names.
+- CLI results default to `{ "ok": true, "data": ... }`; failures use `{ "ok": false, "error": { "code", "message", "hint", ... } }` and a nonzero exit status. Update consumers to read `data`; follow modes emit JSON Lines. Explicit human-readable formats and raw exports remain available.
+- Use `opencli adapter init`, `adapter test`, and `adapter check` for adapter authoring and validation. These replace the former browser init/verify and adapter validation entry points.
+- Use `opencli browser network --static` for captured requests plus AST-derived endpoint evidence, and `opencli browser state --diagnostics` for page diagnostics. The separate discover/analyze workflow is removed.
+- Electron desktop automation, its app registry and public launcher export, site sitemap knowledge, and external CLI Hub passthrough are removed. Direct CDP connections to Chrome remain supported.
+- Existing JS adapter registration and execution contracts (`cli({...})`, `func(args)`, `func(page, args)`) remain supported. Adapter `defaultFormat` no longer overrides the CLI's JSON default.
+
+### Features
+
+- Native Chrome API discovery and calls through `opencli browser chrome describe` and `chrome call`, including tab/window management and tab-group creation and editing without attaching a page session. Managed session resources are protected.
+- Compact, paginated command discovery with `opencli list [query] --site --limit --offset`; streamlined bundled agent skills and adapter authoring.
+- AST-based static endpoint discovery integrated with captured network evidence, with incomplete network captures retained when requested.
+- Per-site slot pools give concurrent adapter runs exclusive tabs and run-level pacing; optional owned-tab cleanup and configurable browser idle timeout.
+- Proton API inbox and verified browser authentication; Xiaohongshu comment/comment-delete and YouTube comment commands; richer Twitter, YouTube, and Bilibili metadata.
+
+### Fixes
+
+- Exclude Chrome 155 browser toolbar targets from direct CDP page selection so blank tabs remain usable.
+- More reliable ChatGPT file/image uploads and composer targeting; current Gemini, Grok, and DeepSeek composer flows.
+- Xiaohongshu captcha/search/comment handling, Taobao cart confirmation and blocked-page detection, DBLP browser-backed XML reads, and YouTube channel-handle resolution.
+- Plugin path containment and host-package linking, browser upload file chooser activation, auth recovery hints, and structured error/exit-code handling.
+- Updated Vitest to address GHSA-82fw-gwwq-j7x9.
 
 ## [1.8.4](https://github.com/jackwener/opencli/compare/v1.8.3...v1.8.4) (2026-06-15)
 

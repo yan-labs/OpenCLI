@@ -62,18 +62,6 @@ afterEach(() => {
     while (tempDirs.length) fs.rmSync(tempDirs.pop(), { recursive: true, force: true });
 });
 
-describe('weixin command registration', () => {
-    it('registers create-draft and drafts commands', () => {
-        const registry = getRegistry();
-        const values = [...registry.values()];
-        expect(values.find(c => c.site === 'weixin' && c.name === 'create-draft')).toBeDefined();
-        const draftsCommand = values.find(c => c.site === 'weixin' && c.name === 'drafts');
-        expect(draftsCommand).toBeDefined();
-        expect(draftsCommand.args.find((arg) => arg.name === 'timeout')).toMatchObject({ type: 'int', default: 60 });
-        expect(values.find(c => c.site === 'weixin' && c.name === 'search')).toBeDefined();
-    });
-});
-
 describe('weixin drafts command', () => {
     it('throws AuthRequiredError when no session token is available', async () => {
         const command = getRegistry().get('weixin/drafts');

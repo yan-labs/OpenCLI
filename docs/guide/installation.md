@@ -11,6 +11,10 @@
 npm install -g @jackwener/opencli
 ```
 
+## Install the Browser Bridge Extension
+
+For browser commands, install **OpenCLI** from the [Chrome Web Store](https://chromewebstore.google.com/detail/opencli/ildkmabpimmkaediidaifkhjpohdnifk) (recommended). See [Browser Bridge setup](./browser-bridge) for manual installation and verification.
+
 ## Install from Source
 
 ```bash
@@ -40,6 +44,12 @@ npx skills add jackwener/opencli --skill opencli-browser
 npx skills add jackwener/opencli --skill opencli-usage
 npx skills add jackwener/opencli --skill smart-search
 ```
+
+OpenCLI no longer ships the sitemap skills. Older `opencli-sitemap-author` and
+`opencli-browser-sitemap` copies may remain in an agent's separate skills directory after an
+upgrade. If they remain, use the agent's removal flow if available; otherwise remove only those two
+directories (for example, `~/.agents/skills/opencli-sitemap-author`). The location varies by agent;
+keep the rest of the skills directory.
 
 ## Verify Installation
 

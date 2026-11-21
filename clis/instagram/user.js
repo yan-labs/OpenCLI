@@ -1,3 +1,4 @@
+import { readInstagramJsonJs, runInstagramRead } from './_shared/read-response.js';
 import { cli } from '@jackwener/opencli/registry';
 cli({
     site: 'instagram',
@@ -10,12 +11,15 @@ cli({
         { name: 'limit', type: 'int', default: 12, help: 'Number of posts' },
     ],
     columns: ['index', 'caption', 'likes', 'comments', 'type', 'date'],
-    pipeline: [
-        { navigate: 'https://www.instagram.com' },
-        { evaluate: `(async () => {
-  const username = \${{ args.username | json }};
-  const limit = \${{ args.limit }};
+    browser: true,
+    navigateBefore: false,
+    func: async (page, kwargs) => {
+        await page.goto(`https://www.instagram.com/${encodeURIComponent(String(kwargs.username))}/`);
+        return runInstagramRead(page, `(async () => {
+  const username = ${JSON.stringify(kwargs.username)};
+  const limit = ${JSON.stringify(kwargs.limit)};
   const headers = { 'X-IG-App-ID': '936619743392459' };
+  ${readInstagramJsonJs()}
   const opts = { credentials: 'include', headers };
 
   // Fetch directly by username. web_profile_info is gated for some public
@@ -25,9 +29,10 @@ cli({
     'https://www.instagram.com/api/v1/feed/user/' + encodeURIComponent(username) + '/username/?count=' + limit,
     opts
   );
-  if (!r2.ok) throw new Error('HTTP ' + r2.status + ' - make sure you are logged in to Instagram');
-  const d2 = await r2.json();
-  return (d2?.items || []).slice(0, limit).map((p, i) => ({
+  if (!r2.ok) throw new Error('Instagram feed-by-username failed: HTTP ' + r2.status);
+  const d2 = await readInstagramJson(r2, 'Instagram feed-by-username');
+  if (!Array.isArray(d2.items)) throw new Error('Instagram feed returned malformed items');
+  return d2.items.slice(0, limit).map((p, i) => ({
     index: i + 1,
     caption: (p.caption?.text || '').replace(/\\n/g, ' ').substring(0, 100),
     likes: p.like_count ?? 0,
@@ -36,6 +41,6 @@ cli({
     date: p.taken_at ? new Date(p.taken_at * 1000).toLocaleDateString() : '',
   }));
 })()
-` },
-    ],
+`);
+    },
 });

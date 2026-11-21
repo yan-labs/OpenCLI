@@ -52,27 +52,28 @@ cli({
 
             writeStarted = true;
             bookmarkBtn.click();
-            await new Promise(r => setTimeout(r, 1000));
-
-            // Verify
-            const verifyArticle = findTargetArticle() || targetArticle;
-            const verify = verifyArticle?.querySelector('[data-testid="removeBookmark"]');
-            if (verify) {
-                return { ok: true, message: 'Tweet successfully bookmarked.' };
-            } else {
-                return { ok: false, unconfirmed: true, message: 'Bookmark action initiated but UI did not update.' };
+            // Reacquire the requested article after each render; never click again.
+            const deadline = Date.now() + 5000;
+            while (true) {
+                const verifyArticle = findTargetArticle();
+                if (verifyArticle?.querySelector('[data-testid="removeBookmark"]')) {
+                    return { ok: true, message: 'Tweet successfully bookmarked.' };
+                }
+                const remaining = deadline - Date.now();
+                if (remaining <= 0) break;
+                await new Promise(r => setTimeout(r, Math.min(250, remaining)));
             }
+            return { ok: false, unconfirmed: true, message: 'Bookmark action initiated but UI did not update.' };
         } catch (e) {
             return { ok: false, unconfirmed: writeStarted, message: e.toString() };
         }
     })()`);
         if (result.unconfirmed) {
-            throw new TimeoutError('twitter bookmark confirmation', 1, `${result.message} Check the tweet before retrying; the bookmark may already have succeeded.`);
+            throw new TimeoutError('twitter bookmark confirmation', 5, `${result.message} Check the tweet before retrying; the bookmark may already have succeeded.`);
         }
         if (!result.ok) {
             throw new CommandExecutionError(result.message, 'Nothing changed. Open the tweet in the browser and retry.');
         }
-        await page.wait(2);
         return [{
                 status: 'success',
                 message: result.message

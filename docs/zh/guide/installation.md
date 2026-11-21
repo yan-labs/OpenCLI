@@ -11,6 +11,10 @@
 npm install -g @jackwener/opencli
 ```
 
+## 安装 Browser Bridge 扩展
+
+使用浏览器命令前，推荐从 [Chrome Web Store](https://chromewebstore.google.com/detail/opencli/ildkmabpimmkaediidaifkhjpohdnifk) 安装 **OpenCLI** 扩展。手动安装方式和验证步骤见 [Browser Bridge 设置](./browser-bridge)。
+
 ## 从源码安装
 
 ```bash
@@ -40,6 +44,11 @@ npx skills add jackwener/opencli --skill opencli-browser
 npx skills add jackwener/opencli --skill opencli-usage
 npx skills add jackwener/opencli --skill smart-search
 ```
+
+OpenCLI 当前已不再发布 sitemap skills。升级后，旧版 `opencli-sitemap-author` 和
+`opencli-browser-sitemap` 仍可能留在 Agent 单独管理的 skills 目录中。如果副本仍存在，请使用 Agent
+管理器提供的卸载方式；没有时只删除这两个文件夹即可（例如 `~/.agents/skills/opencli-sitemap-author`，
+具体路径因 Agent 而异），不要删除整个 skills 目录。
 
 ## 验证安装
 

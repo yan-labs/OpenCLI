@@ -73,18 +73,16 @@ function debugChatGPTModel(message) {
     }
 }
 
-// labels: how the selected tool shows up in the composer (pill) — matched loosely.
-// menuLabels: how the entry is named in the "+" menu — matched as a text prefix, so
-// the bare word "搜索" can not hit "添加资料库文件 浏览和搜索你的文件".
 const CHATGPT_TOOL_OPTIONS = {
-    'deep-research': { label: 'Deep Research', labels: ['深度研究', 'Deep Research'], menuLabels: ['深度研究', 'Deep research'] },
-    'web-search': { label: 'Web Search', labels: ['网页搜索', '搜索', 'Web Search', 'Search'], menuLabels: ['网页搜索', 'Web search'] },
+    'deep-research': { label: 'Deep Research', labels: ['深度研究', 'Deep Research'] },
+    'web-search': { label: 'Web Search', labels: ['网页搜索', '搜索', 'Web Search', 'Search'] },
 };
-const CHATGPT_PLUS_BUTTON_LABELS = ['添加文件等内容', 'Add files and more', 'Add files & more'];
 export const CHATGPT_TOOL_CHOICES = Object.keys(CHATGPT_TOOL_OPTIONS);
 
 // Selectors
 const COMPOSER_SELECTORS = [
+    'form[data-chatgpt-composer] .ProseMirror[contenteditable="true"]',
+    'form[data-composer-placement="thread"] .ProseMirror[contenteditable="true"]',
     '[contenteditable="true"][role="textbox"]',
     '#prompt-textarea[contenteditable="true"]',
     '[aria-label="Chat with ChatGPT"]',
@@ -122,9 +120,12 @@ function buildComposerLocatorScript() {
     const markerAttr = 'data-opencli-chatgpt-composer';
     return `
       const isVisible = (el) => {
-        if (!(el instanceof HTMLElement)) return false;
-        const style = window.getComputedStyle(el);
-        if (style.display === 'none' || style.visibility === 'hidden') return false;
+        if (!(el instanceof HTMLElement) || el.closest('[hidden], [inert], [aria-hidden="true"]')) return false;
+        for (let node = el; node; node = node.parentElement) {
+          const style = window.getComputedStyle(node);
+          if (style.display === 'none' || style.visibility === 'hidden' ||
+              (style.opacity !== '' && Number(style.opacity) < 0.01)) return false;
+        }
         const rect = el.getBoundingClientRect();
         return rect.width > 0 && rect.height > 0;
       };
@@ -139,6 +140,7 @@ function buildComposerLocatorScript() {
       const findComposer = () => {
         for (const selector of ${JSON.stringify(COMPOSER_SELECTORS)}) {
           const candidates = Array.from(document.querySelectorAll(selector)).filter(c => c instanceof HTMLElement && isVisible(c));
+          if (candidates.length > 1) return null;
           const node = candidates.find(c => c.isContentEditable) || candidates[0];
           if (node instanceof HTMLElement) {
             clearMarkers(node);
@@ -295,21 +297,31 @@ export async function isOnChatGPT(page) {
 // wait succeeds as soon as any composer flavour mounts (querySelectorAll
 // matches all of them). Tracks the most stable subset of COMPOSER_SELECTORS;
 // we only need to know "the composer is ready", not which variant rendered.
-// Newer chatgpt.com builds dropped #prompt-textarea; the ProseMirror composer is
-// a plain contenteditable textbox, so it has to be part of the wait selector.
-const COMPOSER_WAIT_SELECTOR = '#prompt-textarea, [data-testid="prompt-textarea"], [contenteditable="true"][role="textbox"]';
+const COMPOSER_WAIT_SELECTOR = '#prompt-textarea, [data-testid="prompt-textarea"]';
 const CONVERSATION_LINK_SELECTOR = 'a[href*="/c/"]';
 const PROJECT_LINK_SELECTOR = 'a[href*="/g/g-p-"]';
 // Selector used by detail.js to wait for at least one rendered message bubble
 // after navigating to /c/<id>; mirrors the markup queried by getVisibleMessages.
-// Legacy markup: [data-message-author-role] / article conversation-turn.
-// 2026 markup: user bubble = [data-user-message-bubble], assistant message =
-// [data-chatgpt-selection-message-id] (no article, no data-message-author-role).
-const USER_BUBBLE_SELECTOR = '[data-user-message-bubble]';
-const ASSISTANT_MESSAGE_SELECTOR = '[data-chatgpt-selection-message-id]';
-export const CONVERSATION_MESSAGE_SELECTOR = `[data-message-author-role], article[data-testid*="conversation-turn"], ${USER_BUBBLE_SELECTOR}, ${ASSISTANT_MESSAGE_SELECTOR}`;
+// 2026-10 redesign: turns are [data-chatgpt-search-unit-key="…:user|:assistant"].
+export const CONVERSATION_MESSAGE_SELECTOR = '[data-message-author-role], article[data-testid*="conversation-turn"], [data-chatgpt-search-unit-key]';
+
+async function activateChatGPTSessionTab(page) {
+    if (typeof page.tabs !== 'function' || typeof page.selectTab !== 'function') return;
+    const tabs = await page.tabs();
+    const candidates = Array.isArray(tabs) ? tabs.filter((tab) => {
+        try { return isTrustedChatGPTHost(new URL(tab.url).hostname); }
+        catch { return false; }
+    }) : [];
+    const targetId = page.getActivePage?.();
+    const target = candidates.find((tab) => tab.page === targetId)
+        ?? (candidates.length === 1 ? candidates[0] : null);
+    if (target?.active === false && typeof target.page === 'string') {
+        await page.selectTab(target.page);
+    }
+}
 
 export async function ensureOnChatGPT(page) {
+    await activateChatGPTSessionTab(page);
     if (await isOnChatGPT(page)) return false;
     await page.goto(CHATGPT_URL, { settleMs: 2000 });
     try {
@@ -321,6 +333,7 @@ export async function ensureOnChatGPT(page) {
 }
 
 export async function startNewChat(page) {
+    await activateChatGPTSessionTab(page);
     await page.goto(`${CHATGPT_URL}/new`, { settleMs: 2000 });
     try {
         await page.wait({ selector: COMPOSER_WAIT_SELECTOR, timeout: 8 });
@@ -411,6 +424,30 @@ function requireKnownChatGPTTool(tool) {
     return { key, ...option };
 }
 
+const REASONING_CONTROLS_JS = `
+    const reasoningVisible = (element) => {
+        if (!(element instanceof HTMLElement) || element.closest('[hidden], [inert], [aria-hidden="true"]')) return false;
+        const rect = element.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return false;
+        for (let node = element; node; node = node.parentElement) {
+            const style = getComputedStyle(node);
+            if (style.display === 'none' || style.visibility === 'hidden' ||
+                (style.opacity !== '' && Number(style.opacity) < 0.01)) return false;
+        }
+        return true;
+    };
+    const reasoningMatches = (selector) => Array.from(document.querySelectorAll(selector)).filter(reasoningVisible);
+`;
+const FOCUS_REASONING_SLIDER_JS = `(() => {
+    ${REASONING_CONTROLS_JS}
+    const rows = reasoningMatches('[data-reasoning-slider="true"]');
+    if (rows.length !== 1) return false;
+    const row = rows[0];
+    if (!row.querySelector('[role="slider"]') || row.getAttribute('aria-disabled') === 'true') return false;
+    row.focus();
+    return document.activeElement === row;
+})()`;
+
 export async function getCurrentChatGPTModel(page) {
     return requireObjectEvaluateResult(unwrapEvaluateResult(await page.evaluate(`(() => {
         const isVisible = (el) => {
@@ -433,6 +470,14 @@ export async function getCurrentChatGPTModel(page) {
             return normalizedText.replace(/\\s+/g, '').includes(normalizedLabel.replace(/\\s+/g, ''));
         };
         const labels = ${JSON.stringify(CHATGPT_MODEL_TARGETS)};
+        ${REASONING_CONTROLS_JS}
+        const effortTriggers = reasoningMatches('button[data-selected-reasoning-effort]');
+        if (effortTriggers.length > 1) return { model: null, label: '', ambiguousReasoning: true };
+        const effortTrigger = effortTriggers[0];
+        if (effortTrigger instanceof HTMLElement && isVisible(effortTrigger)) {
+            const effortKey = { low: 'fast', medium: 'balanced', high: 'advanced', xhigh: 'very-high' }[effortTrigger.getAttribute('data-selected-reasoning-effort')];
+            if (effortKey) return { model: effortKey, label: labels[effortKey].label };
+        }
         const findEntryForText = (text) => {
             const matches = [];
             for (const [key, value] of Object.entries(labels)) {
@@ -569,6 +614,58 @@ async function setChatGPTModelConfig(page, target) {
     return { ok: true, status: response.status, modelSlug, effort };
 }
 
+async function selectModernChatGPTIntelligence(page, target) {
+    const desiredEffort = { fast: 'low', balanced: 'medium', advanced: 'high', 'very-high': 'xhigh' }[target.key];
+    if (!desiredEffort) return false;
+    const trigger = requireObjectEvaluateResult(unwrapEvaluateResult(await page.evaluate(`(() => {
+        ${REASONING_CONTROLS_JS}
+        const buttons = reasoningMatches('button[data-selected-reasoning-effort]');
+        if (buttons.length > 1) return { ambiguous: true };
+        const button = buttons[0];
+        if (!button) return { found: false };
+        if (button.disabled || button.getAttribute('aria-disabled') === 'true') return { disabled: true };
+        const rect = button.getBoundingClientRect();
+        if (!rect.width || !rect.height) return { found: false };
+        return { found: true, open: button.getAttribute('aria-expanded') === 'true', x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+    })()`)), 'chatgpt reasoning trigger');
+    if (trigger.ambiguous || trigger.disabled) {
+        throw new CommandExecutionError('ChatGPT reasoning control is ambiguous or disabled.');
+    }
+    if (!trigger.found) return false;
+    if (typeof page.nativeKeyPress !== 'function' || (!trigger.open && typeof page.nativeClick !== 'function')) {
+        throw new CommandExecutionError('ChatGPT reasoning selection requires native browser keyboard support.');
+    }
+    if (!trigger.open) await page.nativeClick(trigger.x, trigger.y);
+    await page.wait(0.5);
+    try {
+        let focused = false;
+        for (let attempt = 0; attempt < 6 && !focused; attempt += 1) {
+            focused = requireBooleanEvaluateResult(unwrapEvaluateResult(await page.evaluate(FOCUS_REASONING_SLIDER_JS)), 'chatgpt reasoning slider focus');
+            if (!focused) await page.wait({ time: 0.25 });
+        }
+        if (!focused) throw new CommandExecutionError('Could not focus the ChatGPT reasoning slider.');
+        const order = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+        for (let attempt = 0; attempt < order.length; attempt += 1) {
+            const effort = unwrapEvaluateResult(await page.evaluate(`(() => {
+                ${REASONING_CONTROLS_JS}
+                const buttons = reasoningMatches('button[data-selected-reasoning-effort]');
+                return buttons.length === 1 ? buttons[0].getAttribute('data-selected-reasoning-effort') : null;
+            })()`));
+            if (effort === desiredEffort) return true;
+            const currentIndex = order.indexOf(effort);
+            if (currentIndex < 0) throw new CommandExecutionError('ChatGPT returned an unknown reasoning effort.');
+            if (!requireBooleanEvaluateResult(unwrapEvaluateResult(await page.evaluate(FOCUS_REASONING_SLIDER_JS)), 'chatgpt reasoning slider focus')) {
+                throw new CommandExecutionError('ChatGPT reasoning slider lost its unique focus target.');
+            }
+            await page.nativeKeyPress(currentIndex < order.indexOf(desiredEffort) ? 'ArrowRight' : 'ArrowLeft');
+            await page.wait(0.2);
+        }
+        throw new CommandExecutionError(`ChatGPT reasoning effort did not switch to ${target.label}.`);
+    } finally {
+        await page.nativeKeyPress('Escape');
+    }
+}
+
 export async function selectChatGPTModel(page, model) {
     const target = requireKnownChatGPTModel(model);
     debugChatGPTModel(`target=${target.key}`);
@@ -588,8 +685,14 @@ export async function selectChatGPTModel(page, model) {
 
     const before = await getCurrentChatGPTModel(page);
     debugChatGPTModel(`before=${before.model || 'none'}`);
+    if (before.ambiguousReasoning) {
+        throw new CommandExecutionError('ChatGPT reasoning control is ambiguous.');
+    }
     if (before.model === target.key) {
         return { Status: 'Already selected', Model: target.label };
+    }
+    if (await selectModernChatGPTIntelligence(page, target)) {
+        return { Status: 'Success', Model: target.label };
     }
     const apiResult = await setChatGPTModelConfig(page, target);
     debugChatGPTModel(`api=${apiResult ? JSON.stringify({ ok: apiResult.ok, status: apiResult.status, reason: apiResult.reason }) : 'none'}`);
@@ -830,131 +933,6 @@ export async function getCurrentChatGPTTool(page) {
     })()`)), 'chatgpt current tool');
 }
 
-// Finds the composer "+" button and opens the tools menu. mode 'dom' clicks from
-// inside the page; mode 'native' returns coordinates for a CDP mouse click. Dedicated
-// windows can silently drop CDP mouse events, so the DOM click goes first.
-async function openChatGPTToolsMenu(page, mode) {
-    const opened = requireObjectEvaluateResult(unwrapEvaluateResult(await page.evaluate(`(() => {
-        const isVisible = (el) => {
-            if (!(el instanceof HTMLElement)) return false;
-            const style = window.getComputedStyle(el);
-            if (style.display === 'none' || style.visibility === 'hidden') return false;
-            const rect = el.getBoundingClientRect();
-            return rect.width > 0 && rect.height > 0;
-        };
-        const menuRootSelector = '[data-composer-overlay-floating-ui], [role="menu"], [role="listbox"], [data-radix-popper-content-wrapper], [data-radix-menu-content]';
-        const menuOpen = Array.from(document.querySelectorAll(menuRootSelector))
-            .some((node) => node instanceof HTMLElement && isVisible(node) && !node.closest('nav, aside, header'));
-        if (menuOpen) return { found: true, alreadyOpen: true };
-        const plusLabels = ${JSON.stringify(CHATGPT_PLUS_BUTTON_LABELS)};
-        const form = Array.from(document.querySelectorAll('form')).find((node) => node instanceof HTMLElement && isVisible(node));
-        const scopes = form ? [form, document] : [document];
-        let button = null;
-        for (const scope of scopes) {
-            button = Array.from(scope.querySelectorAll('button[data-testid="composer-plus-btn"], button[aria-label]'))
-                .find((node) => isVisible(node)
-                    && (node.getAttribute('data-testid') === 'composer-plus-btn' || plusLabels.includes(node.getAttribute('aria-label') || '')));
-            if (button) break;
-        }
-        if (!(button instanceof HTMLElement)) return { found: false };
-        button.scrollIntoView({ block: 'center', inline: 'center' });
-        if (${JSON.stringify(mode)} === 'dom') {
-            button.click();
-            return { found: true, clicked: true };
-        }
-        const rect = button.getBoundingClientRect();
-        return {
-            found: true,
-            x: Math.round(rect.left + rect.width / 2),
-            y: Math.round(rect.top + rect.height / 2),
-        };
-    })()`)), 'chatgpt tools menu button');
-    if (!opened.found) {
-        throw new CommandExecutionError('Could not find the ChatGPT tools menu button in the composer.');
-    }
-    if (!opened.alreadyOpen && !opened.clicked) {
-        await page.nativeClick(Number(opened.x), Number(opened.y));
-    }
-    await page.wait(0.5);
-}
-
-// Looks for the requested entry in the open "+" menu. The menu is a floating
-// overlay (no role=menu); entries are <button data-list-navigation-item> whose
-// text is "<title><description>". If the entry is not rendered yet, scroll the
-// menu's scroll container to bring more entries into the DOM.
-async function findChatGPTToolMenuOption(page, target, { mode, attempt }) {
-    return requireObjectEvaluateResult(unwrapEvaluateResult(await page.evaluate(`(() => {
-        const isVisible = (el) => {
-            if (!(el instanceof HTMLElement)) return false;
-            const style = window.getComputedStyle(el);
-            if (style.display === 'none' || style.visibility === 'hidden') return false;
-            const rect = el.getBoundingClientRect();
-            return rect.width > 0 && rect.height > 0;
-        };
-        const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-        const labels = ${JSON.stringify(target.menuLabels || target.labels)}.map(normalize);
-        const rootSelector = '[data-composer-overlay-floating-ui], [role="menu"], [role="listbox"], [data-radix-popper-content-wrapper], [data-radix-menu-content]';
-        const roots = Array.from(document.querySelectorAll(rootSelector))
-            .filter((node) => node instanceof HTMLElement && isVisible(node) && !node.closest('nav, aside, header'));
-        if (!roots.length) return { menuOpen: false, found: false };
-        const optionSelector = 'button[data-list-navigation-item], [role="menuitemradio"], [role="menuitem"], [role="option"], button, div[tabindex="0"]';
-        const options = Array.from(new Set(roots.flatMap((root) => Array.from(root.querySelectorAll(optionSelector)))));
-        const option = options.find((node) => {
-            if (!(node instanceof HTMLElement) || !isVisible(node) || node.closest('nav, aside, header')) return false;
-            return [node.textContent, node.getAttribute('aria-label'), node.getAttribute('title')]
-                .map(normalize)
-                .some((text) => text && labels.some((label) => text === label || text.startsWith(label)));
-        });
-        if (!(option instanceof HTMLElement)) {
-            if (${Number(attempt)} >= 2) {
-                for (const root of roots) {
-                    const scroller = [root, ...root.querySelectorAll('*')].find((node) => node instanceof HTMLElement
-                        && node.scrollHeight > node.clientHeight + 4
-                        && /(auto|scroll)/.test(window.getComputedStyle(node).overflowY));
-                    if (scroller) scroller.scrollTop += Math.max(120, Math.floor(scroller.clientHeight * 0.8));
-                }
-            }
-            return { menuOpen: true, found: false, optionCount: options.length };
-        }
-        const checked = option.getAttribute('aria-checked') === 'true' || option.getAttribute('aria-selected') === 'true';
-        option.scrollIntoView({ block: 'center', inline: 'center' });
-        if (${JSON.stringify(mode)} === 'dom' && !checked) {
-            option.click();
-            return { menuOpen: true, found: true, checked, clicked: true };
-        }
-        const rect = option.getBoundingClientRect();
-        return {
-            menuOpen: true,
-            found: true,
-            checked,
-            x: Math.round(rect.left + rect.width / 2),
-            y: Math.round(rect.top + rect.height / 2),
-        };
-    })()`)), 'chatgpt tool option click');
-}
-
-async function trySelectChatGPTTool(page, target, mode) {
-    await openChatGPTToolsMenu(page, mode);
-    let option = null;
-    for (let attempt = 0; attempt < 10; attempt += 1) {
-        option = await findChatGPTToolMenuOption(page, target, { mode, attempt });
-        if (option.found) break;
-        await page.wait(0.5);
-    }
-    if (!option?.found) {
-        throw new CommandExecutionError(`Could not find the ChatGPT ${target.label} tool option.`);
-    }
-    if (!option.checked && !option.clicked) {
-        await page.nativeClick(Number(option.x), Number(option.y));
-    }
-    await page.wait(0.5);
-    const after = await getCurrentChatGPTTool(page);
-    if (after.tool !== target.key) {
-        throw new CommandExecutionError(`ChatGPT tool did not switch to ${target.label}.`);
-    }
-    return { Status: option.checked ? 'Already selected' : 'Success', Tool: target.label };
-}
-
 export async function selectChatGPTTool(page, tool) {
     const target = requireKnownChatGPTTool(tool);
     if (typeof page.nativeClick !== 'function') {
@@ -968,38 +946,103 @@ export async function selectChatGPTTool(page, tool) {
         return { Status: 'Already selected', Tool: target.label };
     }
 
-    let lastError = null;
-    for (const mode of ['dom', 'native']) {
-        try {
-            return await trySelectChatGPTTool(page, target, mode);
-        } catch (error) {
-            lastError = error;
-            const current = await getCurrentChatGPTTool(page).catch(() => null);
-            if (current?.tool === target.key) {
-                return { Status: 'Success', Tool: target.label };
-            }
-        }
+    const menuButton = requireObjectEvaluateResult(unwrapEvaluateResult(await page.evaluate(`(() => {
+        const isVisible = (el) => {
+            if (!(el instanceof HTMLElement)) return false;
+            const style = window.getComputedStyle(el);
+            if (style.display === 'none' || style.visibility === 'hidden') return false;
+            const rect = el.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+        };
+        const button = document.querySelector('button[data-testid="composer-plus-btn"], button[aria-label="Add files and more"]');
+        if (!(button instanceof HTMLElement) || !isVisible(button)) return { found: false };
+        button.scrollIntoView({ block: 'center', inline: 'center' });
+        const rect = button.getBoundingClientRect();
+        return {
+            found: true,
+            x: Math.round(rect.left + rect.width / 2),
+            y: Math.round(rect.top + rect.height / 2),
+        };
+    })()`)), 'chatgpt tools menu button');
+    if (!menuButton.found) {
+        throw new CommandExecutionError('Could not find the ChatGPT tools menu button in the composer.');
     }
-    throw lastError;
-}
+    await page.nativeClick(Number(menuButton.x), Number(menuButton.y));
+    await page.wait(0.5);
 
-// A tool picked from the "+" menu can stay in the persisted composer draft — Deep
-// Research is an inline mention chip that survives page loads and even other
-// windows. If the caller asked for no tool, drop it: otherwise a plain ask would
-// silently go out as a Deep Research message and never match its own prompt.
-export async function clearChatGPTStaleToolChips(page) {
-    const removed = requireBooleanEvaluateResult(unwrapEvaluateResult(await page.evaluate(`(() => {
-        ${buildComposerLocatorScript()}
-        const composer = findComposer();
-        if (!composer || !composer.isContentEditable) return false;
-        if (!composer.querySelector('[app-mention-name], [contenteditable="false"]')) return false;
-        composer.focus();
-        document.execCommand('selectAll', false);
-        document.execCommand('delete', false);
-        return true;
-    })()`)), 'chatgpt stale tool chips');
-    if (removed) await page.wait(0.5);
-    return removed;
+    let optionCenter = null;
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+        optionCenter = requireObjectEvaluateResult(unwrapEvaluateResult(await page.evaluate(`(() => {
+            const isVisible = (el) => {
+                if (!(el instanceof HTMLElement)) return false;
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden') return false;
+                const rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            };
+            const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+            const compact = (value) => normalize(value).toLowerCase().replace(/[^\\p{L}\\p{N}]+/gu, '');
+            const labels = ${JSON.stringify(target.labels)};
+            const optionSelector = '[role="menuitemradio"], [role="menuitem"], [role="option"], button, div[tabindex="0"]';
+            const matchesLabel = (value) => {
+                const normalized = normalize(value).toLowerCase();
+                const compacted = compact(value);
+                if (!normalized && !compacted) return false;
+                return labels.some((label) => {
+                    const normalizedLabel = normalize(label).toLowerCase();
+                    const compactedLabel = compact(label);
+                    return normalized === normalizedLabel
+                        || normalized.includes(normalizedLabel)
+                        || (compactedLabel && compacted.includes(compactedLabel));
+                });
+            };
+            const rootSelector = '[role="menu"], [role="listbox"], [data-radix-popper-content-wrapper], [data-radix-menu-content], [data-testid*="menu"], [data-testid*="popover"], [data-mention-list-scroll-area]';
+            const visibleRoots = Array.from(document.querySelectorAll(rootSelector))
+                .filter((node) => node instanceof HTMLElement && isVisible(node) && !node.closest('nav, aside'));
+            const searchRoots = visibleRoots.length ? visibleRoots : [document];
+            const options = Array.from(new Set(searchRoots.flatMap((root) => {
+                const matchesRoot = root instanceof HTMLElement && root.matches(optionSelector) ? [root] : [];
+                return matchesRoot.concat(Array.from(root.querySelectorAll(optionSelector)));
+            })));
+            // Prefer a row whose text starts with the label: 'Search' also matches 'Browse and search your files'.
+            const startsWithLabel = (node) => labels.some((label) => normalize(node.textContent).toLowerCase().startsWith(normalize(label).toLowerCase()));
+            const option = options.filter(startsWithLabel).concat(options).find((node) => {
+                if (!(node instanceof HTMLElement) || !isVisible(node) || node.closest('nav, aside')) return false;
+                const haystacks = [
+                    node.textContent,
+                    node.getAttribute('aria-label'),
+                    node.getAttribute('title'),
+                    node.getAttribute('data-testid'),
+                ];
+                return haystacks.some(matchesLabel);
+            });
+            if (!(option instanceof HTMLElement)) return { found: false };
+            const checked = option.getAttribute('aria-checked') === 'true' || option.getAttribute('aria-selected') === 'true';
+            option.scrollIntoView({ block: 'center', inline: 'center' });
+            const rect = option.getBoundingClientRect();
+            return {
+                found: true,
+                checked,
+                x: Math.round(rect.left + rect.width / 2),
+                y: Math.round(rect.top + rect.height / 2),
+            };
+        })()`)), 'chatgpt tool option click');
+        if (optionCenter.found) break;
+        await page.wait(0.5);
+    }
+    if (!optionCenter?.found) {
+        throw new CommandExecutionError(`Could not find the ChatGPT ${target.label} tool option.`);
+    }
+    if (!optionCenter.checked) {
+        await page.nativeClick(Number(optionCenter.x), Number(optionCenter.y));
+    }
+
+    await page.wait(0.5);
+    const after = await getCurrentChatGPTTool(page);
+    if (after.tool !== target.key) {
+        throw new CommandExecutionError(`ChatGPT tool did not switch to ${target.label}.`);
+    }
+    return { Status: optionCenter.checked ? 'Already selected' : 'Success', Tool: target.label };
 }
 
 export async function clearChatGPTDraft(page) {
@@ -1154,9 +1197,8 @@ async function fillChatGPTMessage(page, text) {
         // Fallback: use execCommand
         await page.evaluate(`
             (() => {
-                var composer = null;
-                var sels = ${JSON.stringify(COMPOSER_SELECTORS)};
-                for (var si = 0; si < sels.length; si++) { composer = document.querySelector(sels[si]); if (composer) break; }
+                ${buildComposerLocatorScript()}
+                const composer = findComposer();
                 if (!composer) return;
                 composer.focus();
                 document.execCommand('insertText', false, ${JSON.stringify(text)});
@@ -1188,8 +1230,12 @@ async function submitChatGPTMessage(page) {
                     && isVisible(button)
                     && !button.disabled
                     && button.getAttribute('aria-disabled') !== 'true';
-                const form = Array.from(document.querySelectorAll('form')).find((node) => node instanceof HTMLElement && isVisible(node));
-                const root = form || document.body;
+                const composer = (() => {
+                    ${buildComposerLocatorScript()}
+                    return findComposer();
+                })();
+                if (!composer) return { sendBtnFound: false };
+                const root = composer.closest('form') || document.body;
                 const primary = root.querySelector(${JSON.stringify(SEND_BUTTON_SELECTOR)})
                     || ${JSON.stringify(SEND_BUTTON_FALLBACK_SELECTORS)}.map(selector => root.querySelector(selector)).find(Boolean);
                 const btns = Array.from(root.querySelectorAll('button'));
@@ -1225,8 +1271,12 @@ async function submitChatGPTMessage(page) {
                 && isVisible(button)
                 && !button.disabled
                 && button.getAttribute('aria-disabled') !== 'true';
-            const form = Array.from(document.querySelectorAll('form')).find((node) => node instanceof HTMLElement && isVisible(node));
-            const root = form || document.body;
+            const composer = (() => {
+                ${buildComposerLocatorScript()}
+                return findComposer();
+            })();
+            if (!composer) return { ready: false };
+            const root = composer.closest('form') || document.body;
             const primary = root.querySelector(${JSON.stringify(SEND_BUTTON_SELECTOR)})
                 || ${JSON.stringify(SEND_BUTTON_FALLBACK_SELECTORS)}.map(selector => root.querySelector(selector)).find(Boolean);
             const labels = ${JSON.stringify(SEND_BUTTON_LABELS)};
@@ -1270,9 +1320,10 @@ export async function getVisibleMessages(page, { textOnly = false } = {}) {
         };
         const normalize = (value) => String(value || '').replace(/\\u00a0/g, ' ').replace(/[ \\t]+\\n/g, '\\n').replace(/\\n{3,}/g, '\\n\\n').trim();
         const roleOf = (node) => {
-            if (node.hasAttribute('data-user-message-bubble')) return 'User';
-            if (node.hasAttribute('data-chatgpt-selection-message-id')) return 'Assistant';
             const attr = node.getAttribute('data-message-author-role') || node.getAttribute('data-author') || '';
+            const searchKey = node.getAttribute('data-chatgpt-search-unit-key') || '';
+            if (/:assistant$/.test(searchKey)) return 'Assistant';
+            if (/:user$/.test(searchKey)) return 'User';
             if (/assistant/i.test(attr)) return 'Assistant';
             if (/user/i.test(attr)) return 'User';
             const testid = node.getAttribute('data-testid') || '';
@@ -1284,40 +1335,8 @@ export async function getVisibleMessages(page, { textOnly = false } = {}) {
             return '';
         };
 
-        let nodes = Array.from(document.querySelectorAll(${JSON.stringify(CONVERSATION_MESSAGE_SELECTOR)}));
+        let nodes = Array.from(document.querySelectorAll('[data-message-author-role], article[data-testid*="conversation-turn"], [data-chatgpt-search-unit-key]'));
         nodes = nodes.filter((node) => node instanceof HTMLElement && isVisible(node));
-
-        // Inline chips that are not message text: web-search citations ("Node.js +1")
-        // in assistant markdown, and tool mentions (the "深度研究" pill) that Deep
-        // Research prepends to the user's own bubble.
-        const CITATION_SELECTOR = 'a[data-testid="chatgpt-citation"], [data-prompt-link-href]';
-        const readWithoutCitations = (contentNode, wantHtml) => {
-            const chips = Array.from(contentNode.querySelectorAll(CITATION_SELECTOR));
-            if (!wantHtml) {
-                // Poll-loop path: textContent only, no layout. Drop the chips on a
-                // detached clone so the live page is never touched.
-                if (!chips.length) return { text: contentNode.textContent || '', html: '' };
-                const clone = contentNode.cloneNode(true);
-                clone.querySelectorAll(CITATION_SELECTOR).forEach((chip) => chip.remove());
-                return { text: clone.textContent || '', html: '' };
-            }
-            if (!chips.length) {
-                return { text: contentNode.innerText || contentNode.textContent || '', html: contentNode.innerHTML || '' };
-            }
-            // Hide the chips synchronously (no paint in between) so innerText keeps
-            // its block-level line breaks, then restore the page exactly as it was.
-            const saved = chips.map((chip) => chip.style.display);
-            chips.forEach((chip) => { chip.style.display = 'none'; });
-            let text = '';
-            try {
-                text = contentNode.innerText || contentNode.textContent || '';
-            } finally {
-                chips.forEach((chip, i) => { chip.style.display = saved[i]; });
-            }
-            const clone = contentNode.cloneNode(true);
-            clone.querySelectorAll(CITATION_SELECTOR).forEach((chip) => chip.remove());
-            return { text, html: clone.innerHTML || '' };
-        };
 
         const rows = [];
         const seen = new Set();
@@ -1327,20 +1346,25 @@ export async function getVisibleMessages(page, { textOnly = false } = {}) {
             if (!role && roleNode) role = roleOf(roleNode);
             if (!role) continue;
 
-            const contentNode = node.querySelector('[data-message-author-role] .markdown')
+            let contentNode = node.querySelector('[data-markdown-copy="contents"], [data-markdown-text-style="assistant-message"], [data-user-message-bubble] [data-search-result-target]')
+                || node.querySelector('[data-message-author-role] .markdown')
                 || node.querySelector('.markdown')
-                || node.querySelector('[data-markdown-text-style="assistant-message"]')
                 || node.querySelector('[data-message-author-role]')
                 || node;
-            const read = contentNode instanceof HTMLElement
-                ? readWithoutCitations(contentNode, includeHtml)
-                : { text: '', html: '' };
-            const html = includeHtml ? read.html : '';
-            const text = normalize(read.text);
+            // Deduplicate overlapping markup by node identity, preserving repeated turns.
+            if (seen.has(contentNode)) continue;
+            seen.add(contentNode);
+            // Tool chips ("Web search", "Deep research") render inside the user prompt; drop them so it matches the sent text.
+            if (role === 'User' && contentNode.querySelector('[data-prompt-link-href]')) {
+                contentNode = contentNode.cloneNode(true);
+                contentNode.querySelectorAll('[data-prompt-link-href]').forEach((pill) => pill.remove());
+            }
+            const html = includeHtml && contentNode instanceof HTMLElement ? (contentNode.innerHTML || '') : '';
+            const rawText = contentNode instanceof HTMLElement
+                ? (includeHtml ? (contentNode.innerText || contentNode.textContent || '') : (contentNode.textContent || ''))
+                : '';
+            const text = normalize(rawText);
             if (!text) continue;
-            const key = role + '\\n' + text;
-            if (seen.has(key)) continue;
-            seen.add(key);
             rows.push({ role, text, html });
         }
         return rows;
@@ -1479,6 +1503,11 @@ function extractDeepResearchSourcesFromReportMessage(reportMessage) {
         if (hasDirectSource) addSource(reference, 'content reference');
         if (reference?.matched_text) addSource({ title: reference.matched_text, url: reference.url }, 'matched content reference');
         if (reference?.metadata) addSource(reference.metadata, 'content reference metadata');
+    }
+    // Deep Research reports now cite through metadata.citations[].metadata.
+    for (const citation of Array.isArray(metadata.citations) ? metadata.citations : []) {
+        const url = String(citation?.metadata?.url || '').split('#')[0];
+        if (url) addSource({ title: citation.metadata.title, url }, 'citation');
     }
     for (const url of safeUrls) addSource(typeof url === 'string' ? { url } : url, 'safe URL');
     for (const group of groups) {
@@ -1691,7 +1720,7 @@ function extractDeepResearchFromConversationPayload(payload, { expectedConversat
 }
 
 function conversationIdFromBackendConversationUrl(url) {
-    const match = String(url || '').match(/\/backend-api\/conversation\/([^/?#]+)/);
+    const match = String(url || '').match(/\/backend-api\/conversation\/([^/?#]+)(?:[?#]|$)/);
     return match?.[1] ? decodeURIComponent(match[1]) : '';
 }
 
@@ -1699,8 +1728,9 @@ function extractDeepResearchFromNetworkEntries(entries, { expectedConversationId
     const candidates = [];
     for (const entry of Array.isArray(entries) ? entries : []) {
         const url = String(entry?.url || '');
-        if (!/\/backend-api\/conversation\//.test(url)) continue;
         const entryConversationId = conversationIdFromBackendConversationUrl(url);
+        // Sub-resources (/conversation/<id>/stream_status, textdocs…) carry no mapping.
+        if (!entryConversationId) continue;
         if (expectedConversationId && entryConversationId !== expectedConversationId) continue;
         const body = parseJsonMaybe(entry?.responsePreview) || parseJsonMaybe(entry?.body) || null;
         if (!body) {
@@ -1806,9 +1836,8 @@ async function fetchChatGPTConversationPayload(page, conversationId) {
                     };
                 }
                 errors.push('node fetch returned non-json');
+            // Cookie-only requests now get 404 conversation_inaccessible instead of 401/403.
             } else if (response.status === 401 || response.status === 403 || response.status === 404) {
-                // chatgpt.com answers 404 (not 401) to a cookie-only conversation fetch;
-                // the Bearer access token from /api/auth/session is what actually works.
                 errors.push(`node cookie fetch status ${response.status}`);
                 const bearerAuth = await buildChatGPTConversationHeaders(page, { includeAuthorization: true });
                 if (bearerAuth.ok) {
@@ -1848,22 +1877,10 @@ async function fetchChatGPTConversationPayload(page, conversationId) {
     }
 
     const result = unwrapEvaluateResult(await withTimeout(page.evaluate(`(async () => {
-        const first = await fetch('/backend-api/conversation/${conversationId}', {
+        const response = await fetch('/backend-api/conversation/${conversationId}', {
             credentials: 'include',
             headers: { accept: 'application/json' },
         });
-        let response = first;
-        if (!first.ok) {
-            // Same-origin cookie-only reads can 404; retry with the session access token.
-            const session = await fetch('/api/auth/session', { credentials: 'include' });
-            const accessToken = session.ok ? (await session.json())?.accessToken : '';
-            if (accessToken) {
-                response = await fetch('/backend-api/conversation/${conversationId}', {
-                    credentials: 'include',
-                    headers: { accept: 'application/json', authorization: 'Bearer ' + accessToken },
-                });
-            }
-        }
         const text = await response.text();
         return {
             ok: response.ok,
@@ -1878,130 +1895,6 @@ async function fetchChatGPTConversationPayload(page, conversationId) {
     const payload = parseJsonMaybe(result.text);
     if (!payload) return { error: [...errors, 'page fetch returned non-json'].join('; ') };
     return { payload, status: result.status, contentType: result.contentType, transport: 'page-fetch' };
-}
-
-// ChatGPT wraps inline citation markers in private-use characters (U+E200..U+E2FF),
-// e.g. "citeturn0search1". They never belong in returned text.
-const CITATION_MARKER_RE = /[-]/g;
-
-function normalizeCitedUrl(value) {
-    const raw = String(value || '').trim();
-    if (!raw) return '';
-    try {
-        const url = new URL(raw);
-        if (url.searchParams.get('utm_source') === 'chatgpt.com') {
-            url.searchParams.delete('utm_source');
-        }
-        return url.toString();
-    } catch {
-        return raw;
-    }
-}
-
-/**
- * Pull the web sources of the latest turn out of a /backend-api/conversation payload.
- * `sources` are the pages the final answer cites (content_references); `searchedCount`
- * is how many search hits the model looked at for that turn. `finished` tells the
- * caller whether the final assistant message is complete in the payload yet.
- */
-export function extractChatGPTSourcesFromPayload(payload) {
-    const mapping = payload && typeof payload === 'object' ? payload.mapping : null;
-    if (!mapping || typeof mapping !== 'object') {
-        return { sources: [], searchedCount: 0, finished: false, model: '' };
-    }
-    // Walk the active branch (current_node -> root) so regenerated/edited branches
-    // and earlier turns of a continued conversation do not leak into this turn.
-    const chain = [];
-    const visited = new Set();
-    let nodeId = payload.current_node;
-    while (nodeId && mapping[nodeId] && !visited.has(nodeId)) {
-        visited.add(nodeId);
-        chain.unshift(mapping[nodeId]);
-        nodeId = mapping[nodeId].parent;
-    }
-    const messages = (chain.length ? chain : Object.values(mapping))
-        .map((node) => node?.message)
-        .filter(Boolean);
-    let lastUser = -1;
-    messages.forEach((message, index) => {
-        if (message?.author?.role === 'user') lastUser = index;
-    });
-    const turn = messages.slice(lastUser + 1);
-    const finals = turn.filter((message) => message?.author?.role === 'assistant'
-        && message?.content?.content_type === 'text'
-        && Array.isArray(message.content.parts)
-        && message.content.parts.join('').replace(CITATION_MARKER_RE, '').trim());
-    const final = finals[finals.length - 1] || null;
-    const entries = turn
-        .flatMap((message) => message?.metadata?.search_result_groups || [])
-        .flatMap((group) => group?.entries || []);
-    const sources = [];
-    const seen = new Set();
-    const addSource = (title, url) => {
-        const normalized = normalizeCitedUrl(url);
-        if (!normalized || seen.has(normalized)) return;
-        seen.add(normalized);
-        sources.push({ title: String(title || '').trim(), url: normalized });
-    };
-    for (const ref of final?.metadata?.content_references || []) {
-        for (const match of String(ref?.matched_text || '').matchAll(/turn\d+([a-z]+)(\d+)/g)) {
-            const entry = entries.find((candidate) => candidate?.ref_id?.ref_type === match[1]
-                && String(candidate?.ref_id?.ref_index) === match[2]);
-            if (entry) addSource(entry.title, entry.url);
-        }
-        for (const item of [...(ref?.items || []), ...(ref?.sources || [])]) {
-            addSource(item?.title, item?.url);
-        }
-        for (const url of ref?.safe_urls || []) addSource('', url);
-    }
-    // Backfill titles for URLs that were only known from safe_urls.
-    for (const source of sources) {
-        if (source.title) continue;
-        const entry = entries.find((candidate) => normalizeCitedUrl(candidate?.url) === source.url);
-        if (entry?.title) source.title = String(entry.title).trim();
-    }
-    return {
-        sources,
-        searchedCount: entries.length,
-        finished: !!final && final.status === 'finished_successfully' && final.end_turn !== false,
-        model: String(payload.default_model_slug || ''),
-    };
-}
-
-/**
- * Fetch the conversation payload and return the cited web sources of its latest turn.
- * Never throws: sources are an add-on to the answer, so a failed fetch is reported
- * through `error` instead of failing the whole command.
- */
-export async function getChatGPTConversationSources(page, conversationId, { timeoutSeconds = 20 } = {}) {
-    const deadline = Date.now() + timeoutSeconds * 1000;
-    let last = { sources: [], searchedCount: 0, finished: false, model: '' };
-    let error = '';
-    let failures = 0;
-    do {
-        try {
-            const result = await fetchChatGPTConversationPayload(page, conversationId);
-            if (result?.payload) {
-                error = '';
-                failures = 0;
-                last = extractChatGPTSourcesFromPayload(result.payload);
-                if (last.finished) break;
-            } else {
-                error = result?.error || 'conversation payload unavailable';
-                failures += 1;
-            }
-        } catch (caught) {
-            error = String(caught?.message || caught);
-            failures += 1;
-        }
-        if (failures >= 3 || Date.now() >= deadline) break;
-        await page.sleep(2);
-    } while (Date.now() < deadline);
-    return { ...last, error };
-}
-
-export function stripChatGPTCitationMarkers(text) {
-    return String(text || '').replace(CITATION_MARKER_RE, '');
 }
 
 function collectAxText(tree) {
@@ -2474,20 +2367,7 @@ export async function waitForChatGPTResponse(page, baselineCount, prompt, timeou
 
         if (candidate === lastText) {
             stableCount += 1;
-            if (stableCount >= 2) {
-                // The poll loop reads textContent (no layout), which glues paragraphs
-                // together. Take one layout-aware read so the returned answer keeps
-                // its line breaks; fall back to the polled text if that read differs
-                // in substance or fails.
-                try {
-                    const settled = await getVisibleMessages(page);
-                    const laidOut = findLatestNewAssistantResponse(settled, prompt, baselinePairCounts);
-                    if (laidOut && laidOut.replace(/\s+/g, '') === candidate.replace(/\s+/g, '')) return laidOut;
-                } catch {
-                    // keep the polled candidate
-                }
-                return candidate;
-            }
+            if (stableCount >= 2) return candidate;
         } else {
             lastText = candidate;
             stableCount = 0;
@@ -2497,7 +2377,7 @@ export async function waitForChatGPTResponse(page, baselineCount, prompt, timeou
     throw new TimeoutError(
         'chatgpt ask',
         timeoutSeconds,
-        'No ChatGPT response appeared before timeout. Re-run with a higher --timeout if it is still generating.',
+        'Your message may already be submitted. Check "opencli chatgpt read" before sending again. For future requests, use a higher --timeout.',
     );
 }
 
@@ -2508,7 +2388,7 @@ export async function getConversationList(page) {
 
     const openSidebar = requireBooleanEvaluateResult(unwrapEvaluateResult(await page.evaluate(`(() => {
         const button = Array.from(document.querySelectorAll('button'))
-            .find((node) => /open sidebar/i.test(node.getAttribute('aria-label') || ''));
+            .find((node) => /^(?:open|show) sidebar$|^(?:打开|展开)(?:侧边栏|边栏)$/i.test(node.getAttribute('aria-label') || ''));
         if (button instanceof HTMLElement) {
             button.click();
             return true;
@@ -2615,15 +2495,27 @@ async function waitForChatGPTUploadPreview(page, fileNames) {
         const ready = requireBooleanEvaluateResult(unwrapEvaluateResult(await page.evaluate(`
             (() => {
                 const names = ${namesJson};
-                const text = document.body ? (document.body.innerText || '') : '';
-                const matchedNames = names.filter(name => text.includes(name)).length;
-                if (matchedNames >= names.length) return true;
-
                 const composer = document.querySelector('[aria-label="Chat with ChatGPT"], [placeholder="Ask anything"], #prompt-textarea');
+                if (!composer) return false;
                 let root = composer;
-                for (let i = 0; i < 6 && root && root.parentElement; i += 1) root = root.parentElement;
-                const scope = root || document.body;
-                if (!scope) return false;
+                for (let i = 0; i < 6 && root.parentElement; i += 1) root = root.parentElement;
+                const scope = composer.closest('form') || root;
+                const text = scope.innerText || '';
+                if (names.every(name => text.includes(name))) return true;
+
+                // Some attachment chips expose their filename only as an accessible name.
+                // Match the exact name in the composer, not a historical message or control.
+                const chips = Array.from(scope.querySelectorAll('[role="group"][aria-label], [data-composer-attachments] button[aria-label]')).filter(node => {
+                    if (node.closest('[hidden], [aria-hidden="true"]')) return false;
+                    const rect = node.getBoundingClientRect();
+                    if (rect.width <= 0 || rect.height <= 0) return false;
+                    for (let ancestor = node; ancestor; ancestor = ancestor.parentElement) {
+                        const style = getComputedStyle(ancestor);
+                        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+                    }
+                    return true;
+                });
+                if (names.every(name => chips.some(node => node.getAttribute('aria-label') === name))) return true;
 
                 const isVisibleMedia = (node) => {
                     if (!(node instanceof HTMLElement)) return false;
@@ -2645,8 +2537,97 @@ async function waitForChatGPTUploadPreview(page, fileNames) {
     return false;
 }
 
-export async function uploadChatGPTImages(page, imagePaths) {
+async function uploadChatGPTChunkedFiles(page, paths, selector, mimeForPath) {
     const fs = await import('node:fs');
+    const path = await import('node:path');
+    if (typeof page.evaluateOnce !== 'function') {
+        throw new CommandExecutionError('File upload fallback requires a browser backend with evaluateOnce support.');
+    }
+    if (paths.some(file => fs.default.statSync(file).size > 25 * 1024 * 1024)) {
+        return { ok: false, reason: 'Uploads over 25 MB require a current Browser Bridge extension with native file-input support' };
+    }
+    // Base64 can exceed the daemon's 1 MB request limit. Stage bounded,
+    // idempotent chunks on the pinned input, then assign files only once.
+    const chunkSize = 192 * 1024;
+    const files = paths.map(absPath => ({
+        name: path.default.basename(absPath),
+        mime: mimeForPath(absPath),
+        bytes: fs.default.readFileSync(absPath),
+    }));
+    let fallbackResult;
+    try {
+        await page.evaluate(`(() => {
+            const input = document.querySelector(${JSON.stringify(selector)});
+            if (!(input instanceof HTMLInputElement)) throw new Error('Pinned file input disappeared');
+            input.__opencliFileChunks = ${JSON.stringify(files.map(file => ({ name: file.name, mime: file.mime, count: Math.max(1, Math.ceil(file.bytes.length / chunkSize)), chunks: [] })))};
+            return true;
+        })()`);
+        for (let fileIndex = 0; fileIndex < files.length; fileIndex += 1) {
+            const bytes = files[fileIndex].bytes;
+            const count = Math.max(1, Math.ceil(bytes.length / chunkSize));
+            for (let index = 0; index < count; index += 1) {
+                const chunk = bytes.subarray(index * chunkSize, (index + 1) * chunkSize).toString('base64');
+                await page.evaluate(`(() => {
+                    const input = document.querySelector(${JSON.stringify(selector)});
+                    if (!input?.__opencliFileChunks) throw new Error('Pinned file input disappeared');
+                    input.__opencliFileChunks[${fileIndex}].chunks[${index}] = ${JSON.stringify(chunk)};
+                    return true;
+                })()`);
+            }
+        }
+        fallbackResult = requireObjectEvaluateResult(unwrapEvaluateResult(await page.evaluateOnce(`
+        (() => {
+            const input = document.querySelector(${JSON.stringify(selector)});
+            const files = input?.__opencliFileChunks;
+            if (!Array.isArray(files)) return { ok: false, reason: 'staged file data is missing' };
+            if (!(input instanceof HTMLInputElement)) {
+                return { ok: false, reason: 'file input not found' };
+            }
+
+            const dt = new DataTransfer();
+            for (const item of files) {
+                if (item.chunks.length !== item.count || Array.from({ length: item.count }, (_, index) => item.chunks[index]).some(chunk => typeof chunk !== 'string')) {
+                    return { ok: false, reason: 'staged file data is incomplete' };
+                }
+                const parts = item.chunks.map(chunk => {
+                    const binary = atob(chunk);
+                    return Uint8Array.from(binary, char => char.charCodeAt(0));
+                });
+                dt.items.add(new File(parts, item.name, { type: item.mime }));
+            }
+            input.files = dt.files;
+
+            const propsKey = Object.keys(input).find(key => key.startsWith('__reactProps$'));
+            if (propsKey && input[propsKey] && typeof input[propsKey].onChange === 'function') {
+                const nativeEvent = new Event('change', { bubbles: true });
+                input[propsKey].onChange({
+                    target: input,
+                    currentTarget: input,
+                    nativeEvent,
+                    preventDefault() {},
+                    stopPropagation() {},
+                    isDefaultPrevented() { return false; },
+                    isPropagationStopped() { return false; },
+                    persist() {},
+                });
+            } else {
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+            return { ok: true };
+        })()
+    `)), 'chatgpt file upload fallback');
+    } finally {
+        await page.evaluate(`(() => {
+            const input = document.querySelector(${JSON.stringify(selector)});
+            if (input) delete input.__opencliFileChunks;
+            return true;
+        })()`);
+    }
+    return fallbackResult;
+}
+
+export async function uploadChatGPTImages(page, imagePaths) {
     const path = await import('node:path');
     const prepared = await prepareChatGPTImagePaths(imagePaths);
     if (!prepared.ok) return prepared;
@@ -2661,55 +2642,14 @@ export async function uploadChatGPTImages(page, imagePaths) {
             uploaded = true;
         } catch (err) {
             const msg = String(err?.message || err);
-            if (!msg.includes('Unknown action') && !msg.includes('not supported') && !msg.includes('Not allowed') && !msg.includes('No element found')) {
+            if (!msg.includes('Unknown action') && !msg.includes('not supported') && !msg.includes('Not allowed') && !msg.includes('No element found') && !msg.includes('fileChooserOpened not received')) {
                 throw err;
             }
         }
     }
 
     if (!uploaded) {
-        const files = absPaths.map(absPath => ({
-            name: path.default.basename(absPath),
-            mime: imageMimeFromPath(absPath),
-            base64: fs.default.readFileSync(absPath).toString('base64'),
-        }));
-        const fallbackResult = requireObjectEvaluateResult(unwrapEvaluateResult(await page.evaluate(`
-            (() => {
-                const files = ${JSON.stringify(files)};
-                const input = document.querySelector('input[type="file"]');
-                if (!(input instanceof HTMLInputElement)) {
-                    return { ok: false, reason: 'file input not found' };
-                }
-
-                const dt = new DataTransfer();
-                for (const item of files) {
-                    const binary = atob(item.base64);
-                    const bytes = new Uint8Array(binary.length);
-                    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
-                    dt.items.add(new File([bytes], item.name, { type: item.mime }));
-                }
-                input.files = dt.files;
-
-                const propsKey = Object.keys(input).find(key => key.startsWith('__reactProps$'));
-                if (propsKey && input[propsKey] && typeof input[propsKey].onChange === 'function') {
-                    const nativeEvent = new Event('change', { bubbles: true });
-                    input[propsKey].onChange({
-                        target: input,
-                        currentTarget: input,
-                        nativeEvent,
-                        preventDefault() {},
-                        stopPropagation() {},
-                        isDefaultPrevented() { return false; },
-                        isPropagationStopped() { return false; },
-                        persist() {},
-                    });
-                } else {
-                    input.dispatchEvent(new Event('input', { bubbles: true }));
-                    input.dispatchEvent(new Event('change', { bubbles: true }));
-                }
-                return { ok: true };
-            })()
-        `)), 'chatgpt image upload fallback');
+        const fallbackResult = await uploadChatGPTChunkedFiles(page, absPaths, 'input[type="file"]', imageMimeFromPath);
         if (fallbackResult && !fallbackResult.ok) return fallbackResult;
     }
 
@@ -2717,6 +2657,115 @@ export async function uploadChatGPTImages(page, imagePaths) {
     if (!ready) return { ok: false, reason: 'image upload preview did not appear' };
 
     return { ok: true, files: absPaths };
+}
+
+const CHATGPT_ATTACHMENT_CARD_JS = `
+    const attachmentCard = (node, scope) => {
+        let card = node;
+        for (let current = node; current && current !== scope; current = current.parentElement) {
+            if (current.matches('[class~="group/composer-attachment"]')) return current;
+            if (current.getAttribute('role') === 'group') card = current;
+        }
+        return card;
+    };
+`;
+
+/** Attach documents to the active composer and verify new, ready attachment chips. */
+export async function uploadChatGPTFiles(page, filePaths) {
+    const path = await import('node:path');
+    const prepared = await prepareChatGPTFilePaths(filePaths);
+    if (!prepared.ok) return prepared;
+    const names = prepared.paths.map(file => path.default.basename(file));
+    if (new Set(names).size !== names.length) return { ok: false, reason: 'Attachments must have distinct filenames' };
+    const target = requireObjectEvaluateResult(unwrapEvaluateResult(await page.evaluate(`(() => {
+        ${buildComposerLocatorScript()}
+        const composer = findComposer();
+        const scope = composer?.closest('form');
+        if (!scope) return { ok: false, reason: 'active composer form not found' };
+        document.querySelectorAll('[data-opencli-file-input]').forEach(node => node.removeAttribute('data-opencli-file-input'));
+        // A portal input is allowed only when it is the sole eligible input on the page.
+        document.querySelectorAll('[data-opencli-file-scope]').forEach(node => node.removeAttribute('data-opencli-file-scope'));
+        scope.setAttribute('data-opencli-file-scope', '1');
+        const fileTypes = ${JSON.stringify(prepared.paths.map(file => ({ ext: path.default.extname(file).toLowerCase(), mime: mimeFromFilePath(file) })))};
+        const acceptsFiles = node => {
+            if (node.disabled || node.hasAttribute('capture') || (fileTypes.length > 1 && !node.multiple)) return false;
+            const accept = (node.getAttribute('accept') || '').toLowerCase().split(',').map(value => value.trim()).filter(Boolean);
+            return !accept.length || fileTypes.every(file => accept.some(type => type === '*/*' || type === file.ext || type === file.mime || type.endsWith('/*') && file.mime.startsWith(type.slice(0, -1))));
+        };
+        const local = Array.from(scope.querySelectorAll('input[type="file"]')).filter(acceptsFiles);
+        const inputs = local.length ? local : Array.from(document.querySelectorAll('input[type="file"]'))
+            .filter(node => acceptsFiles(node) && !node.closest('form, [role="dialog"], [data-project-home-sources-surface]'));
+        if (inputs.length !== 1) return { ok: false, reason: 'file input is missing or ambiguous' };
+        inputs[0].setAttribute('data-opencli-file-input', '1');
+        ${CHATGPT_ATTACHMENT_CARD_JS}
+        scope.querySelectorAll('[role="group"][aria-label], [data-composer-attachments] button[aria-label], [data-composer-attachments] [role="button"][aria-label]').forEach(node => attachmentCard(node, scope).setAttribute('data-opencli-existing-file', '1'));
+        return { ok: true };
+    })()`)), 'chatgpt file input targeting');
+    if (!target.ok) return target;
+    let uploaded = false;
+    if (typeof page.setFileInput === 'function') {
+        try {
+            await page.setFileInput(prepared.paths, '[data-opencli-file-input="1"]');
+            uploaded = true;
+        } catch (error) {
+            // These failures occur before native file assignment. Do not retry
+            // arbitrary transport failures that could have already uploaded.
+            if (!/Not allowed|not supported|Unknown action|fileChooserOpened not received/.test(String(error?.message || error))) throw error;
+        }
+    }
+    if (!uploaded) {
+        const fallbackResult = await uploadChatGPTChunkedFiles(page, prepared.paths, '[data-opencli-file-input="1"]', mimeFromFilePath);
+        if (fallbackResult && !fallbackResult.ok) return fallbackResult;
+    }
+
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+        await page.sleep(1);
+        const ready = requireBooleanEvaluateResult(unwrapEvaluateResult(await page.evaluate(`(() => {
+            ${buildComposerLocatorScript()}
+            const scope = document.querySelector('[data-opencli-file-scope="1"]');
+            if (!scope || findComposer()?.closest('form') !== scope) return false;
+            ${CHATGPT_ATTACHMENT_CARD_JS}
+            const names = ${JSON.stringify(names)};
+            const chips = Array.from(scope.querySelectorAll('[role="group"][aria-label], [data-composer-attachments] button[aria-label], [data-composer-attachments] [role="button"][aria-label]')).filter(node => {
+                if (node.closest('[data-opencli-existing-file]') || node.closest('[hidden], [aria-hidden="true"]')) return false;
+                const card = attachmentCard(node, scope);
+                if (!isVisible(node) || card.matches('[aria-busy="true"]') || card.querySelector('[role="progressbar"], [aria-busy="true"], [role="alert"]')) return false;
+                for (let ancestor = node; ancestor; ancestor = ancestor.parentElement) {
+                    const style = getComputedStyle(ancestor);
+                    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+                }
+                return true;
+            });
+            const assigned = new Map();
+            const matchesName = (label, name) => {
+                if (label === name) return true;
+                const dot = name.lastIndexOf('.');
+                const base = dot > 0 ? name.slice(0, dot) : name;
+                const ext = dot > 0 ? name.slice(dot) : '';
+                if (!label.startsWith(base) || !label.endsWith(ext)) return false;
+                const suffix = label.slice(base.length, ext ? -ext.length : undefined).trim();
+                return /^\\(\\d+\\)$/.test(suffix);
+            };
+            const assign = (nameIndex, seen) => {
+                const name = names[nameIndex];
+                const candidates = chips.filter(node => matchesName(node.getAttribute('aria-label') || '', name));
+                candidates.sort((a, b) => Number(b.getAttribute('aria-label') === name) - Number(a.getAttribute('aria-label') === name));
+                for (const node of candidates) {
+                    const card = attachmentCard(node, scope);
+                    if (seen.has(card)) continue;
+                    seen.add(card);
+                    if (!assigned.has(card) || assign(assigned.get(card), seen)) {
+                        assigned.set(card, nameIndex);
+                        return true;
+                    }
+                }
+                return false;
+            };
+            return names.every((_, index) => assign(index, new Set()));
+        })()`)), 'chatgpt file attachment readiness');
+        if (ready) return { ok: true, files: prepared.paths };
+    }
+    return { ok: false, reason: 'new ready attachment chips did not appear in the active composer; prompt was not sent' };
 }
 
 /**
@@ -2741,14 +2790,6 @@ export async function isGenerating(page) {
                     || label.includes('停止生成')
                     || label.includes('正在思考')) return true;
             }
-            // 2026 markup: the composer's stop control lost data-testid="stop-button"
-            // and is labelled just "停止" / "Stop" (idle state is the voice button).
-            const composerForm = document.querySelector('form');
-            if (composerForm) {
-                for (const button of composerForm.querySelectorAll('button[aria-label]')) {
-                    if (/^(停止|stop)(?![a-z])/i.test((button.getAttribute('aria-label') || '').trim())) return true;
-                }
-            }
             // The "正在思考 / Thinking" pill can render as plain text without an
             // aria-label. Scope the text scan to small containers and use
             // textContent (does not trigger layout) instead of body.innerText.
@@ -2759,7 +2800,7 @@ export async function isGenerating(page) {
             // [data-message-author-role] nodes when articles are absent.
             // Bare 'Thinking' only counts inside the last turn — the composer
             // area shows 'Thinking' as an idle model label.
-            const turns = document.querySelectorAll('article[data-testid*="conversation-turn"]');
+            const turns = document.querySelectorAll('article[data-testid*="conversation-turn"], [data-chatgpt-search-unit-key]');
             const messages = turns.length ? turns : document.querySelectorAll('[data-message-author-role]');
             if (messages.length) scopes.push([messages[messages.length - 1], /正在思考|停止生成|Thinking/]);
             const composer = document.querySelector('#prompt-textarea, [aria-label="Chat with ChatGPT"]');
@@ -2930,6 +2971,10 @@ export async function getChatGPTVisibleImageUrls(page) {
  * Wait for new images to appear after sending a prompt.
  */
 export async function waitForChatGPTImages(page, beforeUrls, timeoutSeconds, convUrl) {
+    // Local draft IDs are replaced by persisted IDs after submission. Reloading
+    // one discards the active rendering surface instead of restoring the chat.
+    const hasStableConversation = convUrl && convUrl.includes('/c/')
+        && !/\/c\/local-chatgpt(?::|%3A)/i.test(convUrl);
     const beforeSet = new Set(beforeUrls);
     const pollIntervalSeconds = 3;
     const maxPolls = Math.max(1, Math.ceil(timeoutSeconds / pollIntervalSeconds));
@@ -2941,7 +2986,7 @@ export async function waitForChatGPTImages(page, beforeUrls, timeoutSeconds, con
         await page.sleep(i === 0 ? 3 : pollIntervalSeconds);
 
         let currentUrl = '';
-        if (convUrl && convUrl.includes('/c/')) {
+        if (hasStableConversation) {
             currentUrl = unwrapEvaluateResult(await page.evaluate('window.location.href').catch(() => ''));
             if (currentUrl && !isSameChatGPTConversation(currentUrl, convUrl)) {
                 await page.goto(convUrl);
@@ -2953,7 +2998,7 @@ export async function waitForChatGPTImages(page, beforeUrls, timeoutSeconds, con
         stillRendering = generating;
         if (generating) continue;
 
-        if (convUrl && convUrl.includes('/c/') && i > 0 && i % 5 === 0) {
+        if (hasStableConversation && i > 0 && i % 5 === 0) {
             const onConversation = !currentUrl || isSameChatGPTConversation(currentUrl, convUrl);
             if (onConversation) {
                 await page.goto(convUrl);
@@ -3008,7 +3053,7 @@ export async function getProjectList(page) {
     // Ensure sidebar is open
     const openSidebar = requireBooleanEvaluateResult(unwrapEvaluateResult(await page.evaluate(`(() => {
         const button = Array.from(document.querySelectorAll('button'))
-            .find((node) => /open sidebar/i.test(node.getAttribute('aria-label') || ''));
+            .find((node) => /^(?:open|show) sidebar$|^(?:打开|展开)(?:侧边栏|边栏)$/i.test(node.getAttribute('aria-label') || ''));
         if (button instanceof HTMLElement) {
             button.click();
             return true;
@@ -3362,7 +3407,7 @@ export async function uploadChatGPTProjectFiles(page, projectId, filePaths) {
                 break;
             } catch (err) {
                 const msg = String(err?.message || err);
-                if (!msg.includes('Unknown action') && !msg.includes('not supported') && !msg.includes('Not allowed') && !msg.includes('No element found')) {
+                if (!msg.includes('Unknown action') && !msg.includes('not supported') && !msg.includes('Not allowed') && !msg.includes('No element found') && !msg.includes('fileChooserOpened not received')) {
                     throw err;
                 }
             }

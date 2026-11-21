@@ -2,11 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { getRegistry } from '@jackwener/opencli/registry';
 import './follow.js';
 describe('zhihu follow', () => {
-    it('registers as a cookie browser command', () => {
-        const cmd = getRegistry().get('zhihu/follow');
-        expect(cmd).toBeDefined();
-        expect(cmd.strategy).toBe('cookie');
-    });
+
     it('follows via API and returns result', async () => {
         const cmd = getRegistry().get('zhihu/follow');
         const page = {

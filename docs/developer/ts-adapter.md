@@ -47,6 +47,83 @@ cli({
 });
 ```
 
+## Pipeline JSON Requests
+
+The `fetch` pipeline step can send JSON request bodies from Node or the browser
+session. Define a `body` alongside an explicit HTTP method:
+
+```typescript
+pipeline: [
+  {
+    fetch: {
+      url: 'https://example.com/graphql',
+      method: 'POST',
+      body: {
+        query: 'query Search($term: String!, $limit: Int!) { search(term: $term, limit: $limit) { id title } }',
+        variables: {
+          term: '${{ args.query }}',
+          limit: '${{ args.limit }}',
+        },
+      },
+    },
+  },
+  { select: 'data.search' },
+]
+```
+
+Body templates support nested objects and arrays. A full expression keeps its
+value type, so numbers, booleans, arrays, objects and `null` remain JSON values.
+Use `body: '${{ data }}'` to send the previous step's complete result. Strings
+inside values returned by expressions are treated as data, without another
+template evaluation pass.
+
+Bodies are JSON-encoded exactly once, including scalar strings. The step adds
+`Content-Type: application/json` unless a content-type header is already present
+(case-insensitive). It preserves explicit headers. GET and HEAD requests cannot
+have a body; an omitted body sends no payload. A body that resolves to `undefined`
+or cannot be JSON-serialized fails before any request is sent. Raw text, form data
+and file uploads are not supported by this JSON request option.
+
+### Per-item Requests
+
+Set `forEach: true` to issue one request per element of the preceding step's
+array, including when every request uses the same URL:
+
+```typescript
+pipeline: [
+  { fetch: 'https://example.com/catalog' },
+  { select: 'entries' },
+  {
+    fetch: {
+      url: 'https://example.com/graphql',
+      method: 'POST',
+      forEach: true,
+      concurrency: 3,
+      params: { language: '${{ args.language }}' },
+      headers: { 'X-Request-Index': '${{ index }}' },
+      body: {
+        query: 'query Detail($id: ID!) { entry(id: $id) { id title } }',
+        variables: { id: '${{ item.id }}' },
+      },
+    },
+  },
+]
+```
+
+URLs, query parameters, headers and bodies all receive the same per-item context:
+`item` is the current element, `index` is zero-based, `data` is the complete input
+array, and `args` contains command arguments. `forEach: true` requires an array;
+an empty array produces `[]` without making requests. Use `forEach: false` to
+force a single request, for example to send an entire array as one JSON body.
+When omitted, existing implicit per-item URL fetching continues to apply.
+
+Concurrency defaults to 5 and must be a positive integer. Results retain input
+order even if requests finish out of order. Batch HTTP or network failures occupy
+their result slot as `{ error: '...' }`; successful requests are not repeated.
+Body serialization completes before sending begins, so an undefined or
+unserializable body fails the whole batch before any requests are issued.
+Browser batches run in one evaluation and include the browser's credentials.
+
 ## Access Metadata
 
 Every adapter must declare `access: 'read' | 'write'`.
@@ -105,6 +182,30 @@ adapter site tab and keeps that tab open until it is explicitly closed. Users
 can override the adapter default with `--site-session ephemeral` or force
 persistence with `--site-session persistent`.
 
+A persistent site tab is shared, so concurrent persistent commands for one site
+can navigate each other's page. Users who batch a site can instead pool it with
+`OPENCLI_SITE_SLOTS` (for example `xiaohongshu:1:1500-3000`): each command run
+borrows one of `poolSize` persistent slot sessions (`site:<site>#<n>`, one warm
+tab each) for its whole duration, reads included, and waits in a daemon-side
+queue when every slot is busy. A command's `--timeout` covers the queue wait and
+the run together; without one, the wait alone is capped at 60s. The optional interval spaces slot grants start-to-start, so the
+pace applies per command run rather than per navigation. A waiting command that
+exits leaves the queue. When a holder stops sending commands for longer than the
+session-lease TTL, its slot can go to the next waiting run. Commands from expired
+or released runs are rejected until they acquire a slot again. Adapters need no changes to be pooled.
+
+All adapter tabs share one automation window, and only its active tab renders.
+A pooled run brings its slot tab to the front when it starts, but another
+command opening a tab during the run (or a second slot of the same site) puts it
+in the background, where rAF and IntersectionObserver-driven lazy loading stall.
+Keep `poolSize` at `1` for render-dependent commands.
+Slot pools require Browser Bridge; direct CDP callers can opt out with
+`--site-session ephemeral`. Pool sizes are limited to 1–32 and intervals/wait
+budgets to 2,147,483,647 ms. Concurrent callers must use the same policy while a
+pool has active runs or waiters. A policy can change after the pool is idle.
+Manual slot-session commands are rejected while a run holds that slot; runs
+must acquire their own slot and cannot reuse a run identity in another pool.
+
 ## The `page` Object
 
 The `page` parameter provides browser interaction methods:
@@ -144,13 +245,13 @@ Use the `opencli-adapter-author` skill plus the `opencli browser *` primitives t
 
 ```bash
 # Recon on the target site
-opencli browser open https://example.com
-opencli browser network
-opencli browser state
+opencli browser --session research open https://example.com
+opencli browser --session research network
+opencli browser --session research state
 
 # Scaffold + verify
-opencli browser init mysite/trending
-opencli browser verify mysite/trending
+opencli adapter init mysite/trending
+opencli adapter test mysite/trending
 ```
 
 See [AI Workflow](/developer/ai-workflow) for the full loop and the adapter-author skill for the step-by-step runbook.

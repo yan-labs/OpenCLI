@@ -16,13 +16,13 @@ import { log } from './logger.js';
 export type HookName = 'onStartup' | 'onBeforeExecute' | 'onAfterExecute';
 
 export interface HookContext {
-  /** Command full name in "site/name" format, or "__startup__" for onStartup */
+  /** Command name: "site/name", "browser/<action>" (including nested actions), or "__startup__". */
   command: string;
   /** Coerced and validated arguments */
   args: Record<string, unknown>;
-  /** Epoch ms when execution started (set by executeCommand) */
+  /** Epoch ms when command execution started. */
   startedAt?: number;
-  /** Epoch ms when execution finished (set by executeCommand) */
+  /** Epoch ms when command execution finished. */
   finishedAt?: number;
   /** Error thrown by the command, if execution failed */
   error?: unknown;

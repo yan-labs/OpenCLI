@@ -13,12 +13,10 @@ function makePage(result) {
 describe('reddit whoami command', () => {
     const command = getRegistry().get('reddit/whoami');
 
-    it('registers with the expected shape', () => {
-        expect(command).toBeDefined();
-        expect(command.access).toBe('read');
-        expect(command.browser).toBe(true);
-        expect(command.columns).toEqual(['field', 'value']);
-        expect(command.args).toEqual([]);
+    it('is not overwritten when the login module loads later', async () => {
+        await import('./auth.js');
+        expect(getRegistry().get('reddit/whoami')).toBe(command);
+        expect(getRegistry().get('reddit/login')).toBeDefined();
     });
 
     it('throws AuthRequiredError on 401/403 from /api/me.json', async () => {

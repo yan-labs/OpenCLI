@@ -4,6 +4,7 @@ import './followers.js';
 import './following.js';
 import './profile.js';
 import './save.js';
+import './search.js';
 import './unfollow.js';
 import { getRegistry } from '@jackwener/opencli/registry';
 
@@ -13,6 +14,15 @@ import { getRegistry } from '@jackwener/opencli/registry';
  */
 async function runCommandEvaluate(commandName, fetchFn, replacements) {
     const cmd = getRegistry().get('instagram/' + commandName);
+    if (cmd.func) {
+        const args = Object.fromEntries(Object.entries(replacements).map(([key, value]) => [key.match(/args\.(\w+)/)[1], JSON.parse(value)]));
+        const page = { goto: vi.fn(), evaluate: async script => new Function('fetch', `return (${script})`)(async (...args) => {
+            const response = await fetchFn(...args);
+            return { ...response, text: response.text ?? (async () => JSON.stringify(await response.json())) };
+        }) };
+        return cmd.func(page, args);
+    }
+
     let js = cmd.pipeline.find((s) => s.evaluate).evaluate;
     for (const [placeholder, value] of Object.entries(replacements)) {
         js = js.split(placeholder).join(value);
@@ -519,6 +529,8 @@ describe('instagram business-account endpoint fallback', () => {
                         following_count: 510,
                         media_count: 1493,
                         is_verified: true,
+                        profile_pic_url: 'https://scontent.cdninstagram.com/biz_150.jpg',
+                        hd_profile_pic_url_info: { url: 'https://scontent.cdninstagram.com/biz_1080.jpg' },
                     },
                 }),
             });
@@ -535,6 +547,7 @@ describe('instagram business-account endpoint fallback', () => {
             following: 510,
             posts: 1493,
             verified: 'Yes',
+            avatar_url: 'https://scontent.cdninstagram.com/biz_1080.jpg',
         }]);
         expect(fetchFn.mock.calls[2][0]).toContain('/api/v1/users/4213518589/info/');
     });
@@ -552,6 +565,8 @@ describe('instagram business-account endpoint fallback', () => {
                         edge_follow: { count: 20 },
                         edge_owner_to_timeline_media: { count: 30 },
                         is_verified: false,
+                        profile_pic_url: 'https://scontent.cdninstagram.com/p_150.jpg',
+                        profile_pic_url_hd: 'https://scontent.cdninstagram.com/p_320.jpg',
                     },
                 },
             }),
@@ -561,7 +576,7 @@ describe('instagram business-account endpoint fallback', () => {
             '${{ args.username | json }}': JSON.stringify('personal'),
         });
 
-        expect(result[0]).toMatchObject({ username: 'personal', followers: 10, following: 20, posts: 30 });
+        expect(result[0]).toMatchObject({ username: 'personal', followers: 10, following: 20, posts: 30, avatar_url: 'https://scontent.cdninstagram.com/p_320.jpg' });
         expect(fetchFn).toHaveBeenCalledTimes(1);
     });
 
@@ -627,5 +642,40 @@ describe('instagram business-account endpoint fallback', () => {
             '${{ args.username | json }}': JSON.stringify('bizaccount'),
             '${{ args.index }}': '1',
         })).rejects.toThrow('Instagram save returned no success evidence');
+    });
+});
+
+describe('instagram avatar_url', () => {
+    const profileArgs = { '${{ args.username | json }}': JSON.stringify('nopic') };
+
+    it('profile returns an empty avatar_url when Instagram sends none or a non-https value', async () => {
+        const fetchFn = vi.fn().mockResolvedValueOnce({
+            ok: true,
+            json: () => Promise.resolve({
+                data: { user: { username: 'nopic', full_name: '', biography: '', profile_pic_url: 'javascript:alert(1)' } },
+            }),
+        });
+        const result = await runCommandEvaluate('profile', fetchFn, profileArgs);
+        expect(result[0].avatar_url).toBe('');
+    });
+
+    it('search returns each user\'s profile photo URL', async () => {
+        const fetchFn = vi.fn().mockResolvedValueOnce({
+            ok: true,
+            json: () => Promise.resolve({
+                users: [
+                    { user: { username: 'nasa', full_name: 'NASA', is_verified: true, is_private: false, profile_pic_url: 'https://scontent.cdninstagram.com/nasa.jpg' } },
+                    { user: { username: 'nopic', full_name: 'No Pic', is_verified: false, is_private: true } },
+                ],
+            }),
+        });
+        const result = await runCommandEvaluate('search', fetchFn, {
+            '${{ args.query | json }}': JSON.stringify('nasa'),
+            '${{ args.limit }}': '5',
+        });
+        expect(result).toEqual([
+            { rank: 1, username: 'nasa', name: 'NASA', verified: 'Yes', private: 'No', avatar_url: 'https://scontent.cdninstagram.com/nasa.jpg', url: 'https://www.instagram.com/nasa' },
+            { rank: 2, username: 'nopic', name: 'No Pic', verified: 'No', private: 'Yes', avatar_url: '', url: 'https://www.instagram.com/nopic' },
+        ]);
     });
 });

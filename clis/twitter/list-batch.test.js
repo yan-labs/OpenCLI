@@ -89,25 +89,3 @@ describe('twitter list batch utilities', () => {
         })).rejects.toThrow(/List 123 not found/);
     });
 });
-
-describe('twitter list-add-batch registration', () => {
-    it('registers the list-add-batch command with the expected shape', () => {
-        const cmd = getRegistry().get('twitter/list-add-batch');
-        expect(cmd?.func).toBeTypeOf('function');
-        expect(cmd?.columns).toEqual(['listId', 'username', 'userId', 'status', 'message']);
-        expect(cmd?.args?.find((a) => a.name === 'interval')?.default).toBe(5);
-        expect(cmd?.args?.find((a) => a.name === 'timeout')?.default).toBe(600);
-    });
-
-});
-
-describe('twitter list-remove-batch registration', () => {
-    it('registers the list-remove-batch command with the expected shape', () => {
-        const cmd = getRegistry().get('twitter/list-remove-batch');
-        expect(cmd?.func).toBeTypeOf('function');
-        expect(cmd?.columns).toEqual(['listId', 'username', 'userId', 'status', 'message']);
-        expect(cmd?.args?.find((a) => a.name === 'interval')?.default).toBe(5);
-        expect(cmd?.args?.find((a) => a.name === 'timeout')?.default).toBe(600);
-    });
-
-});

@@ -5,42 +5,7 @@ import './posts.js';
 import './read.js';
 import './search.js';
 describe('tieba commands', () => {
-    it('registers all tieba commands as TypeScript adapters', () => {
-        const hot = getRegistry().get('tieba/hot');
-        const posts = getRegistry().get('tieba/posts');
-        const search = getRegistry().get('tieba/search');
-        const read = getRegistry().get('tieba/read');
-        expect(hot).toBeDefined();
-        expect(posts).toBeDefined();
-        expect(search).toBeDefined();
-        expect(read).toBeDefined();
-        expect(typeof hot?.func).toBe('function');
-        expect(typeof posts?.func).toBe('function');
-        expect(typeof search?.func).toBe('function');
-        expect(typeof read?.func).toBe('function');
-    });
-    it('keeps the intended browser strategies', () => {
-        const hot = getRegistry().get('tieba/hot');
-        const posts = getRegistry().get('tieba/posts');
-        const search = getRegistry().get('tieba/search');
-        const read = getRegistry().get('tieba/read');
-        expect(hot?.strategy).toBe(Strategy.PUBLIC);
-        expect(posts?.strategy).toBe(Strategy.COOKIE);
-        expect(search?.strategy).toBe(Strategy.COOKIE);
-        expect(read?.strategy).toBe(Strategy.COOKIE);
-        expect(hot?.browser).toBe(true);
-        expect(posts?.browser).toBe(true);
-        expect(search?.browser).toBe(true);
-        expect(read?.browser).toBe(true);
-    });
-    it('keeps the public limit contract at 20 items for list commands', () => {
-        const hot = getRegistry().get('tieba/hot');
-        const posts = getRegistry().get('tieba/posts');
-        const search = getRegistry().get('tieba/search');
-        expect(hot?.args.find((arg) => arg.name === 'limit')?.default).toBe(20);
-        expect(posts?.args.find((arg) => arg.name === 'limit')?.default).toBe(20);
-        expect(search?.args.find((arg) => arg.name === 'limit')?.default).toBe(20);
-    });
+
     it('rejects tieba read results when navigation lands on the wrong page number', async () => {
         const read = getRegistry().get('tieba/read');
         expect(read).toBeDefined();

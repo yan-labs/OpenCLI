@@ -220,6 +220,21 @@ describe('web/read stdout behavior', () => {
 });
 
 describe('web/read render-aware helpers', () => {
+    it('selects substantial main content over unrelated article cards without widening a real article', () => {
+        const cases = [
+            { html: `<main><p>${'PRIMARY '.repeat(300)}</p></main><aside><article>${'RELATED '.repeat(50)}</article><article>${'OTHER '.repeat(40)}</article></aside>`, present: 'PRIMARY', absent: 'RELATED' },
+            { html: `<main><article><p>${'PRIMARY '.repeat(100)}</p></article><aside>${'RELATED '.repeat(400)}</aside></main>`, present: 'PRIMARY', absent: 'RELATED' },
+        ];
+        for (const { html, present, absent } of cases) {
+            const dom = new JSDOM(html, { url: 'https://example.com/post', runScripts: 'outside-only' });
+            try {
+                const result = dom.window.eval(__test__.buildRenderAwareExtractorJs({ frames: 'none' }));
+                expect(result.contentHtml).toContain(present);
+                expect(result.contentHtml).not.toContain(absent);
+            } finally { dom.window.close(); }
+        }
+    });
+
     it('merges accessible same-origin iframe bodies into the extracted HTML', () => {
         const dom = new JSDOM(`
           <main>

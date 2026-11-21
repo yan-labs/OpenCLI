@@ -2,26 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { getRegistry } from '@jackwener/opencli/registry';
 import './timeline.js';
 const { parseMetric, buildPostId, mergeTimelinePosts } = await import('./timeline.js').then((m) => m.__test__);
-describe('linkedin timeline adapter', () => {
-    const command = getRegistry().get('linkedin/timeline');
-    it('registers the command with correct shape', () => {
-        expect(command).toBeDefined();
-        expect(command.site).toBe('linkedin');
-        expect(command.name).toBe('timeline');
-        expect(command.domain).toBe('www.linkedin.com');
-        expect(command.strategy).toBe('cookie');
-        expect(command.browser).toBe(true);
-        expect(typeof command.func).toBe('function');
-    });
-    it('has limit arg with default 20', () => {
-        const limitArg = command.args.find((a) => a.name === 'limit');
-        expect(limitArg).toBeDefined();
-        expect(limitArg.default).toBe(20);
-    });
-    it('includes expected columns', () => {
-        expect(command.columns).toEqual(expect.arrayContaining(['author', 'text', 'reactions', 'comments', 'url']));
-    });
-});
+
 describe('parseMetric', () => {
     it('parses plain numbers', () => {
         expect(parseMetric('42')).toBe(42);

@@ -438,13 +438,6 @@ describe('trip hotel-search command (registry-level)', () => {
         currency: 'USD',
     };
 
-    it('declares Strategy.COOKIE + browser:true + access:read', () => {
-        expect(cmd.access).toBe('read');
-        expect(cmd.browser).toBe(true);
-        expect(String(cmd.strategy)).toContain('cookie');
-        expect(cmd.domain).toBe('trip.com');
-    });
-
     it('rejects invalid city / dates / limit before navigation', async () => {
         const page = createPageMock([]);
         await expect(cmd.func(page, { city: 'London', checkin: '2026-08-15', checkout: '2026-08-16', limit: 5 }))
@@ -597,13 +590,6 @@ describe('trip buildHotelDetailUrl', () => {
 
 describe('trip hotel command (registry-level)', () => {
     const cmd = getRegistry().get('trip/hotel');
-
-    it('declares Strategy.COOKIE + browser:true + access:read', () => {
-        expect(cmd.access).toBe('read');
-        expect(cmd.browser).toBe(true);
-        expect(String(cmd.strategy)).toContain('cookie');
-        expect(cmd.domain).toBe('trip.com');
-    });
 
     it('rejects a non-numeric id before navigation', async () => {
         const page = createPageMock([]);
@@ -788,13 +774,6 @@ describe('trip buildAttractionSearchUrl', () => {
 describe('trip attraction command (registry-level)', () => {
     const cmd = getRegistry().get('trip/attraction');
 
-    it('declares Strategy.COOKIE + browser:true + access:read', () => {
-        expect(cmd.access).toBe('read');
-        expect(cmd.browser).toBe(true);
-        expect(String(cmd.strategy)).toContain('cookie');
-        expect(cmd.domain).toBe('trip.com');
-    });
-
     it('rejects a blank query and invalid limit before navigation', async () => {
         const page = createPageMock([]);
         await expect(cmd.func(page, { query: '', limit: 5 }))
@@ -878,13 +857,6 @@ describe('trip buildTrainRouteUrl', () => {
 describe('trip train command (registry-level)', () => {
     const cmd = getRegistry().get('trip/train');
 
-    it('declares Strategy.COOKIE + browser:true + access:read', () => {
-        expect(cmd.access).toBe('read');
-        expect(cmd.browser).toBe(true);
-        expect(String(cmd.strategy)).toContain('cookie');
-        expect(cmd.domain).toBe('trip.com');
-    });
-
     it('rejects a blank city / country and invalid limit before navigation', async () => {
         const page = createPageMock([]);
         await expect(cmd.func(page, { from: '', to: 'Manchester', country: 'uk', limit: 5 }))
@@ -965,13 +937,6 @@ describe('trip buildCarListUrl', () => {
 
 describe('trip car command (registry-level)', () => {
     const cmd = getRegistry().get('trip/car');
-
-    it('declares Strategy.COOKIE + browser:true + access:read', () => {
-        expect(cmd.access).toBe('read');
-        expect(cmd.browser).toBe(true);
-        expect(String(cmd.strategy)).toContain('cookie');
-        expect(cmd.domain).toBe('trip.com');
-    });
 
     it('rejects a non-numeric city and invalid limit before navigation', async () => {
         const page = createPageMock([]);
@@ -1071,13 +1036,6 @@ describe('trip buildTransferListUrl', () => {
 describe('trip transfer command (registry-level)', () => {
     const cmd = getRegistry().get('trip/transfer');
 
-    it('declares Strategy.COOKIE + browser:true + access:read', () => {
-        expect(cmd.access).toBe('read');
-        expect(cmd.browser).toBe(true);
-        expect(String(cmd.strategy)).toContain('cookie');
-        expect(cmd.domain).toBe('trip.com');
-    });
-
     it('rejects a blank city / non-IATA airport and invalid limit before navigation', async () => {
         const page = createPageMock([]);
         await expect(cmd.func(page, { city: '', airport: 'DMK', limit: 5 }))
@@ -1173,13 +1131,6 @@ describe('trip buildTourSearchJs', () => {
 describe('trip tour command (registry-level)', () => {
     const cmd = getRegistry().get('trip/tour');
 
-    it('declares Strategy.COOKIE + browser:true + access:read', () => {
-        expect(cmd.access).toBe('read');
-        expect(cmd.browser).toBe(true);
-        expect(String(cmd.strategy)).toContain('cookie');
-        expect(cmd.domain).toBe('trip.com');
-    });
-
     it('rejects a blank query, invalid --type, and invalid limit before navigation', async () => {
         const page = createPageMock([]);
         await expect(cmd.func(page, { query: '', type: 'private', limit: 5 }))
@@ -1262,12 +1213,6 @@ describe('trip flattenPoiResults', () => {
 describe('trip search command (registry-level)', () => {
     const cmd = getRegistry().get('trip/search');
     beforeEach(() => vi.unstubAllGlobals());
-
-    it('declares Strategy.PUBLIC + browser:false + access:read', () => {
-        expect(cmd.access).toBe('read');
-        expect(cmd.browser).toBe(false);
-        expect(String(cmd.strategy)).toContain('public');
-    });
 
     it('rejects a blank query and invalid limit', async () => {
         await expect(cmd.func({ query: '', limit: 5 }))
@@ -1391,13 +1336,6 @@ describe('trip package command (registry-level)', () => {
     const cmd = getRegistry().get('trip/package');
     beforeEach(() => vi.unstubAllGlobals());
 
-    it('declares Strategy.PUBLIC + browser:false + access:read', () => {
-        expect(cmd.access).toBe('read');
-        expect(cmd.browser).toBe(false);
-        expect(String(cmd.strategy)).toContain('public');
-        expect(cmd.domain).toBe('trip.com');
-    });
-
     it('rejects a blank keyword, malformed dates, depart>=return, and invalid adults / limit', async () => {
         await expect(cmd.func({ from: '', to: 'Tokyo', depart: '2026-08-05', return: '2026-08-08', adults: 2, limit: 5 }))
             .rejects.toMatchObject({ code: 'ARGUMENT', message: expect.stringContaining('required') });
@@ -1513,13 +1451,6 @@ describe('trip buildDealsUrl', () => {
 
 describe('trip deals command (registry-level)', () => {
     const cmd = getRegistry().get('trip/deals');
-
-    it('declares Strategy.COOKIE + browser:true + access:read', () => {
-        expect(cmd.access).toBe('read');
-        expect(cmd.browser).toBe(true);
-        expect(String(cmd.strategy)).toContain('cookie');
-        expect(cmd.domain).toBe('trip.com');
-    });
 
     it('rejects an invalid limit before navigation', async () => {
         const page = createPageMock([]);

@@ -110,20 +110,36 @@ async function fetchBrowse(apiKey, body) {
  * Extract video objects from playlistVideoRenderer items (playlists, watch-later).
  * Pure function — inject into page.evaluate() via: extractPlaylistVideos.toString()
  */
-export function extractPlaylistVideos(items) {
+export function extractPlaylistVideos(items, offset = 0) {
     return items
-        .filter(i => i.playlistVideoRenderer)
-        .map(i => {
-        const v = i.playlistVideoRenderer;
-        const infoRuns = v.videoInfo?.runs || [];
+        .filter(i => i.playlistVideoRenderer || (i.lockupViewModel?.contentType === 'LOCKUP_CONTENT_TYPE_VIDEO' && i.lockupViewModel.contentId))
+        .map((item, index) => {
+        const v = item.playlistVideoRenderer;
+        if (v) {
+            const infoRuns = v.videoInfo?.runs || [];
+            return {
+                rank: parseInt(v.index?.simpleText || String(offset + index + 1), 10),
+                title: v.title?.runs?.[0]?.text || '',
+                channel: v.shortBylineText?.runs?.[0]?.text || '',
+                duration: v.lengthText?.simpleText || '',
+                views: infoRuns[0]?.text || '',
+                published: infoRuns[2]?.text || '',
+                url: 'https://www.youtube.com/watch?v=' + v.videoId,
+            };
+        }
+        const lockup = item.lockupViewModel;
+        const metadata = lockup.metadata?.lockupMetadataViewModel;
+        const rows = metadata?.metadata?.contentMetadataViewModel?.metadataRows || [];
+        const badges = (lockup.contentImage?.thumbnailViewModel?.overlays || [])
+            .flatMap(overlay => overlay.thumbnailBottomOverlayViewModel?.badges || []);
         return {
-            rank: parseInt(v.index?.simpleText || '0', 10),
-            title: v.title?.runs?.[0]?.text || '',
-            channel: v.shortBylineText?.runs?.[0]?.text || '',
-            duration: v.lengthText?.simpleText || '',
-            views: infoRuns[0]?.text || '',
-            published: infoRuns[2]?.text || '',
-            url: 'https://www.youtube.com/watch?v=' + v.videoId,
+            rank: offset + index + 1,
+            title: metadata?.title?.content || '',
+            channel: rows[0]?.metadataParts?.[0]?.text?.content || '',
+            duration: badges.find(badge => badge.thumbnailBadgeViewModel?.text)?.thumbnailBadgeViewModel.text || '',
+            views: rows[1]?.metadataParts?.[0]?.text?.content || '',
+            published: rows[1]?.metadataParts?.[1]?.text?.content || '',
+            url: 'https://www.youtube.com/watch?v=' + lockup.contentId,
         };
     });
 }
@@ -217,4 +233,31 @@ export async function readYoutubeSapisid(page) {
     || cookies.find((c) => c.name === 'SAPISID')?.value
     || null
   );
+}
+
+/**
+ * Depth-first search for the first value stored under `key` anywhere inside a
+ * nested InnerTube payload (objects and arrays). Returns `undefined` when the
+ * key is absent. YouTube renames renderer wrappers often, so callers look for
+ * the leaf key instead of hard-coding the full path.
+ *
+ * Pure — safe to inject into page.evaluate() via `findKeyDeep.toString()`.
+ */
+export function findKeyDeep(value, key) {
+    const stack = [value];
+    while (stack.length) {
+        const current = stack.pop();
+        if (!current || typeof current !== 'object') continue;
+        if (!Array.isArray(current) && Object.prototype.hasOwnProperty.call(current, key)) {
+            return current[key];
+        }
+        const children = Array.isArray(current) ? current : Object.values(current);
+        for (let i = children.length - 1; i >= 0; i -= 1) stack.push(children[i]);
+    }
+    return undefined;
+}
+
+/** True when `id` has the shape of a YouTube video id (11 URL-safe chars). */
+export function isYoutubeVideoId(id) {
+    return typeof id === 'string' && /^[A-Za-z0-9_-]{11}$/.test(id);
 }

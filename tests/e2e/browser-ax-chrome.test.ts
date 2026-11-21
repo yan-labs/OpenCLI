@@ -6,11 +6,14 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer, type WebSocket } from 'ws';
+import { CDPBridge } from '../../src/browser/cdp.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '../..');
-const EXTENSION_DIR = path.join(ROOT, 'extension');
-const DAEMON_PORT = 19825;
+// Overrides apply only to this test harness, allowing an isolated extension copy
+// to run beside a developer's normal Browser Bridge daemon.
+const EXTENSION_DIR = process.env.OPENCLI_E2E_EXTENSION_DIR || path.join(ROOT, 'extension');
+const DAEMON_PORT = Number(process.env.OPENCLI_E2E_BRIDGE_PORT || 19825);
 
 type Command = {
   id: string;
@@ -19,6 +22,12 @@ type Command = {
   surface?: 'browser' | 'adapter';
   page?: string;
   url?: string;
+  code?: string;
+  files?: string[];
+  selector?: string;
+  windowMode?: 'foreground' | 'background';
+  retainIncomplete?: boolean;
+  pattern?: string;
   cdpMethod?: string;
   cdpParams?: Record<string, unknown>;
 };
@@ -39,6 +48,8 @@ type FakeBridge = {
 
 type TestSite = {
   url: string;
+  navigationRequests: Map<string, number>;
+  releaseCapture: () => void;
   close: () => Promise<void>;
 };
 
@@ -141,9 +152,63 @@ async function startFakeBridge(): Promise<FakeBridge | null> {
 }
 
 async function startTestSite(): Promise<TestSite> {
+  const navigationRequests = new Map<string, number>();
+  const pending = new Set<ServerResponse>();
+  const releaseCapture = () => { for (const res of pending) res.end('true}'); pending.clear(); };
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     const url = new URL(req.url ?? '/', 'http://a.opencli.test');
+    if (url.pathname === '/slow-navigation' || url.pathname === '/slow-redirect') {
+      navigationRequests.set(url.href, (navigationRequests.get(url.href) ?? 0) + 1);
+      // Keep the first navigation pending beyond lease creation's 300/500ms
+      // waits. Chromium can reject a second identical in-flight navigation.
+      const timer = setTimeout(() => {
+        if (url.pathname === '/slow-redirect') {
+          res.writeHead(302, { Location: `/navigation-done${url.search}` });
+          res.end();
+        } else {
+          res.end('<!doctype html><title>Navigation done</title>Loaded');
+        }
+      }, 1500);
+      res.on('close', () => clearTimeout(timer));
+      return;
+    }
+    if (url.pathname === '/navigation-done') {
+      res.end('<!doctype html><title>Navigation done</title>Redirected');
+      return;
+    }
+    if (url.pathname === '/capture-start') {
+      res.writeHead(302, { Location: '/capture-held' });
+      res.end();
+      return;
+    }
+    if (url.pathname === '/capture-held') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.write('{"done":');
+      pending.add(res);
+      res.on('close', () => pending.delete(res));
+      return;
+    }
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    if (url.pathname === '/upload') {
+      res.end(`<!doctype html>
+        <style>.zero { width:0; height:0; opacity:0 }</style>
+        <input type="file" id="visible">
+        <input type="file" id="display" style="display:none">
+        <input type="file" id="zero" class="zero">
+        <input type="file" id="multiple" multiple>
+        <div style="display:none"><input type="file" id="ancestor"></div>
+        <input type="file" id="overlay" style="opacity:0; width:100px; height:30px">
+        <input type="file" id="hidden" hidden>
+        <input type="file" id="disabled" disabled style="display:none">
+        <script>
+          window.uploadEvents = [];
+          for (const type of ['input', 'change']) document.addEventListener(type, event => {
+            window.uploadEvents.push({ id:event.target.id, type, trusted:event.isTrusted,
+              files:Array.from(event.target.files || [], file => file.name) });
+          });
+        </script>`);
+      return;
+    }
     if (url.pathname === '/same-frame') {
       res.end('<!doctype html><button>Same Frame Button</button>');
       return;
@@ -166,6 +231,8 @@ async function startTestSite(): Promise<TestSite> {
   const port = addressPort(server);
   return {
     url: `http://a.opencli.test:${port}/`,
+    navigationRequests,
+    releaseCapture,
     close: async () => {
       await new Promise<void>((resolve, reject) => {
         server.close((err) => err ? reject(err) : resolve());
@@ -215,12 +282,14 @@ function launchChrome(chromePath: string, userDataDir: string, startUrl: string)
       ? ['--headless=new']
       : []),
     `--user-data-dir=${userDataDir}`,
+    '--remote-debugging-port=0',
     `--disable-extensions-except=${EXTENSION_DIR}`,
     `--load-extension=${EXTENSION_DIR}`,
     '--disable-features=DisableLoadExtensionCommandLineSwitch',
     '--enable-unsafe-extension-debugging',
     '--host-resolver-rules=MAP a.opencli.test 127.0.0.1,MAP b.opencli.test 127.0.0.1',
     '--site-per-process',
+    '--no-proxy-server',
     '--no-first-run',
     '--no-default-browser-check',
     '--disable-background-networking',
@@ -298,8 +367,8 @@ describe('Browser Bridge AX real Chrome smoke', () => {
     bridge = await startFakeBridge();
     if (!bridge) {
       skipReason = process.env.CI
-        ? 'Port 19825 is already in use in CI'
-        : 'Port 19825 is already in use; stop opencli daemon before running this e2e smoke locally';
+        ? `Port ${DAEMON_PORT} is already in use in CI`
+        : `Port ${DAEMON_PORT} is already in use; use an isolated extension copy and OPENCLI_E2E_BRIDGE_PORT locally`;
       return;
     }
 
@@ -341,6 +410,169 @@ describe('Browser Bridge AX real Chrome smoke', () => {
       }
     }
   });
+
+  it.each([false, true])('navigates slow adapter pages once with network capture=%s', async (capture) => {
+    if (skipReason) throw new Error(skipReason);
+    const session = { session: `navigation-${capture}`, surface: 'adapter' as const };
+    const command = async (cmd: Omit<Command, 'id'>) => {
+      const result = await bridge!.sendCommand({ ...cmd, ...session });
+      expect(result.ok, result.error).toBe(true);
+      return result;
+    };
+    // Fresh lease, reused placeholder, then another navigation after CDP
+    // attachment. Capture mirrors --trace without relying on a public site.
+    try {
+      for (let run = 0; run < 3; run++) {
+        if (capture) await command({ action: 'network-capture-start' });
+        const target = new URL(`${run === 2 ? '/slow-redirect' : '/slow-navigation'}?capture=${capture}&run=${run}`, site!.url);
+        const expected = run === 2 ? new URL(`/navigation-done${target.search}`, site!.url).href : target.href;
+        const nav = await command({ action: 'navigate', url: target.href });
+        expect(nav.data).toMatchObject({ url: expected, timedOut: false, title: 'Navigation done' });
+        expect(await command({ action: 'exec', page: nav.page, code: 'location.href' }))
+          .toMatchObject({ data: expected, page: nav.page });
+        expect(site!.navigationRequests.get(new URL(target.pathname + target.search, 'http://a.opencli.test').href)).toBe(1);
+        if (run === 0) await command({ action: 'close-window' });
+      }
+    } finally {
+      await command({ action: 'close-window' });
+    }
+  }, 30_000);
+
+  it('retains a redirected streaming response across reads in both backends', async () => {
+    if (skipReason) {
+      if (shouldFailOnBridgeUnavailable()) throw new Error(skipReason);
+      console.warn(`skipped — ${skipReason}`);
+      return;
+    }
+    const script = `(() => { void fetch('/capture-start', { method: 'POST', body: 'original payload' }).then(r => r.text()); return true; })()`;
+    const port = fs.readFileSync(path.join(userDataDir, 'DevToolsActivePort'), 'utf8').split('\n')[0];
+    const direct = new CDPBridge();
+    try {
+      const page = await direct.connect({ cdpEndpoint: `http://127.0.0.1:${port}` });
+      for (const backend of ['direct', 'extension']) {
+        const session = `capture-${backend}-${Date.now()}`;
+        const command = async (cmd: Omit<Command, 'id'>) => {
+          const result = await bridge!.sendCommand({ ...cmd, session, surface: 'browser' });
+          expect(result.ok, result.error).toBe(true);
+          return result.data;
+        };
+        if (backend === 'direct') {
+          await page.goto(new URL('/same-frame', site!.url).href);
+          expect(await page.evaluate('location.href')).toBe(new URL('/same-frame', site!.url).href);
+          await page.startNetworkCapture?.('capture-');
+          await page.evaluate(script);
+        } else {
+          await command({ action: 'navigate', url: new URL('/same-frame', site!.url).href });
+          await command({ action: 'network-capture-start', pattern: 'capture-' });
+          await command({ action: 'exec', code: script });
+        }
+        const read = async () => (backend === 'direct'
+          ? await page.readNetworkCapture?.({ retainIncomplete: true })
+          : await command({ action: 'network-capture-read', retainIncomplete: true })) as Array<Record<string, unknown>>;
+        const poll = async (complete: boolean) => {
+          let lastEntries: Array<Record<string, unknown>> = [];
+          for (let i = 0; i < 100; i++) {
+            const entries = await read();
+            lastEntries = entries;
+            const entry = entries.find(item => item.responseStatus === 200 && (item.captureComplete === true) === complete);
+            if (entry) { expect(entries).toHaveLength(1); return entry; }
+            await new Promise(resolve => setTimeout(resolve, 50));
+          }
+          throw new Error(`${backend}: missing ${complete ? 'completed' : 'incomplete'} capture: ${JSON.stringify(lastEntries)}`);
+        };
+        const early = await poll(false);
+        expect(early.responsePreview).toBeUndefined();
+        site!.releaseCapture();
+        const final = await poll(true);
+        expect(final).toMatchObject({ requestId: early.requestId, method: 'POST', requestBodyPreview: 'original payload', responsePreview: '{"done":true}' });
+        expect(await read()).toEqual([]);
+      }
+    } finally {
+      site!.releaseCapture();
+      await direct.close();
+    }
+  }, 60_000);
+
+  it('closes only the owned tab through the real cleanup protocol', async () => {
+    if (skipReason) {
+      if (shouldFailOnBridgeUnavailable()) throw new Error(skipReason);
+      console.warn(`skipped — ${skipReason}`);
+      return;
+    }
+    const suffix = Date.now();
+    const borrowed = { session: `borrowed-${suffix}`, surface: 'browser' as const };
+    const bound = await bridge!.sendCommand({ action: 'bind', ...borrowed });
+    expect(bound.ok, bound.error).toBe(true);
+    const first = { session: `cleanup-first-${suffix}`, surface: 'adapter' as const };
+    const second = { session: `cleanup-second-${suffix}`, surface: 'adapter' as const };
+    const nav = await bridge!.sendCommand({ action: 'navigate', ...first, url: site!.url });
+    const other = await bridge!.sendCommand({ action: 'navigate', ...second, url: site!.url });
+    expect(nav.ok, nav.error).toBe(true);
+    expect(other.ok, other.error).toBe(true);
+    const targets = async () => {
+      const port = fs.readFileSync(path.join(userDataDir, 'DevToolsActivePort'), 'utf8').split('\n')[0];
+      const response = await fetch(`http://127.0.0.1:${port}/json/list`);
+      expect(response.ok).toBe(true);
+      return (await response.json() as Array<{ id: string }>).map(target => target.id);
+    };
+    expect(await targets()).toContain(nav.page);
+    expect(await targets()).toContain(bound.page);
+    const closed = await bridge!.sendCommand({ action: 'close-owned-tab', ...first });
+    expect(closed).toMatchObject({ ok: true, data: { tabCleanup: 'closed-owned-tab' } });
+    expect(await targets()).not.toContain(nav.page);
+    expect(await targets()).toContain(other.page);
+    expect(await targets()).toContain(bound.page);
+    expect(await bridge!.sendCommand({ action: 'close-owned-tab', ...first }))
+      .toMatchObject({ ok: true, data: { tabCleanup: 'no-owned-tab' } });
+    expect(await bridge!.sendCommand({ action: 'close-owned-tab', ...borrowed }))
+      .toMatchObject({ ok: true, data: { tabCleanup: 'no-owned-tab' } });
+    expect(await targets()).toContain(bound.page);
+    expect(await bridge!.sendCommand({ action: 'exec', ...second, page: other.page, code: 'document.title' }))
+      .toMatchObject({ ok: true });
+    expect(await bridge!.sendCommand({ action: 'close-owned-tab', ...second }))
+      .toMatchObject({ ok: true, data: { tabCleanup: 'closed-owned-tab' } });
+    expect(await targets()).not.toContain(other.page);
+    expect(await targets()).toContain(bound.page);
+  }, 60_000);
+
+  it('uploads through the real extension chooser on visible and hidden inputs without changing styles', async () => {
+    if (skipReason) {
+      if (shouldFailOnBridgeUnavailable()) throw new Error(skipReason);
+      console.warn(`skipped — ${skipReason}`);
+      return;
+    }
+    const one = path.join(userDataDir, 'one.txt');
+    const two = path.join(userDataDir, 'two.txt');
+    fs.writeFileSync(one, 'one');
+    fs.writeFileSync(two, 'two');
+    const session = { session: `upload-smoke-${Date.now()}`, surface: 'browser' as const };
+    for (const [index, id] of ['visible', 'display', 'zero', 'multiple', 'ancestor', 'overlay', 'hidden', 'disabled', 'visible'].entries()) {
+      const nav = await bridge!.sendCommand({ action: 'navigate', ...session,
+        url: new URL(`/upload?case=${index}`, site!.url).href, windowMode: 'background' });
+      expect(nav.ok, nav.error).toBe(true);
+      const evaluate = async (expression: string) => {
+        const result = await bridge!.sendCommand({ action: 'exec', ...session, page: nav.page, code: expression });
+        expect(result.ok, result.error).toBe(true);
+        return result.data;
+      };
+      const markup = await evaluate(`document.querySelector('#${id}').outerHTML`);
+      const files = id === 'multiple' ? [one, two] : [one];
+      const uploaded = await bridge!.sendCommand({ action: 'set-file-input', ...session,
+        page: nav.page, selector: `#${id}`, files });
+      if (id === 'disabled') {
+        expect(uploaded.ok).toBe(false);
+        expect(uploaded.error).toContain('Page.fileChooserOpened not received');
+      } else {
+        expect(uploaded.ok, `${id}: ${uploaded.error}`).toBe(true);
+        const expectedNames = files.map(file => path.basename(file));
+        expect(await evaluate(`Array.from(document.querySelector('#${id}').files, file => file.name)`)).toEqual(expectedNames);
+        expect(await evaluate('window.uploadEvents')).toEqual(['input', 'change'].map(type => ({
+          id, type, trusted: true, files: expectedNames,
+        })));
+      }
+      expect(await evaluate(`document.querySelector('#${id}').outerHTML`)).toBe(markup);
+    }
+  }, 90_000);
 
   it('returns AX nodes for parent and same-origin iframe, and probes cross-origin frame support', async () => {
     if (skipReason) {

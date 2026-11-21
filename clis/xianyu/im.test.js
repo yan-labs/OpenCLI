@@ -184,13 +184,6 @@ describe('xianyu im shared helpers', () => {
         ]);
     });
 
-
-    it('registers reply as an explicit write command', () => {
-        const command = getRegistry().get('xianyu/reply');
-        expect(command?.access).toBe('write');
-        expect(command?.columns).toEqual(['status', 'peer_name', 'item_title', 'price', 'location', 'message']);
-    });
-
     it('builds chat URLs and requires post-submit message evidence', async () => {
         expect(buildChatUrl('10001', '90001')).toBe('https://www.goofish.com/im?itemId=10001&peerUserId=90001');
 

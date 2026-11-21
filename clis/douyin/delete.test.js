@@ -39,13 +39,6 @@ describe('douyin delete registration', () => {
         vi.useRealTimers();
     });
 
-    it('registers the delete command', () => {
-        const registry = getRegistry();
-        const values = [...registry.values()];
-        const cmd = values.find(c => c.site === 'douyin' && c.name === 'delete');
-        expect(cmd).toBeDefined();
-    });
-
     it('uses work_list id/index matching instead of title matching for fallback deletion', () => {
         const source = readFileSync(new URL('./delete.js', import.meta.url), 'utf8');
         expect(source).toContain('target_not_unique');

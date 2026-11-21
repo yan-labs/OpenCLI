@@ -1,14 +1,11 @@
 import { cli, Strategy } from '@jackwener/opencli/registry';
 import { ArgumentError, CommandExecutionError } from '@jackwener/opencli/errors';
-import { log } from '@jackwener/opencli/logger';
 import {
     CHATGPT_DOMAIN,
     CHATGPT_URL,
-    clearChatGPTStaleToolChips,
     currentChatGPTUrl,
     ensureChatGPTComposer,
     ensureOnChatGPT,
-    getChatGPTConversationSources,
     getChatGPTResponsePairCounts,
     getVisibleMessages,
     normalizeBooleanFlag,
@@ -42,7 +39,7 @@ export const askCommand = cli({
     site: 'chatgpt',
     name: 'ask',
     access: 'write',
-    description: 'Send a prompt to ChatGPT web and wait for the response; sources lists the web pages the answer cites',
+    description: 'Send a prompt to ChatGPT web and wait for the response',
     domain: CHATGPT_DOMAIN,
     strategy: Strategy.COOKIE,
     browser: true,
@@ -56,9 +53,9 @@ export const askCommand = cli({
         { name: 'project', valueRequired: true, help: 'Start a new chat inside a ChatGPT project ID or /g/g-p-<id> URL' },
         { name: 'wait', type: 'boolean', default: true, help: 'Wait for the assistant response after sending' },
         { name: 'deep-research', type: 'boolean', default: false, help: 'Enable ChatGPT 深度研究 (Deep Research)' },
-        { name: 'web-search', type: 'boolean', default: false, help: 'Turn on ChatGPT 网页搜索 (Web Search) from the composer + menu before sending. The model can also search on its own when the prompt asks it to' },
+        { name: 'web-search', type: 'boolean', default: false, help: 'Enable ChatGPT 网页搜索 (Web Search)' },
     ],
-    columns: ['conversationId', 'conversationUrl', 'tool', 'response', 'sources', 'searchedCount'],
+    columns: ['conversationId', 'conversationUrl', 'tool', 'response'],
     func: async (page, kwargs) => {
         const prompt = requireNonEmptyPrompt(kwargs.prompt, 'chatgpt ask');
         const timeout = requirePositiveInt(
@@ -101,12 +98,7 @@ export const askCommand = cli({
         // startNewChat / ensureOnChatGPT now wait for the composer selector
         // after navigating, so the previous standalone 2 s settle is redundant.
         await ensureChatGPTComposer(page, 'ChatGPT ask requires a logged-in ChatGPT session with a visible composer.');
-        let selectedTool = null;
-        if (tool) {
-            selectedTool = await selectChatGPTTool(page, tool);
-        } else {
-            await clearChatGPTStaleToolChips(page);
-        }
+        const selectedTool = tool ? await selectChatGPTTool(page, tool) : null;
 
         const settleStart = Date.now();
         while (await isGenerating(page)) {
@@ -126,24 +118,12 @@ export const askCommand = cli({
 
         const { conversationId, conversationUrl } = await waitForConversationUrl(page);
         if (!shouldWait) {
-            return [{ conversationId, conversationUrl, tool: selectedTool?.Tool ?? '', response: '', sources: [], searchedCount: 0 }];
+            return [{ conversationId, conversationUrl, tool: selectedTool?.Tool ?? '', response: '' }];
         }
         const response = await waitForChatGPTResponse(page, baseline, prompt, timeout, {
             baselinePairCounts,
             conversationUrl,
         });
-        // Cited web pages live in the conversation payload, not in the DOM text.
-        const found = await getChatGPTConversationSources(page, conversationId);
-        if (found.error && !found.finished) {
-            log.warn(`ChatGPT sources unavailable for ${conversationId}: ${found.error}`);
-        }
-        return [{
-            conversationId,
-            conversationUrl,
-            tool: selectedTool?.Tool ?? '',
-            response,
-            sources: found.sources,
-            searchedCount: found.searchedCount,
-        }];
+        return [{ conversationId, conversationUrl, tool: selectedTool?.Tool ?? '', response }];
     },
 });

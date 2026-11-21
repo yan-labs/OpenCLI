@@ -135,6 +135,8 @@ Returns `rank`, `name`, `headline`, `location`, and `profile_url` from the rende
 
 ### `posts`
 
+Activity cards can be located through their post permalinks when legacy card classes are absent. Each inferred container must identify a single post. A page with post permalinks but no supported cards reports a layout error rather than an empty profile.
+
 Exports visible rows from a LinkedIn profile activity page. It opens `/in/me/recent-activity/all/` by default, or accepts `--profile-url https://www.linkedin.com/in/<handle>/`.
 
 Returns `rank`, `author`, `posted_at`, `body`, `reactions`, `comments`, `reposts`, `impressions`, `media`, `media_urls`, `url`, and `raw_text`. `media_urls` only includes non-decorative media or external link URLs that LinkedIn exposes in the rendered card; profile photos and reaction sprites are filtered out.

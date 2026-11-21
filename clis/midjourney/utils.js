@@ -530,31 +530,68 @@ export async function waitForCompletedJob(page, jobId, timeoutSeconds) {
   );
 }
 
-async function fetchMediaThroughPage(page, url, expectedMimePrefix) {
+// cdn.midjourney.com is behind a Cloudflare managed challenge. A cross-origin
+// fetch from www.midjourney.com is answered intermittently with 403 text/html
+// ("Just a moment...") even for objects that exist, and with the same 403 for
+// objects that do not, so the status cannot tell a block from a miss. A tab on
+// the CDN origin fetching same-origin is not challenged and reports a missing
+// object as 404/422.
+const CDN_MISSING_STATUSES = new Set([404, 410, 422]);
+const CDN_RETRY_DELAYS_SECONDS = [2, 5, 10];
+const isCdnBlock = (status) => status === 403 || status === 429 || status >= 500;
+
+class MediaNotFoundError extends CommandExecutionError {}
+
+async function enterCdnOrigin(page, url) {
+  const currentOrigin = async () => unwrapEvaluateResult(await page.evaluate(() => window.location.origin));
+  if (await currentOrigin() === MIDJOURNEY_CDN) return;
+  await page.goto(url);
+  const origin = await currentOrigin();
+  if (origin !== MIDJOURNEY_CDN) throw new Error(`the tab is on ${origin || 'an unknown origin'}`);
+}
+
+async function fetchMediaThroughPage(page, url, expectedMimePrefix, jobId) {
   const transferKey = `opencli_media_${Date.now()}_${Math.random().toString(36).slice(2)}`;
   try {
-    let payload;
     try {
-      payload = unwrapEvaluateResult(await page.evaluate(async (mediaUrl, key) => {
-        // CDN is public but Cloudflare-protected. Browser-origin fetch succeeds
-        // with default same-origin credential mode; forcing cross-origin cookies
-        // turns it into a credentialed CORS request and Midjourney rejects it.
-        const response = await fetch(mediaUrl);
-        if (!response.ok) return { ok: false, status: response.status, type: response.headers.get('content-type') || '' };
-        const bytes = new Uint8Array(await response.arrayBuffer());
-        window[key] = bytes;
-        return {
-          ok: true,
-          status: response.status,
-          type: response.headers.get('content-type') || '',
-          size: bytes.length,
-        };
-      }, url, transferKey));
+      await enterCdnOrigin(page, url);
     } catch (error) {
-      throw new CommandExecutionError(`Midjourney browser-context media fetch failed: ${errorMessage(error)}`);
+      throw new CommandExecutionError(`Could not open the Midjourney CDN origin: ${errorMessage(error)}`);
     }
-    if (!payload || typeof payload !== 'object' || !payload.ok) {
-      throw new CommandExecutionError(`Midjourney media download failed: HTTP ${payload?.status ?? 0} from ${url}`);
+    let payload;
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        payload = unwrapEvaluateResult(await page.evaluate(async (mediaUrl, key) => {
+          const response = await fetch(mediaUrl);
+          if (!response.ok) return { ok: false, status: response.status, type: response.headers.get('content-type') || '' };
+          const bytes = new Uint8Array(await response.arrayBuffer());
+          window[key] = bytes;
+          return {
+            ok: true,
+            status: response.status,
+            type: response.headers.get('content-type') || '',
+            size: bytes.length,
+          };
+        }, url, transferKey));
+      } catch (error) {
+        throw new CommandExecutionError(`Midjourney browser-context media fetch failed: ${errorMessage(error)}`);
+      }
+      if (payload && typeof payload === 'object' && payload.ok) break;
+      const status = Number(payload?.status ?? 0);
+      if (CDN_MISSING_STATUSES.has(status)) {
+        throw new MediaNotFoundError(`Midjourney media not found: HTTP ${status} from ${url}`);
+      }
+      if (!isCdnBlock(status) || attempt >= CDN_RETRY_DELAYS_SECONDS.length) {
+        throw new CommandExecutionError(
+          `Midjourney media download failed: HTTP ${status} from ${url}`,
+          isCdnBlock(status)
+            ? `The CDN is challenging or throttling requests, not reporting a missing file. Wait a while, then re-run \`opencli midjourney download ${jobId}\`. If this came from generate, the job already exists and its credits are spent, so do not run generate again.`
+            : undefined,
+        );
+      }
+      // A numeric wait() only waits for the DOM to settle, which on a bare
+      // image or video document is ~0.5 s; {time} is a real sleep.
+      await page.wait({ time: CDN_RETRY_DELAYS_SECONDS[attempt] });
     }
     if (!String(payload.type || '').startsWith(expectedMimePrefix)) {
       throw new CommandExecutionError(`Midjourney media download returned unexpected content type "${payload.type || 'unknown'}"`);
@@ -635,30 +672,40 @@ async function downloadOne(page, jobId, index, outputDir, force) {
     { url: `${MIDJOURNEY_CDN}/${jobId}/0_${index}.webp`, extension: '.webp', mime: 'image/webp' },
   ];
   if (!force) {
-    for (const candidate of candidates) {
-      const filePath = path.join(outputDir, `${jobId}_${index}${candidate.extension}`);
-      try {
-        const existing = await existingMedia(filePath, false, candidate.mime);
-        if (existing) {
-          return { index, filePath, bytes: existing.size, url: candidate.url, mime: candidate.mime, cached: true };
-        }
-      } catch {}
-    }
+    // Only the PNG original counts as a cache hit: a lone .jpg/.webp on disk may
+    // be a lower-quality derivative saved while the PNG probe was being blocked.
+    const [original] = candidates;
+    const filePath = path.join(outputDir, `${jobId}_${index}${original.extension}`);
+    try {
+      const existing = await existingMedia(filePath, false, original.mime);
+      if (existing) {
+        return { index, filePath, bytes: existing.size, url: original.url, mime: original.mime, cached: true };
+      }
+    } catch {}
   }
 
   let media = null;
   let resolved = null;
-  let lastError = null;
   for (const candidate of candidates) {
     try {
-      media = await fetchMediaThroughPage(page, candidate.url, 'image/');
+      media = await fetchMediaThroughPage(page, candidate.url, 'image/', jobId);
       resolved = candidate;
       break;
     } catch (error) {
-      lastError = error;
+      // Only a confirmed miss moves on to the next format. A block or transport
+      // error must surface instead of silently saving a lower-quality derivative.
+      if (!(error instanceof MediaNotFoundError)) throw error;
     }
   }
-  if (!media || !resolved) throw lastError || new CommandExecutionError(`No Midjourney original image was available for ${jobId}`);
+  if (!media || !resolved) {
+    throw new CommandExecutionError(
+      `No Midjourney original image was available for ${jobId} index ${index + 1}`,
+      `Tried ${candidates.map((candidate) => candidate.extension).join(', ')}; the job may have been deleted.`,
+    );
+  }
+  if (resolved !== candidates[0]) {
+    log.warn(`Midjourney PNG original not found for ${jobId} index ${index + 1}; saved ${resolved.extension} instead`);
+  }
   const actualMime = sniffMediaMime(media.buffer);
   if (!actualMime?.startsWith('image/')) {
     throw new CommandExecutionError(`Midjourney original image returned invalid media bytes from ${resolved.url}`);
@@ -714,7 +761,7 @@ export async function downloadRawVideo(page, jobId, index, outputDir, force = fa
   const filePath = path.join(outputDir, `${jobId}_${index + 1}_raw.mp4`);
   const existing = await existingMedia(filePath, force, 'video/mp4');
   if (existing) return { index, kind: 'video-raw', filePath, bytes: existing.size, url, mime: 'video/mp4', cached: true };
-  const media = await fetchMediaThroughPage(page, url, 'video/');
+  const media = await fetchMediaThroughPage(page, url, 'video/', jobId);
   const actualMime = sniffMediaMime(media.buffer);
   if (actualMime !== 'video/mp4') {
     throw new CommandExecutionError(`Midjourney raw video returned invalid MP4 bytes from ${url}`);

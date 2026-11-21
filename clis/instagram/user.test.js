@@ -2,23 +2,12 @@ import { describe, expect, it, vi } from 'vitest';
 import { getRegistry } from '@jackwener/opencli/registry';
 import './user.js';
 
-function getUserEvaluateJs() {
-  const cmd = getRegistry().get('instagram/user');
-  const evalStep = cmd.pipeline.find((s) => s.evaluate);
-  return evalStep.evaluate;
-}
-
 async function runUserEvaluate(fetchFn, args = { username: 'sleepcycleapp', limit: 2 }) {
-  const js = getUserEvaluateJs()
-    .replace('${{ args.username | json }}', JSON.stringify(args.username))
-    .replace('${{ args.limit }}', String(args.limit));
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = fetchFn;
-  try {
-    return await eval(js);
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
+  const page = { goto: vi.fn(), evaluate: async script => new Function('fetch', `return (${script})`)(async (...args) => {
+    const response = await fetchFn(...args);
+    return { ...response, text: response.text ?? (async () => JSON.stringify(await response.json())) };
+  }) };
+  return getRegistry().get('instagram/user').func(page, args);
 }
 
 describe('instagram/user feed fetch', () => {
@@ -59,8 +48,8 @@ describe('instagram/user feed fetch', () => {
     ]);
   });
 
-  it('keeps the login-oriented error for failed feed requests', async () => {
+  it('reports unsuccessful feed requests as typed HTTP failures', async () => {
     const fetchFn = vi.fn().mockResolvedValue({ ok: false, status: 400 });
-    await expect(runUserEvaluate(fetchFn)).rejects.toThrow('HTTP 400 - make sure you are logged in to Instagram');
+    await expect(runUserEvaluate(fetchFn)).rejects.toThrow('Instagram feed-by-username failed: HTTP 400');
   });
 });

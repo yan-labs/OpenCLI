@@ -1,3 +1,4 @@
+import { JSDOM } from 'jsdom';
 import { describe, expect, it, vi } from 'vitest';
 import { getRegistry } from '@jackwener/opencli/registry';
 import { CommandExecutionError } from '@jackwener/opencli/errors';
@@ -18,6 +19,20 @@ function makePage(evaluateResult) {
 }
 
 describe('linkedin company', () => {
+    it('reads current h2/sibling facts and legacy h1/definition-list layouts through the command', async () => {
+        for (const modern of [true, false]) {
+            const facts = [['Website', 'https://example.com'], ['Industry', 'Software'], ['Company size', '11-50 employees'], ['Headquarters', 'Paris'], ['Founded', '2020'], ['Specialties', 'Tools']];
+            const html = `<main><${modern ? 'h2' : 'h1'}>Example Corp</${modern ? 'h2' : 'h1'}><section><h2>Overview</h2><p>Useful tools.</p>${facts.map(([label, value]) => modern ? `<div><p><span>${label}</span></p><p>${value}</p></div>` : `<dl><dt>${label}</dt><dd>${value}</dd></dl>`).join('')}</section></main>`;
+            const dom = new JSDOM(html, { url: 'https://www.linkedin.com/company/example/about/', runScripts: 'outside-only' });
+            Object.defineProperty(dom.window.HTMLElement.prototype, 'innerText', { get() { return this.textContent; } });
+            const page = { goto: vi.fn(), wait: vi.fn(), evaluate: vi.fn().mockResolvedValueOnce(false).mockImplementation(script => dom.window.eval(script)) };
+            try {
+                const rows = await getRegistry().get('linkedin/company').func(page, { company: 'example' });
+                expect(rows[0]).toMatchObject({ name: 'Example Corp', industry: 'Software', size: '11-50 employees', headquarters: 'Paris', founded: '2020', website: 'https://example.com', specialties: 'Tools' });
+            } finally { dom.window.close(); }
+        }
+    });
+
     it('normalizes bare name, path, and URL to the about page', () => {
         expect(normalizeCompanyUrl('nvidia')).toBe('https://www.linkedin.com/company/nvidia/about/');
         expect(normalizeCompanyUrl('/company/nvidia')).toBe('https://www.linkedin.com/company/nvidia/about/');

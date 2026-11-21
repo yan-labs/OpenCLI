@@ -28,14 +28,6 @@ const sampleDraft = {
 };
 
 describe('xiaohongshu draft commands', () => {
-    it('registers draft commands with correct access and side-effect guard columns', () => {
-        expect(getRegistry().get('xiaohongshu/drafts')?.access).toBe('read');
-        expect(getRegistry().get('xiaohongshu/draft-open')?.access).toBe('read');
-        expect(getRegistry().get('xiaohongshu/draft-delete')?.access).toBe('write');
-        expect(getRegistry().get('xiaohongshu/draft-clear')?.access).toBe('write');
-        expect(getRegistry().get('xiaohongshu/draft-delete')?.columns).toEqual(['status', 'id', 'type', 'message']);
-        expect(getRegistry().get('xiaohongshu/draft-clear')?.columns).toEqual(['status', 'type', 'count', 'message']);
-    });
 
     it('rejects invalid draft types before browser navigation', async () => {
         const command = getRegistry().get('xiaohongshu/drafts');

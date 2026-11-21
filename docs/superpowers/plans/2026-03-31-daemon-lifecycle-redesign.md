@@ -554,7 +554,7 @@ In `src/cli.ts`, add the import at the top:
 import { daemonStatus, daemonStop, daemonRestart } from './commands/daemon.js';
 ```
 
-Add the daemon subcommand group before the `// ── External CLIs` section (around line 380):
+Add the daemon subcommand group before dynamic adapter command registration:
 
 ```typescript
   // ── Built-in: daemon ──────────────────────────────────────────────────────

@@ -27,6 +27,8 @@ function normalizePageUrl(value, path, requiredParams) {
             const values = url.searchParams.getAll(name);
             if (values.length !== 1 || (expected !== null && values[0] !== expected)) return '';
         }
+        const size = url.searchParams.get('limit');
+        if (!/^[1-9]\d*$/.test(size || '') || !Number.isSafeInteger(Number(size))) return '';
         return url.toString();
     } catch {
         return '';
@@ -132,7 +134,10 @@ async function fetchPages(page, options) {
     const { firstUrl, limit, label, role, expectedRootId = '', normalizeNext, notFoundDetail = '' } = options;
     const byId = new Map();
     const visited = new Set();
-    const maxPages = Math.ceil(limit / PAGE_SIZE) + PAGE_OVERLAP_ALLOWANCE;
+    // A server may shrink pages or return overlap. Bound total work by the
+    // requested unique records, and independently stop consecutive stalls.
+    const maxPages = limit + PAGE_OVERLAP_ALLOWANCE;
+    let stalledPages = 0;
     let pageCount = 0;
     let url = firstUrl;
     while (byId.size < limit) {
@@ -141,8 +146,13 @@ async function fetchPages(page, options) {
         visited.add(url);
         pageCount += 1;
         const payload = await fetchCommentPage(page, url, label, notFoundDetail);
+        const previousSize = byId.size;
         addPageComments(byId, payload.data, role, expectedRootId);
+        stalledPages = byId.size === previousSize ? stalledPages + 1 : 0;
         if (payload.paging.is_end || byId.size >= limit) break;
+        if (stalledPages >= PAGE_OVERLAP_ALLOWANCE) {
+            throw new CommandExecutionError(`Zhihu ${label} pagination made no progress`);
+        }
         url = normalizeNext(payload.paging.next);
         if (!url) throw new CommandExecutionError(`Zhihu ${label} pagination returned a malformed next URL`);
     }
@@ -158,7 +168,7 @@ export function fetchRootComments(page, answerId, order, limit) {
         role: 'root',
         normalizeNext: (next) => normalizePageUrl(next, path, {
             order_by: apiOrder,
-            limit: String(PAGE_SIZE),
+            limit: null,
             offset: null,
         }),
         notFoundDetail: `No Zhihu answer comments resource was found for ${answerId}.`,
@@ -172,7 +182,7 @@ async function fetchChildComments(page, rootId, limit) {
         label: 'answer child comments',
         role: 'child',
         expectedRootId: rootId,
-        normalizeNext: (next) => normalizePageUrl(next, path, { limit: String(PAGE_SIZE), offset: null }),
+        normalizeNext: (next) => normalizePageUrl(next, path, { limit: null, offset: null }),
     });
 }
 export async function fetchRepliesByRoot(page, roots, repliesLimit) {

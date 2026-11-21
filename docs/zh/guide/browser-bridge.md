@@ -6,13 +6,17 @@ OpenCLI 通过轻量级 **Browser Bridge** Chrome 扩展 + 微守护进程连接
 
 ## 扩展安装
 
-### 方法 1：下载预构建版本（推荐）
+### 方法 1：Chrome Web Store（推荐）
+
+在 [Chrome Web Store](https://chromewebstore.google.com/detail/opencli/ildkmabpimmkaediidaifkhjpohdnifk) 安装 **OpenCLI** 扩展。
+
+### 方法 2：下载预构建版本
 
 1. 前往 GitHub [Releases 页面](https://github.com/jackwener/opencli/releases) 下载最新的 `opencli-extension-v{version}.zip`。
 2. 解压后打开 `chrome://extensions`，启用**开发者模式**。
 3. 点击**加载已解压的扩展程序**，选择解压后的文件夹。
 
-### 方法 2：加载源码（开发者）
+### 方法 3：加载源码（开发者）
 
 1. 打开 `chrome://extensions`，启用**开发者模式**。
 2. 点击**加载已解压的扩展程序**，选择仓库中的 `extension/` 目录。
@@ -25,22 +29,22 @@ opencli doctor            # 检查扩展 + 守护进程连接
 
 ## 多 Tab 定位
 
-浏览器命令必须紧跟一个 `<session>` 位置参数。同一个多步骤流程使用同一个 session；并行任务使用不同 session 隔离。
+浏览器命令通过 `--session <name>` 指定页面 session。同一个多步骤流程使用同一个 session；并行任务使用不同 session 隔离。
 
 ```bash
-opencli browser baidu open https://www.baidu.com/
-opencli browser baidu tab list
-opencli browser baidu tab new https://www.baidu.com/
-opencli browser baidu eval --tab <targetId> 'document.title'
-opencli browser baidu tab select <targetId>
-opencli browser baidu get title
-opencli browser baidu tab close <targetId>
+opencli browser --session baidu open https://www.baidu.com/
+opencli browser --session baidu tab list
+opencli browser --session baidu tab new https://www.baidu.com/
+opencli browser --session baidu eval --tab <targetId> 'document.title'
+opencli browser --session baidu tab select <targetId>
+opencli browser --session baidu get title
+opencli browser --session baidu tab close <targetId>
 ```
 
 规则如下：
 
-- `opencli browser <session> open <url>` 和 `opencli browser <session> tab new [url]` 都会返回 `targetId`。
-- `opencli browser <session> tab list` 会打印当前已存在 tab 的 `targetId`。
+- `opencli browser --session <session> open <url>` 和 `opencli browser --session <session> tab new [url]` 都会返回 `targetId`。
+- `opencli browser --session <session> tab list` 会打印当前已存在 tab 的 `targetId`。
 - `--tab <targetId>` 会把单条 browser 命令路由到对应 tab。
 - `tab new` 只会新建 tab，不会改变默认浏览器目标。
 - `tab select <targetId>` 会把该 tab 设为后续未显式指定 target 的 `opencli browser ...` 命令默认目标。
@@ -51,20 +55,20 @@ opencli browser baidu tab close <targetId>
 如果你希望多条 `opencli browser` 命令持续操作同一个页面，请使用稳定的 session 名称：
 
 ```bash
-opencli browser my-session open https://example.com
-opencli browser my-session state
-opencli browser my-session extract "main"
+opencli browser --session my-session open https://example.com
+opencli browser --session my-session state
+opencli browser --session my-session extract "main"
 ```
 
 OpenCLI 拥有的 browser session 使用交互式 tab lease，默认空闲超时为 10 分钟。完成后可以显式释放：
 
 ```bash
-opencli browser my-session close
+opencli browser --session my-session close
 ```
 
-如果要把 OpenCLI 绑定到你已经手动打开的 Chrome tab，请使用 `opencli browser <session> bind`。绑定 session 没有 owned session 的 idle close 计时器，会一直保持到 `unbind`、tab 关闭、窗口关闭或 daemon 重启。对于 OpenCLI 自己创建的 owned session，使用 `--window foreground` 可以在可见自动化窗口里观察 OpenCLI 操作；使用 `--window background` 可以让这个自动化窗口留在后台。
+如果要把 OpenCLI 绑定到你已经手动打开的 Chrome tab，请使用 `opencli browser --session <session> bind`。绑定 session 没有 owned session 的 idle close 计时器，会一直保持到 `unbind`、tab 关闭、窗口关闭或 daemon 重启。对于 OpenCLI 自己创建的 owned session，使用 `--window foreground` 可以在可见自动化窗口里观察 OpenCLI 操作；使用 `--window background` 可以让这个自动化窗口留在后台。
 
-`OpenCLI Browser` 和 `OpenCLI Adapter` tab group 是扩展管理的自动化容器；请不要把自己的长期 tab 放进去，也不要重命名。
+`OpenCLI Browser` 和 `OpenCLI Adapter` tab group 是扩展管理的自动化容器；请不要把自己的长期 tab 放进去，也不要重命名。 最后一个 interactive lease 在仅有一个 tab 的窗口中释放时，会留下带有 OpenCLI 标记的闲置页面。浏览器重启或扩展更新后可恢复该闲置窗口。恢复不依赖 group 的标题或颜色，不会接管旧版无标记窗口、含实际内容或额外 tab 的窗口，也不会在重复标记间猜选；该机制不恢复活动页面或 session。
 
 ## Daemon 生命周期
 

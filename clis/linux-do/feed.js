@@ -14,6 +14,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { ArgumentError, AuthRequiredError, CommandExecutionError } from '@jackwener/opencli/errors';
 import { cli, Strategy } from '@jackwener/opencli/registry';
+import { BROWSER_JSON_SNIFF_FN, throwIfLoginWall } from '@jackwener/opencli/utils';
 import { toLocalTime } from './format.js';
 const LINUX_DO_HOME = 'https://linux.do';
 const LINUX_DO_METADATA_TTL_MS = 24 * 60 * 60 * 1000;
@@ -77,36 +78,40 @@ export async function fetchLinuxDoJson(page, apiPath, options = {}) {
     }
     if (!page)
         throw new CommandExecutionError('Browser page required');
-    const escapedPath = JSON.stringify(apiPath);
     const result = await page.evaluate(`(async () => {
+    ${BROWSER_JSON_SNIFF_FN}
     try {
-      const res = await fetch(${escapedPath}, { credentials: 'include' });
-      let data = null;
-      try { data = await res.json(); } catch {}
-      return {
-        ok: res.ok,
-        status: res.status,
-        data,
-        error: data === null ? 'Response is not valid JSON' : '',
-      };
+      const payload = await fetchJsonOrLoginWall(${JSON.stringify(apiPath)}, { credentials: 'include' });
+      if (payload?.__loginWall) return { kind: 'login-wall', sentinel: payload };
+      if (payload?.error) return { kind: 'http', status: payload.error };
+      return { kind: 'ok', data: payload };
     } catch (error) {
-      return {
-        ok: false,
-        error: error instanceof Error ? error.message : String(error),
-      };
+      return { kind: 'exception', detail: error instanceof Error ? error.message : String(error) };
     }
   })()`);
     if (!result) {
         throw new CommandExecutionError('linux.do returned an empty browser response');
     }
-    if (result.status === 401 || result.status === 403) {
-        throw new AuthRequiredError('linux.do', 'linux.do requires an active signed-in browser session');
+    if (result.kind === 'login-wall') {
+        throwIfLoginWall(result.sentinel, { url: apiPath });
     }
-    if (!result.ok) {
-        throw new CommandExecutionError(result.error || `linux.do request failed: HTTP ${result.status ?? 'unknown'}`);
+    if (result.kind === 'http') {
+        if (typeof result.status !== 'number') {
+            throw new CommandExecutionError('linux.do response reported a non-numeric HTTP status.');
+        }
+        if (result.status === 401 || result.status === 403) {
+            throw new AuthRequiredError('linux.do', `linux.do returned HTTP ${result.status}`);
+        }
+        const hint = result.status === 429
+            ? 'Stop retrying this channel and wait for the channel cooldown.'
+            : undefined;
+        throw new CommandExecutionError(`linux.do request failed: HTTP ${result.status ?? 'unknown'}`, hint);
     }
-    if (result.error) {
-        throw new CommandExecutionError(result.error, 'Please verify your linux.do session is still valid');
+    if (result.kind === 'exception') {
+        throw new CommandExecutionError(`linux.do request failed: ${result.detail}`);
+    }
+    if (result.kind !== 'ok') {
+        throw new CommandExecutionError(`Unexpected linux.do response: ${JSON.stringify(result)}`);
     }
     return result.data;
 }

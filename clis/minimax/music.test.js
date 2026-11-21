@@ -57,15 +57,6 @@ afterEach(() => {
 });
 
 describe('minimax music contract', () => {
-    it('registers one stable public write command without retired free models', () => {
-        const cmd = command();
-        expect(cmd).toMatchObject({ browser: false, strategy: 'public', access: 'write' });
-        const args = new Map(cmd.args.map((arg) => [arg.name, arg]));
-        expect(args.get('model')).toMatchObject({ default: 'music-3.0', choices: ['music-3.0', 'music-2.6'] });
-        expect(args.get('region').choices).toEqual(['global', 'cn']);
-        expect(args.get('execute').type).toBe('boolean');
-        expect(cmd.columns).toEqual(['status', 'model', 'region', 'output_format', 'audio_format', 'audio_url', 'file', 'expires_in_hours']);
-    });
 
     it.each([
         [{ prompt: 'x', lyrics: 'song' }, /--execute/],

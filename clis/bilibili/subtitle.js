@@ -13,7 +13,7 @@ cli({
         { name: 'lang', required: false, help: '字幕语言代码 (如 zh-CN, en-US, ai-zh)，默认取第一个' },
         { name: 'page', required: false, help: '分P 选集序号（从 1 开始）。多 P 视频取该集字幕；缺省取默认 P1' },
     ],
-    columns: ['index', 'from', 'to', 'content'],
+    columns: ['index', 'from', 'to', 'content', 'language', 'track_type'],
     func: async (page, kwargs) => {
         if (!page)
             throw new CommandExecutionError('Browser session required for bilibili subtitle');
@@ -123,6 +123,10 @@ cli({
         if (finalItems.length === 0) {
             throw new EmptyResultError('bilibili subtitle', '字幕文件中没有字幕片段。');
         }
+        const language = String(target.lan || '');
+        const aiType = target.ai_type;
+        const trackType = /^ai-/i.test(language) || (typeof aiType === 'number' && aiType > 0)
+            ? 'ai' : aiType === 0 ? 'cc' : 'unknown';
         // 5. 数据映射
         return finalItems.map((item, idx) => {
             const from = Number(item?.from);
@@ -134,7 +138,9 @@ cli({
                 index: idx + 1,
                 from: from.toFixed(2) + 's',
                 to: to.toFixed(2) + 's',
-                content: String(item.content ?? '')
+                content: String(item.content ?? ''),
+                language,
+                track_type: trackType
             };
         });
     },

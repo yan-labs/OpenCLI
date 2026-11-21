@@ -20,7 +20,7 @@ export const askCommand = cli({
         { name: 'prompt', positional: true, required: true, help: 'Prompt to send' },
         { name: 'timeout', type: 'int', default: 120, help: 'Max seconds to wait for response' },
         { name: 'new', type: 'boolean', default: false, help: 'Start a new chat before sending' },
-        { name: 'model', default: 'instant', choices: ['instant', 'expert', 'vision'], help: 'Model to use: instant, expert, or vision' },
+        { name: 'model', choices: ['instant', 'expert', 'vision'], help: 'Explicitly select a model; omitted uses the current DeepSeek model' },
         { name: 'think', type: 'boolean', default: false, help: 'Enable DeepThink mode' },
         { name: 'search', type: 'boolean', default: false, help: 'Enable web search' },
         { name: 'file', help: 'Attach a file (PDF, image, text) with the prompt' },
@@ -74,8 +74,8 @@ export const askCommand = cli({
             }
         }
 
-        // Model selector is only available on the new-chat page, not inside
-        // an existing conversation. Skip it when we resumed a prior thread.
+        // Only select a model when the caller explicitly requested one. The
+        // default model needs no UI action, and DeepSeek may hide the selector.
         const currentUrl = await page.evaluate('window.location.href') || '';
         const inConversation = currentUrl.includes('/a/chat/s/');
         const modelExplicit = kwargs.__opencliOptionSources?.model === 'cli';
@@ -89,7 +89,7 @@ export const askCommand = cli({
             );
         }
 
-        if (!inConversation) {
+        if (!inConversation && modelExplicit) {
             const modelResult = await withRetry(() => selectModel(page, wantModel));
             if (!modelResult?.ok) {
                 throw new CommandExecutionError(`Could not switch to ${wantModel} model`);

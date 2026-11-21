@@ -1,4 +1,4 @@
-import { AuthRequiredError, CommandExecutionError } from '@jackwener/opencli/errors';
+import { AuthRequiredError } from '@jackwener/opencli/errors';
 import { registerSiteAuthCommands } from '../_shared/site-auth.js';
 
 async function hasTiktokSessionCookie(page) {
@@ -20,6 +20,11 @@ async function verifyTiktokIdentity(page) {
       let data;
       try { data = JSON.parse(raw); } catch { return null; }
       const scope = data?.['__DEFAULT_SCOPE__'] || {};
+      const current = scope['webapp.app-context']?.user;
+      if (current && typeof current.secUid === 'string' && current.secUid.trim()
+          && typeof current.uniqueId === 'string' && current.uniqueId.trim()) {
+        return { sec_uid: current.secUid, username: current.uniqueId, nickname: String(current.nickname || current.nickName || '') };
+      }
       const seen = new Set();
       const stack = [scope];
       while (stack.length) {

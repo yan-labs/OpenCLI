@@ -17,7 +17,8 @@ const WHOAMI_PROBE = `(async () => {
     if (r.status === 401 || r.status === 403) return { kind: 'auth', detail: 'DeepSeek users/current HTTP ' + r.status };
     if (!r.ok) return { kind: 'http', httpStatus: r.status };
     const d = await r.json();
-    if (!d || d.code !== 0) return { kind: 'auth', detail: 'DeepSeek users/current code=' + String(d && d.code) + ' — anonymous' };
+    if (d?.code === 40002) return { kind: 'auth', detail: 'DeepSeek users/current reports an anonymous session' };
+    if (!d || d.code !== 0) return { kind: 'render-error', detail: 'DeepSeek users/current returned an unexpected status' };
     const u = (d.data && (d.data.biz_data || d.data.user || d.data)) || {};
     const userId = String(u.id || u.user_id || u.uuid || '');
     const name = String(u.name || u.nickname || u.username || '');
@@ -31,6 +32,10 @@ const WHOAMI_PROBE = `(async () => {
 async function verifyDeepseekIdentity(page) {
   await page.goto('https://chat.deepseek.com/');
   await page.wait(2);
+  return probeDeepseekIdentity(page);
+}
+
+async function probeDeepseekIdentity(page) {
   const probe = await page.evaluate(WHOAMI_PROBE);
   if (probe?.kind === 'auth') throw new AuthRequiredError('chat.deepseek.com', probe.detail);
   if (probe?.kind === 'http') throw new CommandExecutionError(`HTTP ${probe.httpStatus} from DeepSeek users/current`);
@@ -46,9 +51,5 @@ registerSiteAuthCommands({
   loginUrl: 'https://chat.deepseek.com/sign_in',
   columns: ['user_id', 'name'],
   verify: verifyDeepseekIdentity,
-  poll: async (page) => {
-    const probe = await page.evaluate(WHOAMI_PROBE);
-    if (!probe?.ok) throw new AuthRequiredError('chat.deepseek.com', 'Waiting for DeepSeek login');
-    return { user_id: probe.user_id, name: probe.name };
-  },
+  poll: probeDeepseekIdentity,
 });

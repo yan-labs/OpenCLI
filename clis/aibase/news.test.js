@@ -16,10 +16,6 @@ function makePage(evaluateResult) {
 }
 
 describe('aibase/news', () => {
-    it('registers stable URL in columns', () => {
-        expect(aibaseNewsCommand.access).toBe('read');
-        expect(aibaseNewsCommand.columns).toEqual(['rank', 'title', 'url']);
-    });
 
     it('validates limit before browser navigation', async () => {
         const page = makePage({ ok: true, rows: [] });

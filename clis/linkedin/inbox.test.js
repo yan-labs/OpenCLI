@@ -76,31 +76,6 @@ function fixture() {
 describe('linkedin inbox adapter', () => {
   const command = getRegistry().get('linkedin/inbox');
 
-  it('registers the command with the expected shape', () => {
-    expect(command).toBeDefined();
-    expect(command.site).toBe('linkedin');
-    expect(command.name).toBe('inbox');
-    expect(command.domain).toBe('www.linkedin.com');
-    expect(command.strategy).toBe('cookie');
-    expect(command.browser).toBe(true);
-    expect(typeof command.func).toBe('function');
-  });
-
-  it('exposes channel-safe structured columns', () => {
-    expect(command.columns).toEqual(
-      expect.arrayContaining([
-        'thread_url',
-        'thread_id',
-        'person_name',
-        'last_message_preview',
-        'unread',
-        'counterparty_type',
-        'category',
-        'timestamp',
-      ]),
-    );
-  });
-
   it('builds a thread URL from a thread id', () => {
     expect(threadUrl('2-aaa==')).toBe('https://www.linkedin.com/messaging/thread/2-aaa==/');
     expect(threadUrl('')).toBe('');

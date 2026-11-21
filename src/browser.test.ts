@@ -1,5 +1,5 @@
 import { afterEach, describe, it, expect, vi } from 'vitest';
-import { BrowserBridge, generateStealthJs } from './browser/index.js';
+import { BrowserBridge } from './browser/index.js';
 import { withTimeoutMs } from './runtime.js';
 import { __test__ as cdpTest } from './browser/cdp.js';
 import { classifyBrowserError } from './browser/errors.js';
@@ -32,7 +32,7 @@ describe('browser helpers', () => {
     expect(classifyBrowserError(new Error('Permission denied')).kind).toBe('non-retryable');
   });
 
-  it('prefers the real Electron app target over DevTools and blank pages', () => {
+  it('prefers the browser page target over DevTools and blank pages', () => {
     const target = cdpTest.selectCDPTarget([
       {
         type: 'page',
@@ -47,8 +47,8 @@ describe('browser helpers', () => {
         webSocketDebuggerUrl: 'ws://127.0.0.1:9224/blank',
       },
       {
-        type: 'app',
-        title: 'Antigravity',
+        type: 'page',
+        title: 'Example',
         url: 'http://localhost:3000/',
         webSocketDebuggerUrl: 'ws://127.0.0.1:9224/app',
       },
@@ -57,100 +57,39 @@ describe('browser helpers', () => {
     expect(target?.webSocketDebuggerUrl).toBe('ws://127.0.0.1:9224/app');
   });
 
+  it.each(['page', 'other'])('excludes Chrome toolbar targets reported as %s', (type) => {
+    vi.stubEnv('OPENCLI_CDP_TARGET', 'toolbar');
+    const toolbar = {
+      type,
+      title: 'Toolbar',
+      url: 'chrome://webui-toolbar.top-chrome/',
+      webSocketDebuggerUrl: 'ws://127.0.0.1:9222/toolbar',
+    };
+    const blank = { type: 'page', url: 'about:blank', webSocketDebuggerUrl: 'ws://127.0.0.1:9222/blank' };
+    expect(cdpTest.selectCDPTarget([toolbar, blank])).toBe(blank);
+    expect(cdpTest.selectCDPTarget([toolbar])).toBeUndefined();
+    expect(cdpTest.selectCDPTarget([{ ...toolbar, url: 'chrome-untrusted://side-panel.top-chrome/' }, blank])).toBe(blank);
+  });
+
   it('honors OPENCLI_CDP_TARGET when multiple inspectable targets exist', () => {
-    vi.stubEnv('OPENCLI_CDP_TARGET', 'codex');
+    vi.stubEnv('OPENCLI_CDP_TARGET', 'docs');
 
     const target = cdpTest.selectCDPTarget([
       {
-        type: 'app',
-        title: 'Cursor',
-        url: 'http://localhost:3000/cursor',
-        webSocketDebuggerUrl: 'ws://127.0.0.1:9226/cursor',
+        type: 'page',
+        title: 'Example',
+        url: 'http://localhost:3000/example',
+        webSocketDebuggerUrl: 'ws://127.0.0.1:9226/example',
       },
       {
-        type: 'app',
-        title: 'OpenAI Codex',
-        url: 'http://localhost:3000/codex',
-        webSocketDebuggerUrl: 'ws://127.0.0.1:9226/codex',
+        type: 'page',
+        title: 'Documentation',
+        url: 'http://localhost:3000/docs',
+        webSocketDebuggerUrl: 'ws://127.0.0.1:9226/docs',
       },
     ]);
 
-    expect(target?.webSocketDebuggerUrl).toBe('ws://127.0.0.1:9226/codex');
-  });
-
-  it('prefers the main Electron window over a routed auxiliary window on the same document', () => {
-    const target = cdpTest.selectCDPTarget([
-      {
-        type: 'page',
-        title: 'Codex',
-        url: 'app://-/index.html?initialRoute=%2Favatar-overlay',
-        webSocketDebuggerUrl: 'ws://127.0.0.1:9238/overlay',
-      },
-      {
-        type: 'page',
-        title: 'Codex',
-        url: 'app://-/index.html',
-        webSocketDebuggerUrl: 'ws://127.0.0.1:9238/main',
-      },
-    ]);
-
-    expect(target?.webSocketDebuggerUrl).toBe('ws://127.0.0.1:9238/main');
-  });
-
-  it('still connects to a routed window when the app opens no other surface', () => {
-    const target = cdpTest.selectCDPTarget([
-      {
-        type: 'page',
-        title: 'Codex',
-        url: 'app://-/index.html?initialRoute=%2Favatar-overlay',
-        webSocketDebuggerUrl: 'ws://127.0.0.1:9238/overlay',
-      },
-    ]);
-
-    expect(target?.webSocketDebuggerUrl).toBe('ws://127.0.0.1:9238/overlay');
-  });
-
-  it('keeps a routed window that outscores its plain sibling', () => {
-    const target = cdpTest.selectCDPTarget([
-      {
-        type: 'page',
-        title: 'Codex',
-        url: 'app://-/index.html?initialRoute=%2Fc%2Fthread',
-        webSocketDebuggerUrl: 'ws://127.0.0.1:9238/thread',
-      },
-      {
-        type: 'page',
-        title: '',
-        url: 'app://-/index.html',
-        webSocketDebuggerUrl: 'ws://127.0.0.1:9238/blank',
-      },
-    ]);
-
-    expect(target?.webSocketDebuggerUrl).toBe('ws://127.0.0.1:9238/thread');
-  });
-
-  it('ignores uninspectable targets when deciding which window is routed', () => {
-    const target = cdpTest.selectCDPTarget([
-      {
-        type: 'page',
-        title: 'Codex',
-        url: 'app://-/index.html',
-      },
-      {
-        type: 'page',
-        title: 'Codex',
-        url: 'app://-/index.html?initialRoute=%2Fc%2Fthread',
-        webSocketDebuggerUrl: 'ws://127.0.0.1:9238/main',
-      },
-      {
-        type: 'page',
-        title: 'Codex Helper',
-        url: 'about:blank',
-        webSocketDebuggerUrl: 'ws://127.0.0.1:9238/blank',
-      },
-    ]);
-
-    expect(target?.webSocketDebuggerUrl).toBe('ws://127.0.0.1:9238/main');
+    expect(target?.webSocketDebuggerUrl).toBe('ws://127.0.0.1:9226/docs');
   });
 
   it('leaves http tabs in document order when one carries a query string', () => {
@@ -172,45 +111,6 @@ describe('browser helpers', () => {
     expect(target?.webSocketDebuggerUrl).toBe('ws://127.0.0.1:9222/query');
   });
 
-  it('leaves unknown-scheme documents in document order when one carries a query', () => {
-    const target = cdpTest.selectCDPTarget([
-      {
-        type: 'page',
-        title: 'Example',
-        url: 'vscode-file://vscode-app/index.html?windowId=2',
-        webSocketDebuggerUrl: 'ws://127.0.0.1:9229/query',
-      },
-      {
-        type: 'page',
-        title: 'Example',
-        url: 'vscode-file://vscode-app/index.html',
-        webSocketDebuggerUrl: 'ws://127.0.0.1:9229/plain',
-      },
-    ]);
-
-    expect(target?.webSocketDebuggerUrl).toBe('ws://127.0.0.1:9229/query');
-  });
-
-  it('honors OPENCLI_CDP_TARGET even when it names a routed auxiliary window', () => {
-    vi.stubEnv('OPENCLI_CDP_TARGET', 'avatar-overlay');
-
-    const target = cdpTest.selectCDPTarget([
-      {
-        type: 'page',
-        title: 'Codex',
-        url: 'app://-/index.html?initialRoute=%2Favatar-overlay',
-        webSocketDebuggerUrl: 'ws://127.0.0.1:9238/overlay',
-      },
-      {
-        type: 'page',
-        title: 'Codex',
-        url: 'app://-/index.html',
-        webSocketDebuggerUrl: 'ws://127.0.0.1:9238/main',
-      },
-    ]);
-
-    expect(target?.webSocketDebuggerUrl).toBe('ws://127.0.0.1:9238/overlay');
-  });
 });
 
 describe('BrowserBridge state', () => {
@@ -358,6 +258,31 @@ describe('BrowserBridge state', () => {
     await expect(bridge.connect({ timeout: 0.1 })).rejects.toThrow('Stale daemon could not be replaced');
   });
 
+  it('keeps a daemon owned by a newer CLI instead of replacing it (#2761)', async () => {
+    vi.spyOn(daemonTransport, 'getDaemonHealth').mockResolvedValue({
+      state: 'ready',
+      status: {
+        ok: true,
+        pid: 999999,
+        uptime: 0,
+        daemonVersion: '999.0.0',
+        extensionConnected: true,
+        pending: 0,
+        memoryMB: 0,
+        port: 0,
+      },
+    });
+    const shutdown = vi.spyOn(daemonLifecycle.daemonLifecycleHooks, 'requestDaemonShutdown').mockResolvedValue(true);
+    const spawn = vi.spyOn(daemonLifecycle.daemonLifecycleHooks, 'spawnDaemonProcess');
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+
+    await expect(daemonLifecycle.ensureBrowserBridgeReady({ timeoutSeconds: 0.1, verbose: false }))
+      .resolves.toMatchObject({ state: 'ready' });
+    expect(shutdown).not.toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled();
+    expect(killSpy).not.toHaveBeenCalled();
+  });
+
   it('falls back to SIGKILL when stale daemon refuses graceful shutdown', async () => {
     vi.spyOn(daemonTransport, 'getDaemonHealth').mockResolvedValue({
       state: 'no-extension',
@@ -412,55 +337,5 @@ describe('BrowserBridge state', () => {
     const bridge = new BrowserBridge();
 
     await expect(bridge.connect({ timeout: 0.1 })).rejects.toThrow('Stale daemon could not be replaced');
-  });
-});
-
-describe('stealth anti-detection', () => {
-  it('generates non-empty JS string', () => {
-    const js = generateStealthJs();
-    expect(typeof js).toBe('string');
-    expect(js.length).toBeGreaterThan(100);
-  });
-
-  it('contains all 7 anti-detection patches', () => {
-    const js = generateStealthJs();
-    // 1. webdriver
-    expect(js).toContain('navigator');
-    expect(js).toContain('webdriver');
-    // 2. chrome stub
-    expect(js).toContain('window.chrome');
-    // 3. plugins
-    expect(js).toContain('plugins');
-    expect(js).toContain('PDF Viewer');
-    // 4. languages
-    expect(js).toContain('languages');
-    // 5. permissions
-    expect(js).toContain('Permissions');
-    expect(js).toContain('notifications');
-    // 6. automation artifacts (dynamic cdc_ scan)
-    expect(js).toContain('__playwright');
-    expect(js).toContain('__puppeteer');
-    expect(js).toContain('getOwnPropertyNames');
-    expect(js).toContain('cdc_');
-    // 7. CDP stack trace cleanup
-    expect(js).toContain('Error.prototype');
-    expect(js).toContain('puppeteer_evaluation_script');
-    expect(js).toContain('getOwnPropertyDescriptor');
-  });
-
-  it('includes guard flag to prevent double-injection', () => {
-    const js = generateStealthJs();
-    // Guard uses a non-enumerable property on a built-in prototype
-    expect(js).toContain("EventTarget.prototype");
-    // Guard should check early and return 'skipped'
-    expect(js).toContain("return 'skipped'");
-    // Normal path returns 'applied'
-    expect(js).toContain("return 'applied'");
-  });
-
-  it('generates syntactically valid JS', () => {
-    const js = generateStealthJs();
-    // Should not throw when parsed
-    expect(() => new Function(js)).not.toThrow();
   });
 });

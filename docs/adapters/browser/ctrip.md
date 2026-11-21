@@ -26,6 +26,16 @@ and `flights.ctrip.com`.
 | `opencli ctrip package` | Browser (cookie) | Flight-plus-hotel (自由行) package search by destination keyword |
 | `opencli ctrip attraction` | Browser (cookie) | Top attractions for a city id (rating, review count, detail link) |
 
+## One-way flight loading
+
+`flight` opens a foreground browser window by default because Ctrip can leave
+background pages as skeleton placeholders. It reads the page's own `batchSearch`
+responses without reconstructing or replaying requests, waits up to 25 seconds
+for completed response bodies and the upstream completion flag, and combines
+batches before returning rows. Visible DOM cards are not required for extraction.
+A captcha, failed response or timeout is reported explicitly; an unfinished
+search is never reported as an empty flight list.
+
 ## Usage Examples
 
 ```bash

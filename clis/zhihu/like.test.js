@@ -2,11 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { getRegistry } from '@jackwener/opencli/registry';
 import './like.js';
 describe('zhihu like', () => {
-    it('registers as a cookie browser command', () => {
-        const cmd = getRegistry().get('zhihu/like');
-        expect(cmd).toBeDefined();
-        expect(cmd.strategy).toBe('cookie');
-    });
+
     it('likes via API and returns result', async () => {
         const cmd = getRegistry().get('zhihu/like');
         const page = {

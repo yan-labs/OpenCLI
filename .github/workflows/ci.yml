@@ -20,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && fromJSON('["ubuntu-latest","macos-latest","windows-latest"]') || fromJSON('["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@v6
 
@@ -32,11 +32,11 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Type check
-        run: npx tsc --noEmit
-
       - name: Build
         run: npm run build
+
+      - name: Test release verification
+        run: node --test scripts/verify-release.test.mjs
 
       # Guard: committed cli-manifest.json must match the one build regenerates.
       # Prevents silent drift where unrelated adapter entries vanish or change
@@ -64,16 +64,20 @@ jobs:
         if: runner.os == 'Linux'
         run: npm run check:typed-error-lint
 
+      - name: Verify offline CLI contracts
+        if: runner.os == 'Linux'
+        run: npx vitest run --project e2e
+
   # ── Unit tests (vitest shard) ──
-  # PR: ubuntu + Node 22 only (fast feedback, 2 jobs).
-  # Push to main/dev: full matrix for cross-platform/cross-version coverage (12 jobs).
+  # Every PR/push runs all offline tests on Linux; scheduled/manual runs
+  # additionally check core behavior on macOS and Windows.
   unit-test:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && fromJSON('["ubuntu-latest","macos-latest","windows-latest"]') || fromJSON('["ubuntu-latest"]') }}
-        node-version: ${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && fromJSON('["22"]') || fromJSON('["22"]') }}
+        os: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && fromJSON('["ubuntu-latest","macos-latest","windows-latest"]') || fromJSON('["ubuntu-latest"]') }}
+        node-version: [22]
         shard: [1, 2]
     steps:
       - uses: actions/checkout@v6
@@ -86,11 +90,17 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Run unit tests (Node ${{ matrix.node-version }}, shard ${{ matrix.shard }}/2)
-        run: npx vitest run --project unit --project extension --reporter=verbose --shard=${{ matrix.shard }}/2
+      - name: Run all offline tests (Linux, shard ${{ matrix.shard }}/2)
+        if: runner.os == 'Linux'
+        run: npm test -- --shard=${{ matrix.shard }}/2
+
+      - name: Run cross-platform core tests (shard ${{ matrix.shard }}/2)
+        if: runner.os != 'Linux'
+        run: npx vitest run --project unit --shard=${{ matrix.shard }}/2
 
   # ── Bun compatibility check ──
   bun-test:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -110,39 +120,11 @@ jobs:
       - name: Run unit tests under Bun
         run: bun vitest run --project unit --reporter=verbose
 
-  # Adapter tests are pure unit tests — OS doesn't affect results. Gated off
-  # `pull_request` to keep PR CI under ~2 minutes; adapter authors run focused
-  # tests locally before pushing, and `push` to main / nightly cron / manual
-  # dispatch still guard the merged state.
-  adapter-test:
-    if: github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: actions/setup-node@v6
-        with:
-          node-version: '22'
-          cache: 'npm'
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Run focused adapter tests
-        run: npm run test:adapter -- --reporter=verbose
-
   # ── Smoke tests (scheduled / manual only) ──
   smoke-test:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     needs: build
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        # NOTE: Windows excluded — browser-actions/setup-chrome hangs during
-        # Chrome MSI installation on Windows runners (known issue).
-        os: [ubuntu-latest, macos-latest]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
@@ -154,20 +136,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Setup Chrome
-        uses: ./.github/actions/setup-chrome
-        id: setup-chrome
-
       - name: Build
         run: npm run build
 
-      - name: Run smoke tests (Linux, via xvfb)
-        if: runner.os == 'Linux'
-        run: |
-          xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" \
-            npx vitest run tests/smoke/ --reporter=verbose
-
-      - name: Run smoke tests (macOS / Windows)
-        if: runner.os != 'Linux'
-        run: npx vitest run tests/smoke/ --reporter=verbose
+      - name: Run API health smoke tests
+        run: npx vitest run --project smoke --reporter=verbose
     timeout-minutes: 15

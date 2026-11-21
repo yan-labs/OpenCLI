@@ -17,11 +17,6 @@ function createPage(payload) {
 }
 
 describe('facebook feed', () => {
-  it('registers the feed command with the existing row contract', () => {
-    const cmd = getRegistry().get('facebook/feed');
-    expect(cmd).toBeDefined();
-    expect(cmd.columns).toEqual(['index', 'author', 'content', 'likes', 'comments', 'shares']);
-  });
 
   it('extracts existing role=article feed rows', () => {
     const payload = runExtract(`

@@ -6,12 +6,6 @@ import './sent-invitations.js';
 const { buildSentInvitationsScript } = await import('./sent-invitations.js').then((m) => m.__test__);
 
 describe('linkedin sent-invitations command', () => {
-  it('registers with structured columns that do not include raw blobs', () => {
-    const command = getRegistry().get('linkedin/sent-invitations');
-    expect(command).toBeDefined();
-    expect(command.access).toBe('read');
-    expect(command.columns).toEqual(['rank', 'name', 'profile_url', 'invited_date_text']);
-  });
 
   it('scopes extraction to semantic invitation rows and ignores navigation labels', () => {
     const dom = new JSDOM(`<!doctype html><body>
